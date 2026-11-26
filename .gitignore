@@ -1,0 +1,13 @@
+.env
+.env.dev
+.env.prod
+video/
+segments/
+hls_chunks/
+manifests/
+thumbnails/
+database.db
+main
+.vscode/
+tmp/
+.gitpod.yml
