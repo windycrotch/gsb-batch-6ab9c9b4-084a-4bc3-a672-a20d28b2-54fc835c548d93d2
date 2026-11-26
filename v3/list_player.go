@@ -74,7 +74,7 @@ func (lp *ListPlayer) Player() (*Player, error) {
 	// reference count increased by libvlc_media_list_player_get_media_player.
 	C.libvlc_media_player_release(player)
 
-	return &Player{player: player}, nil
+	return newPlayerHandle(player), nil
 }
 
 // SetPlayer sets the underlying Player instance of the list player.

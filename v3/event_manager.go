@@ -23,12 +23,27 @@ import (
 // EventManager wraps a libvlc event manager.
 type EventManager struct {
 	manager *C.libvlc_event_manager_t
+
+	// gate optionally scopes attachments to a player media session. When
+	// non-nil, Attach stamps the current session epoch and eventDispatch
+	// rejects events from stale sessions and after release. It is nil for
+	// media, media list and other non-player event managers.
+	gate *eventGate
 }
 
 // newEventManager returns a new event manager instance.
 func newEventManager(manager *C.libvlc_event_manager_t) *EventManager {
 	return &EventManager{
 		manager: manager,
+	}
+}
+
+// newScopedEventManager returns an event manager whose attachments are gated
+// by the provided player session gate.
+func newScopedEventManager(manager *C.libvlc_event_manager_t, gate *eventGate) *EventManager {
+	return &EventManager{
+		manager: manager,
+		gate:    gate,
 	}
 }
 
@@ -47,40 +62,84 @@ func (em *EventManager) attach(event Event, externalCallback EventCallback,
 		return 0, ErrInvalidEventCallback
 	}
 
-	id := inst.events.add(event, externalCallback, internalCallback, userData)
-	if C.eventAttach(em.manager, C.libvlc_event_type_t(event), C.ulong(id)) != 0 {
+	var epoch sessionEpoch
+	if em.gate != nil {
+		epoch = em.gate.stamp()
+	}
+
+	id := inst.events.addScoped(event, externalCallback, internalCallback, userData, em.gate, epoch)
+	if em.manager == nil || C.eventAttach(em.manager, C.libvlc_event_type_t(event), C.ulong(id)) != 0 {
+		inst.events.remove(id)
 		return 0, errOrDefault(getError(), ErrEventAttach)
+	}
+
+	if em.gate != nil {
+		em.gate.track(id)
 	}
 
 	return id, nil
 }
 
 // Detach unregisters the specified event notification.
+//
+// Detach is idempotent: detaching an EventID that was never registered or was
+// already detached (including calling Detach more than once with the same ID)
+// is a safe no-op. Concurrent calls for the same ID perform the native detach
+// exactly once.
 func (em *EventManager) Detach(eventIDs ...EventID) {
 	if err := inst.assertInit(); err != nil {
 		return
 	}
 
 	for _, eventID := range eventIDs {
-		ctx, ok := inst.events.get(eventID)
+		// Atomically claim the context. Only the winning caller performs the
+		// native detach, so repeated/concurrent Detach calls cannot invoke
+		// libvlc_event_detach twice for the same registration.
+		ctx, ok := inst.events.take(eventID)
 		if !ok {
 			continue
 		}
 
-		inst.events.remove(eventID)
-		C.eventDetach(em.manager, C.libvlc_event_type_t(ctx.event), C.ulong(eventID))
+		if ctx.gate != nil {
+			ctx.gate.untrack(eventID)
+		}
+
+		if em != nil && em.manager != nil {
+			C.eventDetach(em.manager, C.libvlc_event_type_t(ctx.event), C.ulong(eventID))
+		}
 	}
 }
 
 //export eventDispatch
 func eventDispatch(event *C.constev, userData unsafe.Pointer) {
+	dispatchEventByID(EventID(uintptr(userData)), event)
+}
+
+// dispatchEventByID contains the dispatch logic keyed by the parsed
+// subscription ID. Splitting it from the cgo trampoline keeps the session
+// filtering and re-entrancy behaviour directly testable without synthesising
+// an invalid void pointer in tests.
+func dispatchEventByID(eventID EventID, event *C.constev) {
 	if err := inst.assertInit(); err != nil {
 		return
 	}
 
-	ctx, ok := inst.events.get(EventID(uintptr(userData)))
+	ctx, ok := inst.events.get(eventID)
 	if !ok {
 		return
+	}
+
+	// Session/lifetime gate. Stale media sessions and released players do not
+	// deliver user callbacks. enter also tracks in-flight dispatches so
+	// Release can drain them before releasing native resources.
+	var done func()
+	if ctx.gate != nil {
+		var allowed bool
+		done, allowed = ctx.gate.enter(ctx.epoch)
+		if !allowed {
+			return
+		}
+		defer done()
 	}
 
 	// Execute external callback.

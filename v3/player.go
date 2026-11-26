@@ -8,6 +8,7 @@ package vlc
 import "C"
 import (
 	"io"
+	"sync"
 	"time"
 	"unsafe"
 )
@@ -106,6 +107,49 @@ const (
 // For playing media lists (playlists) use ListPlayer instead.
 type Player struct {
 	player *C.libvlc_media_player_t
+
+	// mu protects the Go side lifecycle state and the player pointer.
+	mu sync.Mutex
+
+	// cgoMu serializes native stop/release teardown so a stop cannot race
+	// the final release of the underlying libvlc player.
+	cgoMu sync.Mutex
+
+	// gate scopes event delivery to the current media session. It is lazily
+	// initialized for Player values not created through NewPlayer.
+	gate *eventGate
+
+	// released records that Release has claimed the player. Repeated Release
+	// calls are no-ops and never release the native player twice.
+	released bool
+
+	// releaseDone is closed once the native player has been released.
+	releaseDone chan struct{}
+
+	// settings caches player level audio preferences so volume and mute can
+	// be re-applied after media switches.
+	settings playerSettings
+}
+
+// newPlayerHandle builds a Player with initialized lifecycle state.
+func newPlayerHandle(player *C.libvlc_media_player_t) *Player {
+	return &Player{
+		player:      player,
+		gate:        newEventGate(),
+		releaseDone: make(chan struct{}),
+	}
+}
+
+// ensureStateLocked lazily initializes the gate and release channel. The
+// caller must hold p.mu.
+func (p *Player) ensureStateLocked() *eventGate {
+	if p.gate == nil {
+		p.gate = newEventGate()
+	}
+	if p.releaseDone == nil {
+		p.releaseDone = make(chan struct{})
+	}
+	return p.gate
 }
 
 // NewPlayer creates an instance of a single-media player.
@@ -119,33 +163,99 @@ func NewPlayer() (*Player, error) {
 		return nil, errOrDefault(getError(), ErrPlayerCreate)
 	}
 
-	return &Player{player: player}, nil
+	return newPlayerHandle(player), nil
 }
 
 // Release destroys the media player instance.
+//
+// Release is idempotent: calling it more than once, including concurrently or
+// from within an event callback, returns nil, releases the underlying native
+// player exactly once and never deadlocks. User callbacks already queued or
+// running are fenced by the player's event gate; after Release returns, no new
+// event callback enters user code. When Release is invoked from inside one of
+// the player's event callbacks, the final native release is performed after
+// the callback unwinds.
 func (p *Player) Release() error {
-	if err := p.assertInit(); err != nil {
+	if p == nil {
 		return nil
 	}
 
-	C.libvlc_media_player_release(p.player)
+	p.mu.Lock()
+	if p.released {
+		p.mu.Unlock()
+		return nil
+	}
+	p.released = true
+	cp := p.player
 	p.player = nil
+	gate := p.ensureStateLocked()
+	done := p.releaseDone
+	p.mu.Unlock()
+
+	// Fence event delivery and drop Go subscription contexts so late native
+	// callbacks become no-ops.
+	gate.close()
+	if inst != nil {
+		for _, eventID := range gate.trackedIDs() {
+			if _, ok := inst.events.take(eventID); ok {
+				gate.untrack(eventID)
+			}
+		}
+	}
+
+	releaseNative := func() {
+		p.cgoMu.Lock()
+		if cp != nil {
+			C.libvlc_media_player_release(cp)
+		}
+		p.cgoMu.Unlock()
+		close(done)
+	}
+
+	// Re-entrant release from a user event callback: waiting for in-flight
+	// dispatches on this goroutine would self-deadlock. Defer draining and
+	// native release to a dedicated goroutine which runs after the current
+	// callback returns.
+	if gate.inCallback() {
+		go func() {
+			gate.wait()
+			releaseNative()
+		}()
+		return nil
+	}
+
+	// External release: drain callbacks already running on libvlc threads
+	// before releasing the native player.
+	gate.wait()
+	releaseNative()
 	return nil
 }
 
 // Play plays the current media.
 func (p *Player) Play() error {
-	if err := p.assertInit(); err != nil {
-		return err
+	if p == nil {
+		return ErrPlayerNotInitialized
 	}
-	if p.IsPlaying() {
+
+	p.mu.Lock()
+	if p.released || p.player == nil {
+		p.mu.Unlock()
+		return ErrPlayerNotInitialized
+	}
+	player := p.player
+	p.mu.Unlock()
+
+	if C.libvlc_media_player_is_playing(player) != 0 {
 		return nil
 	}
 
-	if C.libvlc_media_player_play(p.player) < 0 {
+	if C.libvlc_media_player_play(player) < 0 {
 		return errOrDefault(getError(), ErrPlayerPlay)
 	}
 
+	// (Re-)apply player level audio settings. Starting playback can recreate
+	// the audio output, so applying after Play prevents volume/mute resets.
+	p.applyAudioSettings()
 	return nil
 }
 
@@ -170,13 +280,36 @@ func (p *Player) WillPlay() bool {
 }
 
 // Stop cancels the currently playing media, if there is one.
+//
+// Stop is idempotent: stopping an already stopped or released player is not an
+// error and performs no additional teardown. It is safe to call Stop from
+// within an event callback.
 func (p *Player) Stop() error {
-	if err := p.assertInit(); err != nil {
-		return err
+	if p == nil {
+		return ErrPlayerNotInitialized
 	}
 
-	C.libvlc_media_player_stop(p.player)
-	return getError()
+	// Serialize against the native release path, then re-check the player
+	// state so a concurrent Release cannot free the pointer before the stop
+	// call below.
+	p.cgoMu.Lock()
+	defer p.cgoMu.Unlock()
+
+	p.mu.Lock()
+	released := p.released
+	player := p.player
+	p.mu.Unlock()
+
+	if player == nil {
+		if released {
+			// Repeated stop after release is an idempotent no-op.
+			return nil
+		}
+		return ErrPlayerNotInitialized
+	}
+
+	C.libvlc_media_player_stop(player)
+	return nil
 }
 
 // SetPause sets the pause state of the media player.
@@ -294,7 +427,16 @@ func (p *Player) IsFullScreen() (bool, error) {
 }
 
 // Volume returns the volume of the player.
+//
+// Once SetVolume has been called successfully, the returned value is the last
+// explicitly requested volume. This makes the value stable across media
+// switches and audio output recreation, including output plugins that do not
+// expose the current hardware volume.
 func (p *Player) Volume() (int, error) {
+	if volume, ok := p.settings.volumeValue(); ok {
+		return volume, nil
+	}
+
 	if err := p.assertInit(); err != nil {
 		return 0, err
 	}
@@ -303,6 +445,10 @@ func (p *Player) Volume() (int, error) {
 }
 
 // SetVolume sets the volume of the player.
+//
+// The explicitly requested volume is remembered for the lifetime of the
+// player and re-applied after media switches, so changing media does not
+// reset it unless the caller sets a different value.
 func (p *Player) SetVolume(volume int) error {
 	if err := p.assertInit(); err != nil {
 		return err
@@ -315,12 +461,20 @@ func (p *Player) SetVolume(volume int) error {
 		return errOrDefault(getError(), ErrPlayerSetVolume)
 	}
 
+	p.settings.setVolume(volume)
 	return nil
 }
 
 // IsMuted returns a boolean value that specifies whether the audio
 // output of the player is muted.
+//
+// Once SetMute or ToggleMute has been called, the returned state is the last
+// explicitly requested mute state, which stays stable across media switches.
 func (p *Player) IsMuted() (bool, error) {
+	if muted, ok := p.settings.mutedValue(); ok {
+		return muted, nil
+	}
+
 	if err := p.assertInit(); err != nil {
 		return false, err
 	}
@@ -329,6 +483,9 @@ func (p *Player) IsMuted() (bool, error) {
 }
 
 // SetMute mutes or unmutes the audio output of the player.
+//
+// The explicitly requested mute state is remembered and re-applied after
+// media switches.
 //
 //	NOTE: If there is no active audio playback stream, the mute status might
 //	not be available. If digital pass-through (S/PDIF, HDMI, etc.) is in use,
@@ -340,6 +497,7 @@ func (p *Player) SetMute(mute bool) error {
 	}
 
 	C.libvlc_audio_set_mute(p.player, C.int(boolToInt(mute)))
+	p.settings.setMuted(mute)
 	return nil
 }
 
@@ -356,6 +514,14 @@ func (p *Player) ToggleMute() error {
 	}
 
 	C.libvlc_audio_toggle_mute(p.player)
+
+	// Reflect the toggled state in the persisted settings cache.
+	muted := C.libvlc_audio_get_mute(p.player)
+	if muted >= 0 {
+		p.settings.setMuted(muted > C.int(0))
+	} else if current, ok := p.settings.mutedValue(); ok {
+		p.settings.setMuted(!current)
+	}
 	return nil
 }
 
@@ -1527,6 +1693,12 @@ func (p *Player) SetMouseInput(enable bool) error {
 }
 
 // EventManager returns the event manager responsible for the media player.
+//
+// Attachments created through the returned manager are scoped to the player's
+// current media session. Replacing the player media starts a new session and
+// prevents events belonging to the previous media from reaching callbacks
+// attached for that session. Attachments created before the first media is set
+// are treated as player-lifetime subscriptions and survive media changes.
 func (p *Player) EventManager() (*EventManager, error) {
 	if err := p.assertInit(); err != nil {
 		return nil, err
@@ -1537,7 +1709,11 @@ func (p *Player) EventManager() (*EventManager, error) {
 		return nil, ErrMissingEventManager
 	}
 
-	return newEventManager(manager), nil
+	p.mu.Lock()
+	gate := p.ensureStateLocked()
+	p.mu.Unlock()
+
+	return newScopedEventManager(manager, gate), nil
 }
 
 func (p *Player) loadMedia(path string, local bool) (*Media, error) {
@@ -1562,8 +1738,52 @@ func (p *Player) setMedia(m *Media) error {
 		return err
 	}
 
-	C.libvlc_media_player_set_media(p.player, m.media)
-	return getError()
+	p.mu.Lock()
+	if p.released || p.player == nil {
+		p.mu.Unlock()
+		return ErrPlayerNotInitialized
+	}
+	player := p.player
+	gate := p.ensureStateLocked()
+	p.mu.Unlock()
+
+	// Opening a new media session rotates the event epoch. Event subscriptions
+	// stamped for the previous media are now stale and their late events are
+	// dropped by eventDispatch.
+	gate.rotate()
+
+	C.libvlc_media_player_set_media(player, m.media)
+	if err := getError(); err != nil {
+		return err
+	}
+
+	// Media switches can recreate the audio output. Restore the player level
+	// volume and mute preferences explicitly.
+	p.applyAudioSettings()
+	return nil
+}
+
+// applyAudioSettings re-applies cached volume and mute state to the native
+// player. It is a no-op if no explicit preference has been recorded.
+func (p *Player) applyAudioSettings() {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	player := p.player
+	released := p.released
+	p.mu.Unlock()
+	if player == nil || released {
+		return
+	}
+
+	if volume, ok := p.settings.volumeValue(); ok {
+		C.libvlc_audio_set_volume(player, C.int(volume))
+	}
+	if muted, ok := p.settings.mutedValue(); ok {
+		C.libvlc_audio_set_mute(player, C.int(boolToInt(muted)))
+	}
 }
 
 func (p *Player) assertInit() error {

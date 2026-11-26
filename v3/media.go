@@ -791,10 +791,25 @@ func getMediaReadSeeker(id objectID) (io.ReadSeeker, error) {
 
 //export mediaBufferOpenCB
 func mediaBufferOpenCB(id unsafe.Pointer, userData *unsafe.Pointer, size *C.uint64_t) C.int {
+	mediaSize, ok := mediaBufferOpen(id)
+	if !ok {
+		return 1
+	}
+
+	// Initialize callback data.
+	*userData = id
+	*size = C.uint64_t(mediaSize)
+	return 0
+}
+
+// mediaBufferOpen contains the pure Go open logic for read-seeker backed
+// media. It is separated from the cgo trampoline so the reader lifetime
+// behaviour can be tested without cgo test files.
+func mediaBufferOpen(id objectID) (size uint64, ok bool) {
 	// Get media reader.
 	r, err := getMediaReadSeeker(id)
 	if err != nil {
-		return 1
+		return 0, false
 	}
 
 	// Get reader size.
@@ -805,34 +820,22 @@ func mediaBufferOpenCB(id unsafe.Pointer, userData *unsafe.Pointer, size *C.uint
 
 	// Rewind reader.
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return 1
+		return 0, false
 	}
 
-	// Initialize callback data.
-	*userData = id
-	*size = C.uint64_t(offset)
-	return 0
+	return offset, true
 }
 
 //export mediaBufferReadCB
 func mediaBufferReadCB(id unsafe.Pointer, buf *C.uchar, size C.size_t) C.ssize_t {
-	// Get media reader.
-	r, err := getMediaReadSeeker(id)
-	if err != nil {
-		return -1
-	}
-
-	// Read data.
+	// Read data into a Go buffer.
 	b := make([]byte, int(size))
-
-	read, err := r.Read(b)
-	if err != nil {
-		if err != io.EOF {
-			read = -1
-		}
+	read := mediaBufferRead(id, b)
+	if read < 0 {
+		return C.ssize_t(read)
 	}
 
-	// Copy data to buffer.
+	// Copy data to the C buffer.
 	if read > 0 {
 		C.memcpy(unsafe.Pointer(buf), unsafe.Pointer(&b[0]), C.size_t(read))
 	}
@@ -840,20 +843,49 @@ func mediaBufferReadCB(id unsafe.Pointer, buf *C.uchar, size C.size_t) C.ssize_t
 	return C.ssize_t(read)
 }
 
-//export mediaBufferSeekCB
-func mediaBufferSeekCB(id unsafe.Pointer, offset C.uint64_t) C.int {
+// mediaBufferRead contains the pure Go read logic for read-seeker backed
+// media. It returns the number of bytes read, 0 on EOF semantics preserved by
+// the caller, or -1 when the reader is unavailable or failed.
+func mediaBufferRead(id objectID, b []byte) int {
 	// Get media reader.
 	r, err := getMediaReadSeeker(id)
 	if err != nil {
 		return -1
 	}
 
-	// Seek to the specified offset.
-	if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
-		return -1
+	read, err := r.Read(b)
+	if err != nil {
+		if err != io.EOF {
+			return -1
+		}
 	}
 
+	return read
+}
+
+//export mediaBufferSeekCB
+func mediaBufferSeekCB(id unsafe.Pointer, offset C.uint64_t) C.int {
+	if !mediaBufferSeek(id, uint64(offset)) {
+		return -1
+	}
 	return 0
+}
+
+// mediaBufferSeek contains the pure Go seek logic for read-seeker backed
+// media.
+func mediaBufferSeek(id objectID, offset uint64) bool {
+	// Get media reader.
+	r, err := getMediaReadSeeker(id)
+	if err != nil {
+		return false
+	}
+
+	// Seek to the specified offset.
+	if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
+		return false
+	}
+
+	return true
 }
 
 //export mediaBufferCloseCB
