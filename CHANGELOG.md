@@ -1,0 +1,737 @@
+# Changelog
+
+All notable changes to qc are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The release notes of each GitHub release are taken from its section here
+(see [RELEASING.md](RELEASING.md)).
+
+## [Unreleased]
+
+## [1.4.1] - 2026-10-29
+
+### Fixed
+
+- **Vertical videos are scored with the right model, upright**
+  ([#2](https://github.com/eko/qc/issues/2), [#3](https://github.com/eko/qc/issues/3)).
+  The automatic model looked at the height only: a 1080×1920 short got the
+  4K model (`vmaf_v1.0.16_3d0h_2160`, which adds 5 points and clips at 110,
+  hence scores above 100), and every portrait source was stretched to a
+  landscape evaluation size. The model is now chosen on the short side of
+  the picture, and a portrait source is evaluated upright (1080×1920). On
+  the short of #2, the exact score matches Netflix's `vmaf` tool at the
+  native size to the third decimal (97.113, 95.512 with `vmaf_v0.6.1`),
+  instead of 100.7. Scores of portrait videos change; landscape ones do
+  not. Ladders of portrait sources are measured the same way. Library:
+  `vmaf.ResolveModelForSize`; `vmaf.ResolveModel` is deprecated.
+- **A container without a memory limit no longer gets killed for lack of
+  memory** ([#1](https://github.com/eko/qc/issues/1)). Without `--memory`
+  nor a cgroup limit (Docker Desktop's default), qc now sizes its workers
+  on the memory the system has available (`MemAvailable`, Linux) instead
+  of not at all. With the fix above, `qc vmaf` on a 1080×1920 short peaks
+  at 1.5 GB with 6 workers, where 1.4.0 took more than 4 GB with 2.
+- Docs: the memory of a vertical video, what the default `--metrics` cost,
+  and why libvmaf 3.2.1 reports itself as 3.2.0.
+
+## [1.4.0] - 2026-10-23
+
+### Added
+
+- **Energy in the ladder reports** (`qc ladder`, `qc run`; terminal, HTML,
+  JSON `energy`): what encoding each rung on the whole title costs, in CPU
+  time measured on its verification encode and scaled to the title, plus
+  the decode of the source, measured apart. Within 4% of the whole-title
+  encodes of a 59 min 1080p title (1080p and 360p rungs). `--core-watts`
+  turns it into Wh or kWh. `--energy-tolerance X` moves each rung, at the
+  same bitrate, to the lowest resolution within X VMAF of the best, and
+  reports the CPU saved — see [energy](docs/ladder.md#13-energy). The
+  wizard asks both when the ladder is customised.
+  Library: `ladder.Energy`, `Rung.Encode`, `ladder.WithDecoder`
+  (implemented by `encode.FFmpeg.Decode`).
+
+### Changed
+
+- **`--cpus` holds in the description of a ladder's digest** (`qc ladder`,
+  `qc run`, and a container's CPU quota, which Go follows): under 6 CPUs
+  its frame analysis, its two fast encodes and their VMAF scores run one
+  after the other, each on all of them, and the two encodes one after the
+  other too. They ran side by side, each sized for every CPU: an instant
+  ladder took 2.8 cores on average under `--cpus 2`, 6.5 at its peak, and
+  its 8.8 s were 13 s on two real cores.
+- **VMAF measurements cost up to a third less CPU**, scores unchanged to
+  the bit: with a VMAF v1 model on the CPU, the warm-up frames of a clip
+  are given to motion alone, the only temporal feature, instead of to the
+  whole model (CAMBI and chroma are most of its cost). −29% of CPU on an
+  exact measurement of a 32 s 1080p encode, libvmaf 11.1 → 4.7 s in an
+  instant ladder, which on two cores now takes 10 s instead of 13 (`qc
+  vmaf`, the probes and the verification of a ladder benefit as well).
+  Library: `vmaf.WarmScorer`, implemented by `libvmaf.Scorer`.
+- **Clearer rate-quality chart in the terminal report of a ladder**
+  (`qc ladder`, `qc run`). It is framed on the rungs (their bitrates
+  widened by 1.6 on each side, VMAF from under the lowest rung to 100)
+  instead of every probe, which a model spreads from VMAF 0 to 100 and
+  from 28 kb/s to 32 Mb/s. Each curve is one dot thick, drawn as the
+  ladder reads it (VMAF linear in the logarithm of the bitrate), in the
+  colour of its resolution where it is the upper envelope the rungs are
+  placed on and faint under it; only measured probes are dotted. The
+  rungs are numbered as in the ladder table. VMAF is labelled every 10
+  with faint guides, and the bitrate axis has ticks at round values
+  (200k, 500k, 1M…). The chart is 18 rows high instead of 14.
+- With several codecs (`-c h264,av1`), **the codec comparison draws the
+  rungs of each codec on one chart**, under its text.
+- **Charts drawn as pictures in terminals that show them** (Kitty,
+  Ghostty and Warp by the Kitty graphics protocol; iTerm2, WezTerm, VS
+  Code by the iTerm2 one): the two charts above become smooth pictures
+  (anti-aliased lines, the colours of the HTML report, dark or light to
+  match the terminal), the envelope bold and the curves under it thin, the
+  rungs numbered. Other terminals, tmux and redirected output keep the
+  braille charts. `QC_CHARTS=kitty|iterm|text|auto` overrides the
+  detection. Library: packages `internal/chartimg` and `internal/termimg`;
+  `tui.RenderLadder` and `tui.RenderCodecs` take `tui.ReportOptions`.
+- **The ladder's live panel is a picture too** in terminals of the Kitty
+  protocol, redrawn in place as the probes land, then as each rung is
+  verified (numbered, at its measured point). `tui.RunDashboard` takes the
+  picture protocol; panels drawing themselves as pictures implement
+  `tui.Pictured`.
+
+### Fixed
+
+- `golangci-lint` 2.15 (`wrapcheck`): the libvmaf binding wraps the errno
+  of a failed call.
+
+## [1.3.0] - 2026-10-13
+
+### Added
+
+- **`qc model report`** (`qc model report corpus.jsonl --model model.json
+  --to model.html`): an HTML page showing what a ladder model is worth and
+  what its corpus holds, of either alone or of both. Findings tell whether
+  the model predicts without a probe and without any encode and how far
+  from a measured ladder, a model older than its corpus, unfinished
+  titles, and a grid that stops before the low rungs of its titles. Then
+  the error of each design, the error of each resolution and CRF of the
+  grid, the titles the model reads worst (the kinds of content to add),
+  the VMAF and the bitrate of the corpus as two surfaces in perspective
+  (drag to turn them, point at a corner, pick a title or play them all
+  against the mean), the mean rate-quality curve of each resolution, and
+  where the titles sit on each feature. `qc model train` now keeps the
+  validation error of each title in the model
+  (`predict.Validation.Titles`).
+- **Ladder models** (`qc model corpus`, `qc model train`, `qc ladder
+  --ladder-model`): a model trained on titles measured on a whole grid of
+  resolutions and CRFs completes the probes of a ladder. A build then
+  measures 4 to 10 encodes of the digest (the anchors) instead of 15 to 30
+  and predicts the others; the level correction, the rung selection and
+  the verification of every rung are unchanged. On a 59-minute title the
+  model had never seen (x264 fast, a model of two other titles), probing
+  went from 3 min 36 s to 52 s with the 10 anchors of the default tolerance
+  and to 37 s with 6 (`--tolerance 0.8`), and the whole build from
+  7 min 16 s to 3 min 28 s and 3 min 02 s, for the same rung resolutions
+  (but the last rung with 6) and verifications within 1.2 and 0.4 VMAF of
+  the predictions; with 4 anchors (`--tolerance 1`), without analysis nor
+  verification (`--digest uniform --no-verify`), 52 s instead of
+  2 min 57 s. Designs of anchors are fitted on digests of a few segments,
+  as the anchors of a build are measured: on a corpus of 39 titles the
+  error of four anchors went from 0.62 to 0.47 VMAF.
+  `qc model train` validates every set of anchors by leaving each title of
+  the corpus out in turn and stores the errors in the model; `--tolerance`
+  picks the fewest anchors whose mean error is within it. A model is for
+  one codec and preset and one source height; a build it does not cover
+  falls back on fixed probing and says why. Library: packages
+  `ladder/corpus` and `ladder/predict`, `ladder.ProbingModel`,
+  `ladder.Options.Curves`, `Probe.Predicted`, `Result.ProbeEncodes`.
+- **Instant ladders** (`qc ladder --ladder-model model.json --instant`): a
+  ladder predicted from the analysis of the video, without any probe nor
+  verification, in about 4 s for titles of 10 minutes to 1 hour. `qc model
+  corpus` now also describes every segment (spatial and temporal
+  information, luma, camera motion, what x264 ultrafast spends on it at
+  360p and the VMAF of those two encodes, what scaling loses at each
+  resolution), and `qc model train` fits and validates a design that
+  reads those features and no anchor. Its accuracy is that of its corpus,
+  and is reported with the ladder: with three titles, 1.2 VMAF and 8% of
+  the bitrate on average on a title never seen; verified, 4 rungs of 6
+  and 5 of 8 were right as predicted on two titles, and the two top rungs
+  of 8 on the third (CRFs 1.5 to 2 steps high below them). The model
+  predicts every segment of the digest and averages them: from the mean
+  features of the digest, bitrates came out 13% low on average on a
+  corpus of 39 titles (7% of error now, 14% then).
+  `--probing predicted` is the same prediction with the digest and the
+  verification of any build. Library: package
+  `ladder/features`, `ladder.ProbingPredicted`, `ladder.WithFeatures`,
+  `encode.FFmpeg.Stats` and `ScaleLoss`. `qc model corpus` takes folders,
+  for every video under them.
+- **`--plain`** (every command, or `QC_PLAIN=1`): the progress as plain
+  lines on stderr, one per event, in place of the live dashboard and of the
+  wizard: for containers, CI jobs and logs. Without it and without a
+  terminal, qc is silent until its report, as before.
+- **`--quiet`** (every command, or `QC_QUIET=1`): no progress at all, in a
+  terminal either: with `-f json`, nothing but the JSON.
+- **`qc model corpus --crf-count`**: the number of CRFs a corpus is
+  measured at, spread evenly over the codec's range (default: 11 for
+  H.264, as before).
+- **`--tolerance`** (`ladder`, `run`): the VMAF error the curves may have
+  between probes, for adaptive probing and for ladder models (it was a
+  library option only).
+- **`--no-encode`** (`ladder`, `run`, with `--instant` or `--probing
+  predicted`): the digest is described without encoding anything, from
+  its frames and from the source's own encode, leaving out the two very
+  fast encodes a prediction otherwise scores. About 2 s instead of 4 for
+  an hour-long title, for about twice the error: 2.2 VMAF and 9.3% of the
+  bitrate on 40 titles never seen, against 1.2 and 6.4%. It never falls
+  back on probes: without a model that can, the build fails and says why
+  (`ladder.ErrNoEncode`). A model now
+  holds a design for each thing a build can read (`qc model train`
+  lists them); one trained before must be trained again for this mode.
+  Library: `ladder.Options.NoEncode`, `features.Sets`, `features.Usable`,
+  `predict.TrainOptions.FeatureSets`.
+
+### Changed
+
+- **Instant ladders are faster (12 s → 4 s for an hour-long title) and
+  read the source's own encode.** Their digest is 20 s long, ten
+  segments, unless `--digest-duration` says another (twenty segments:
+  7.5 s, for about a tenth less error: 1.0 against 1.1 VMAF and 8.8%
+  against 9.8% of bitrate on four titles). The
+  digest is cut from keyframes, a process per segment (nothing is decoded
+  before a segment; `encode.DigestSpec.Fast`); the two fast encodes are
+  scored on three frames spread evenly in each segment instead of three
+  clips of four drawn in it (half the frames, and no longer a draw;
+  `quality.Sample.Even`);
+  and the mean quantiser of the source, read while the digest is cut
+  (8-bit H.264, `encode.DigestSpec.Quantisers`), joins the features: 7.5%
+  → 6.4% of bitrate error on 40 titles. The scale loss, which added
+  nothing, is no longer described (models trained with it still get it).
+  Corpora are described again by `qc model corpus` (features version 7,
+  the encodes of the grid are kept) and models trained again to read the
+  quantiser. `predict.Model.Design` and `Instant` take what tells the
+  features a build can read.
+- **An instant ladder never encodes.** It measured challenger probes
+  where its rungs needed CRFs past the grid of its model (six encodes and
+  44 s on an hour-long title in AV1, whose low rungs need CRF 60 to 62
+  when the grid stopped at 58); it now places those rungs on what the
+  model knows. The corpus grid of AV1 ends on CRF 63, the highest of
+  SVT-AV1, whose scale falls too fast at its end to be read from the
+  points before it: run `qc model corpus` again on an AV1 corpus (five
+  encodes a title) and train again.
+- A ladder no longer inspects its source twice (`qc ladder`, `qc run`):
+  1.5 s less for an hour of video. Library:
+  `ladder.Engine.PrepareInspected`, `analysis.Options.SkipBitstream`.
+
+## [1.2.1] - 2026-10-08
+
+### Added
+
+- **`--cpus` and `--memory`** (every command): the CPUs and the memory qc
+  and the ffmpeg processes it starts may use. `--memory` defaults to the
+  memory limit of the container, and the CPU quota of a container
+  (`docker run --cpus`) is now followed: worker counts, libvmaf threads and
+  the threads of the decoders and encoders are sized on it instead of on
+  the cores of the host. Under a memory limit fewer clips are scored and
+  fewer probes encoded at once; the results do not change. Library:
+  `quality.WithMemory`, `ladder.Options.Memory`, `encode.WithThreads`,
+  `encode.Params.Threads`.
+
+### Fixed
+
+- **Memory of ladder builds**: the decoded frames of every measurement pass
+  were left to a garbage collector that rarely ran, and a build kept
+  gigabytes of dead frames (9.5 GB for qc on an H.264 ladder of a 1080p
+  title, 4.7 GB now). The Docker images also set `MALLOC_ARENA_MAX=2`
+  (3.3 GB). In a container short of memory the build was killed without a
+  message.
+- An ffmpeg process killed from outside (the kernel's out-of-memory killer)
+  is reported as such instead of `signal: killed`.
+
+## [1.2.0] - 2026-10-03
+
+### Added
+
+- **`qc sample`**: extracts a sample of one or several videos into one
+  file, each video giving the same length of scenes chosen on its spatial
+  and temporal information: the most complex (`--scenes top`), a mix of
+  complex and representative ones (`mixed`, the default, `--top-share`),
+  representative ones (`average`) or the easiest (`easy`); `--duration`
+  sets its length. The sample plays the most complex scene first (the
+  easiest first for `easy`). The scenes are whole GOPs copied from the sources
+  without re-encoding, so the frames are the sources' own; the sample is
+  then read back (frame count, timestamps, a decode of every frame).
+  Library: package `sample`, `encode.FFmpeg.Copy` and `Decodes`. The wizard
+  offers it for one video or several.
+
+- **Banding inherited from the source**: when an encode has banded frames,
+  CAMBI is measured on the reference at those frames (`cambi_source`,
+  `banding.sourceFrames`), in a second pass over them alone. Comparisons
+  say how many banded frames the reference has too, and a ladder rung whose
+  banding is mostly the source's is reported as such (`banded-source`)
+  instead of being advised a 10-bit encode.
+- **Harmonic mean and drops in sampled mode**: the harmonic mean is now
+  estimated from the sampled clips, and every measurement reports the share
+  of frames scoring more than 10 VMAF under the mean (`drops`), a finding
+  from 5% of the frames.
+- A note on ladders of HDR sources built on the PQ or HLG signal: their
+  VMAF targets rank the encodes but are not calibrated (`hdr-ladder-target`).
+
+### Changed
+
+- **CAMBI is told the encode's resolution and bit depth**
+  (`cambi.enc_width`, `enc_height`, `enc_bitdepth`), as Netflix recommends
+  for VMAF v1 (`vmaf.ScorerConfig.Encoded`). Renditions below the evaluation
+  resolution read less banding (CAMBI about halved at 360p and 540p) and
+  0.2 to 0.9 VMAF more; renditions at the evaluation resolution are
+  unchanged. Scores of lower rungs are therefore not comparable with those
+  of 1.1.0.
+- The 6 VMAF step between rungs is no longer described as "one
+  just-noticeable difference": measured ones average about 7 and vary with
+  the content. The default is unchanged.
+
+### Documentation
+
+- What the confidence interval is (sampling error) and is not (the
+  uncertainty of VMAF itself); the sampler's coverage on SVT-AV1 encodes;
+  the error of reading the codec comparison between rungs.
+
+## [1.1.0] - 2026-10-02
+
+### Added
+
+- **Prebuilt binaries** on every GitHub release: Linux amd64 and arm64
+  (static, musl) and macOS arm64 (not signed), with libvmaf 3.2.1 linked in
+  and the VMAF models built into it, so they need only ffmpeg; with their
+  `SHA256SUMS` (`make binary` builds the one of the running platform).
+  `qc version --check` accepts the models built into libvmaf.
+- **`--digest top`** (`ladder.DigestTop`): a ladder estimated on the most
+  complex scenes of the title (highest SI × TI, one segment per shot), for
+  what the demanding scenes need rather than the title. They are the
+  scenes that cost the most, not the ones that score the lowest (see
+  docs/validation.md).
+
+- **`--digest-duration`**: the length of the digest, 40 s by default
+  whatever the title.
+- **One ladder for several videos** (per-program encoding): `qc ladder
+  ep1.mov ep2.mov ep3.mov` builds one ladder for all of them
+  (`ladder.Engine.BuildProgram`, `pipeline.Options.Program`). The digest
+  takes as many segments in every video, whatever its length, each video
+  balanced on its own SI and TI; the videos must share their resolution,
+  frame rate, bit depth and dynamic range. Every verified rung is also read
+  video by video (`Measurement.Titles`, a *Per-video quality* table in the
+  reports), with findings for a video the shared ladder under-serves or
+  over-serves on the top rung and for the rung where the videos differ
+  most; `--encode-ladder` encodes every video into a folder of its own.
+  In the wizard, `space` selects several videos, which then get that
+  ladder for every codec picked. `qc run` stays on one video, and per-shot
+  rungs on one title.
+- **`qc ladder -c h264,av1`**: several codecs in one command, for one
+  video or several: one ladder each on the same analysis and digest
+  (`ladder.Engine.PrepareProgram` for several videos), compared at equal
+  quality, reported together as a run reports them.
+- **Codecs compared at equal quality**: a run with several codecs reports
+  what every newer codec needs against the oldest one at equal VMAF, on the
+  verified rungs (`ladder.CompareRates`), and warns when a newer codec
+  costs more, with where to look (digest, preset, model). A ladder built on
+  `--digest top` says its bitrates are those scenes'. The summary cards of
+  the HTML report show the top rungs as verified, not as planned.
+
+### Changed
+
+- **One analysis and one digest per run**: the ladders of the codecs of a
+  run share the frame analysis and the digest the first of them made
+  (`ladder.Engine.Prepare`, `ladder.Options.Prepared`), instead of making
+  them again for each codec. Every codec is measured on the same file by
+  construction.
+- **Per-shot rungs on long titles**: with `--per-shot`, the digest's
+  segments start on the GOPs of the title, so that each is one GOP of one
+  shot; the shots the digest misses are predicted from their spatial and
+  temporal information instead of the source's bitrate; the shot models are
+  parabolas in CRF bent as the title's curves, where VMAF quadratic in
+  ln(bitrate) promised the top rungs up to 6 VMAF too much; and a per-shot
+  version its verification shows no cheaper than its rung is dropped and
+  reported (`Rung.PerShotRejected`). On a 10-minute title per-shot rungs
+  now save 1.3% over the whole title where they lost about 1%.
+- **Balanced digest**: the segments of the digest a ladder is estimated on
+  are no longer evenly spaced. One still sits in each part of the title,
+  moved inside it until the frames of the digest have the title's spatial
+  and temporal information (SI, TI). On a 10-minute title, the frames of
+  the default 40 s digest then cost what the title's do within 3% instead
+  of 12%, and about half the error of evenly spaced segments over digests
+  of every length (`bench/digestsim`, a new validation tool replaying
+  digests on exact measurements of whole-title encodes); the quality level
+  of the digest is unchanged on average. A standalone `qc ladder` analyses
+  the source first (13 s for that title); `--digest uniform` keeps the
+  previous segments. Library: `ladder.Options.DigestSampling`,
+  `ladder.PlanDigest`, `Result.Digest.Sampling` and `Complexity`, and the
+  `analysis` stage of a build's progress.
+
+### Fixed
+
+- **Data races**: two measurements starting at once could race on the
+  VideoToolbox session pool (`decode`), and the `Progress` callback of a
+  measurement could be entered by two workers at once (`quality`); the
+  announcement of a ladder stage could overlap the progress of the source
+  analysis. Calls of a `Progress` callback never overlap now.
+- **Background jobs**: qc drew its dashboard whenever stderr was a
+  terminal, so a background job (`qc run … &`, `brew test`) was stopped by
+  the kernel (SIGTTOU) at its first terminal setting and never finished. The
+  dashboard now needs qc to be the terminal's foreground job.
+- **CUDA image builds**: the apt updates of `Dockerfile.cuda` leave NVIDIA's
+  repository out (every package comes from Ubuntu) and retry, so a mirror
+  sync of that repository no longer fails the release.
+
+## [1.0.0] - 2026-09-30
+
+First public release: a Go library and the `qc` CLI.
+
+### Added
+
+- **Technical analysis** (`qc analyze`): container and stream info, bitrate
+  over time with peaks, GOP structure and HDR metadata read from the
+  bitstream without decoding (`--fast`, under a second). Then one decode
+  fanned out to SI/TI (ITU-T P.910), shot detection, black and frozen
+  segments, letterbox/pillarbox detection and luma levels.
+- **Audio quality control**, alongside the frame analysis and without
+  adding to its wall time: every audio track (`--audio-tracks`) decoded by
+  ffmpeg to float samples and measured in pure Go (packages `audio`,
+  `audio/loudness`, `audio/defect`): integrated loudness, loudness range,
+  true peak (4× oversampling) and momentary/short-term series per ITU-R
+  BS.1770-5 and EBU Tech 3341/3342, checked against `--loudness-target`
+  (`ebu`, `ebu-live`, `atsc`, `streaming`, `streaming-14` or a LUFS value);
+  silence of the mix and of each channel (`--silence-threshold`,
+  `--silence-duration`), leading and trailing silence, muted channels,
+  empty LFE or centre, clipping, DC offset, out-of-phase segments,
+  inverted polarity, mono as stereo, sample rate, bit depth, layout and
+  stream start offsets. Terminal, HTML (loudness, levels and phase charts
+  per track) and JSON reports, and a `loudness` item for annotated videos;
+  `--no-audio` leaves it out, `--fast --audio` adds it to an inspection.
+  Validated against the synthetic EBU conformance cases (all within
+  tolerance), ffmpeg's `ebur128` on real content (within 0.01 LU / dB) and
+  synthetic defects (`bench/audioval`, [docs/audio.md](docs/audio.md)).
+- **Camera motion** (`analyze/motion`, on by default, `--no-motion` to skip):
+  the global motion of every frame estimated on the shared thumbnails
+  (integral-projection predictor, block matching with a Lucas–Kanade
+  sub-pixel step, robust similarity fit), and each shot's camera work:
+  static, pan, tilt, zoom, tracking (parallax), handheld, mixed, with its
+  direction and a shake measure. JSON columns (`motionPan`, `motionTilt`,
+  `motionZoom`, `motionRoll`, `motionShake`, `motionConfidence`),
+  `video.motion` and `shots[].camera`; a camera section and a shot column in
+  the terminal report; a camera motion chart, card and shot column in the
+  HTML report; a note on shaky shots. About 0.17 ms of one core per frame;
+  validated on synthetic moves of known speed (`bench/motionval`).
+- **Annotated videos** (`--overlay annotated.mp4` on `analyze`, `vmaf` and
+  `run`, and a question of the wizard): a copy of the video with the
+  analysis burnt in as a debug overlay: timecode, frame number, size and
+  keyframes, bitrate, shot and cut markers, camera work with a motion
+  vector, SI/TI, luma levels, HDR light levels, black/frozen/banded/
+  out-of-range badges, the VMAF and other metrics of each scored frame
+  (`--exact` for every frame), and a timeline with a playhead
+  (`--overlay-items` to choose, `--overlay-height` for a smaller, faster
+  copy). Package `overlay` writes an ASS script, frame-accurate at any
+  frame rate below 100 fps, that libass draws in the H.264 encode of the
+  copy (`encode.FFmpeg.Burn`); same frames, timestamps and audio as the
+  source. The copy is encoded by the media engine when there is one
+  (`--overlay-encoder auto`: VideoToolbox on macOS after a test encode,
+  NVENC with `--gpu`, x264 otherwise), in segments split at keyframes and
+  rendered concurrently (`--overlay-workers`), each with its slice of the
+  script, joined without re-encoding (a segment that does not render the
+  frames planned falls back to one pass): 59 minutes of 1080p25 annotated
+  in 217 s on an M2 Max (778 s with x264, 6371 s of CPU against 387 s).
+  ffmpeg's libass, and an explicit hardware encoder, are checked before any
+  work; `qc version --check` lists VideoToolbox; the Docker images ship
+  libass with DejaVu Sans Mono.
+- **Fast frame analysis**: on macOS the video is split at keyframes into
+  segments decoded concurrently by VideoToolbox (`--hwaccel auto`, the
+  default; `videotoolbox` and `none` also accepted), each fed to forks of
+  every analyzer (`analyze.Forker`, `analyze.RunSegments`) whose per-frame
+  series are merged in order: the report is identical to a single pass, to
+  the bit, and a segment that does not start where planned falls back to
+  one. Segments seek on the container's timeline, so a video starting after
+  its audio (some concatenations) no longer falls back. NEON loops on arm64 for SI, TI, luma statistics and thumbnails
+  (checked against the portable Go ones), and Unix sockets instead of pipes
+  for the raw frames. 59 minutes of 1080p25 H.264 analysed in 62–71 s at
+  26 Mbit/s (225 s before) and 49–52 s at 6 Mbit/s (230 s) on an M2 Max; the
+  single CPU pass (other systems, `--hwaccel none`) is 1.1× to 2.7× faster
+  too, depending on the share of the decode. See
+  [analysis.md](docs/analysis.md#performance).
+- **VMAF with a confidence interval** (`qc vmaf`): short clips sampled
+  across shots (stratified, two-stage) until the 95% interval is narrower
+  than `--precision`, with a real coverage validated by replaying thousands
+  of runs (`bench/vmafsim`). Fixed budgets with `--sample` (`5%` of the
+  frames, `2/scene`), and `--exact` to score every frame, bit-exact with
+  Netflix's `vmaf` tool at 8 and 10 bits. VMAF v1 models (v1.0.16) picked
+  automatically, 4K and high frame rate aware.
+- **Metrics beyond VMAF**, measured on the same frames with their own
+  confidence intervals (`--metrics`): XPSNR (a pure-Go port matching
+  ffmpeg's filter, also usable on its own as `quality/xpsnr`), CAMBI banding
+  with banded segments, PSNR, PSNR-HVS, SSIM, MS-SSIM, CIEDE2000, and the
+  whole AOM AV2 common test conditions set with `--av2-ctc`.
+- **VMAF per viewing device** (`--devices phone,tv,4k`), each scored with its
+  VMAF v1 model on the same frames.
+- **Faster VMAF on macOS**: both videos are decoded by concurrent
+  VideoToolbox sessions (`--hwaccel auto`, the default), sweeps are split
+  into concurrent runs, and exact measurements are scored in segments split
+  at keyframes, three libvmaf contexts at once, with two warm-up frames
+  before each so that every frame scores as in a single pass. XPSNR has
+  NEON loops (3.8× faster at 1080p). Results are identical to a CPU run,
+  frame by frame. On an M2 Max: 26.5 → 18.6 s for the ±0.5 measurement of
+  a 10:36 title, 58.7 → 42.1 s for a 59-minute one (184 → 108 s at
+  `--sample 5%`), with a third of the CPU; exact measurements, bound by
+  libvmaf's CPU, 149 → 131 s on the 10:36 title and 897 → 704 s on the
+  59-minute one. See [vmaf.md](docs/vmaf.md#performance).
+- **Per-title ladders** (`qc ladder`) for H.264 (libx264), HEVC (libx265)
+  and AV1 (SVT-AV1): probe encodes of a representative digest, rate-quality
+  curves per resolution, their upper envelope, rungs one just-noticeable
+  difference apart, then a verification encode of every rung. Lands on the
+  exhaustive optimum (−0.04 VMAF, −0.7% bitrate on average) in a fraction
+  of the time (`bench/ladderval`). The curve of the resolution below the top
+  rung's is extended when it might reach the top quality at least 10%
+  cheaper, so easy content gets a cheaper lower-resolution top rung.
+  - Imposed shapes: a rung count or the rung resolutions (`--rungs
+    1080,720,540,360`), with the bitrates computed; top and minimum VMAF,
+    bitrate bounds, 8 or 10-bit encodes (`--encode-bit-depth`).
+  - Adaptive probing (`--probing adaptive`): extra probes where the rungs
+    are uncertain.
+  - Probes at a faster preset (`--probe-preset`): the rungs are planned on
+    them, then the top and bottom rungs encoded at `--preset` anchor the
+    probes onto it (bitrate ratio and CRF offset between the presets); for
+    slow delivery presets (SVT-AV1 preset 4 probed at 8: −24% time, same
+    rungs).
+  - Per-shot rungs (`--per-shot`): one CRF per shot at an equal
+    rate-quality slope, with the per-shot ladder view (every shot's CRF,
+    bitrate and VMAF per rung, and each rung's pooled bitrate over the
+    title) in the terminal, HTML and JSON reports. The chunks of an encode
+    and the per-shot verifications run concurrently, and the source's
+    shots come from the analysis `qc run` already made, or from one run
+    alongside the probes (per-shot stage −20% on the drama). Experimental per-shot
+    resolution (`--per-shot-resolution`, implies `--per-shot`): shots also
+    pick their resolution among neighbouring rung resolutions, at equal
+    slope.
+  - AV1 film grain synthesis (`--film-grain auto` or a level), detected and
+    calibrated (the three calibration levels encoded concurrently),
+    fidelity scored against a denoised reference. It cannot be
+    combined with per-shot rungs: the combination is rejected before any
+    work.
+  - Verified rungs checked for banding and for VMAF/XPSNR ranking
+    disagreements.
+  - Renditions (`--encode-ladder <folder>`, also asked by the wizard): the
+    ladder encoded on the whole title with the settings of each rung, and
+    each rung's per-shot version, with progress in the dashboard. Each
+    rendition is checked against the source (`--no-rendition-check` skips
+    it): its VMAF with its confidence interval and its bitrate, shown next
+    to the predictions in the reports, with findings when they drift from
+    them (quality beyond the check's interval, bitrate beyond Apple's 10%
+    `BANDWIDTH` rule).
+- **HDR** ([docs/hdr.md](docs/hdr.md)): HDR10, PQ and HLG detected from the
+  stream and its first frame (HDR10 metadata in SEI, HDR10+), Dolby Vision
+  and HDR10+ reported without processing their dynamic metadata; signalling
+  checks (BT.2020 primaries and matrix, 10 bits, narrow range, missing
+  mastering display or content light level). MaxCLL and MaxFALL measured
+  during the frame analysis (CTA-861.3, on a grid of 10-bit samples that
+  ffmpeg writes to a second pipe of the same decode, robust to 4:2:0 chroma
+  overshoots) and compared with the signalled
+  values, with the peak and average light of every frame charted. wPSNR
+  (JVET HDR test conditions) and ΔE ITP (ITU-R BT.2124, mean and 99th
+  percentile) measured in pure Go on the frames VMAF scores, with their
+  confidence intervals (`quality/hdr`). VMAF on HDR is labelled as not
+  HDR-calibrated, or scored on an SDR tone mapping with `--hdr-metric
+  tonemap`. HDR ladders encode in 10 bits and carry the colour description
+  and HDR10 metadata on every probe, rung and rendered command (x265,
+  SVT-AV1; colour tags for x264 and NVENC). The wizard asks the tone mapping
+  question for HDR sources.
+- **`qc run`**: analysis, VMAF against a reference (`-r`) and ladders for
+  several codecs in one command and one report.
+- **Terminal UI**: a live dashboard with progress, ETA and panels showing
+  VMAF converging and probes landing on a braille rate-quality chart; an
+  interactive wizard (`qc` without arguments), opened by the pixel logo in
+  square half-block pixels with a light sweeping across it once (still with
+  `QC_NO_ANIMATION`, `NO_COLOR` or `ACCESSIBLE`): full screen, with a step
+  indicator (Source › Analysis › Quality › Ladder › Outputs › Review) and a
+  progress rail, a video browser with type-to-filter and the metadata of
+  the highlighted file (codec, resolution, frame rate, bit depth, duration,
+  HDR format, audio tracks, read by ffprobe) that refuses unreadable files
+  and files without a video stream, a summary of the answers beside the
+  form on wide terminals, and a review of every choice with the exact
+  equivalent command before running (run, edit a section, or cancel). It
+  adapts to light and dark terminals and to their size (80×24 and up),
+  falls back to ASCII without colours (`NO_COLOR`, `TERM=dumb`, non-UTF-8
+  locale), and asks plain prompts for screen readers (`ACCESSIBLE=1`).
+- **Reports**: text in the terminal, JSON (`-f json`, `-o report.json`,
+  `schemaVersion` 1) and self-contained interactive HTML (`--html`): a
+  single offline file with an overall verdict (pass, needs attention, fail:
+  the blocking rule lives in `internal/findings`), key numbers with
+  sparklines and meters, findings filterable by kind, sections grouped by
+  area (video, audio, quality, one per ladder, encoding) behind a sidebar
+  navigation and a quick search (`/`, ⌘K), zoomable charts with exact
+  per-frame tooltips, a crosshair synchronised across time charts and
+  labelled targets and thresholds, light and dark themes, and a clean A4
+  print. Set in an embedded Inter subset (SIL OFL, 43 KB).
+- **NVIDIA GPUs** (`--gpu`): NVDEC decoding (`--hwaccel cuda`, frames
+  identical to a CPU decode, or `cuda-scale` with GPU scaling), NVENC
+  ladders (`--encoder nvenc`: `h264_nvenc`, `hevc_nvenc`, `av1_nvenc`, same
+  engine, without per-shot rungs or film grain synthesis) and CUDA VMAF
+  feature extraction (`--vmaf-backend cuda|auto`, VMAF v0.6.1 family; VMAF
+  v1 stays on the CPU and the report says why). ffmpeg's NVIDIA support,
+  the device and each NVENC encoder are checked before any work. The CUDA
+  image (`Dockerfile.cuda`, `ghcr.io/eko/qc:<version>-cuda`) ships libvmaf
+  and ffmpeg built for it, and the validation kit (`bench/gpuval`, `make
+  gpu-validate`) measures NVDEC, CUDA VMAF and NVENC on your GPU. See
+  [docs/gpu.md](docs/gpu.md).
+- Every flag can be set through a `QC_` environment variable, or in a YAML,
+  TOML or JSON configuration file keyed by flag name (`--config`,
+  `QC_CONFIG`); flags win over the environment, which wins over the file.
+- **`qc version`**: the versions of qc, Go and libvmaf; `--check` also checks
+  ffmpeg, ffprobe, the libx264, libx265 and libsvtav1 encoders, NVENC and a
+  loadable VMAF v1 model, for bug reports.
+- **Packaging**: a Docker image (`ghcr.io/eko/qc`, linux/amd64 and
+  linux/arm64) with qc, libvmaf 3.2.1 and its models, and ffmpeg with
+  libx264, libx265, SVT-AV1 and dav1d; a Homebrew formula for the
+  `eko/tap` tap; `go install` with version information.
+
+### Fixed
+
+- **VideoToolbox on virtual machines**: a virtualised GPU (a macOS VM, a
+  GitHub runner) decoded 8-bit H.264 chroma differently from the CPU, so
+  chroma metrics (PSNR Cb/Cr, XPSNR U/V) changed with `--hwaccel auto`
+  while luma and VMAF did not. qc now checks once per process that
+  VideoToolbox decodes two reference clips exactly as the CPU does, and
+  decodes on the CPU with a warning where it does not
+  (`decode.VideoToolboxExact`).
+- **libvmaf without the VMAF v1 extractors**: Homebrew's libvmaf 3.2.0
+  lacks `speed_chroma`, and loading the default model failed with "invalid
+  argument"; the error now says which libvmaf is needed
+  (`vmaf.ErrModelFeatures`).
+- **Comparisons refused for a timestamp gap**: two videos were compared only
+  if their average frame rates matched, and the average is the frame count
+  over the duration, which a gap in the timestamps lengthens. An AV1 encode
+  of a source whose last frame came two frames late averaged 24.97 fps
+  against the source's 25, and its check failed although every frame
+  matched. Videos with the same nominal frame rate now compare; frames are
+  matched by their timestamps.
+- **Rungs at a lower resolution than the optimum's**: a rung can only take a
+  resolution probed at its bitrate, and fixed probe CRFs could stop a higher
+  resolution well above the lower rungs (an AV1 1080p curve at 1 Mb/s on
+  content that compresses well), which then fell to 720p, 540p or 360p where
+  1080p or 720p was 30–78% cheaper. Challenger probes now probe the higher
+  resolution at such rungs' bitrates before the rungs are placed
+  (`probing.challengers`). `bench/ladderval` extends its grid until every
+  resolution covers the rungs' bitrates (its optimum had the same blind
+  spot: a drama's AV1 ladder read +0.7% and was +7.4%), and
+  `bench/ladderreplay` replays the engine on exact grids to compare probing
+  changes in milliseconds.
+
+- **Ladder quality level**: every probe and rung was scored on the same
+  sampled frames, whose error the measurements shared (up to about 1 VMAF);
+  at the top of a curve that is 25–30% of bitrate. A top rung encoded once
+  and scored both sampled and exactly now puts every probe and sampled rung
+  measurement on the exact scale (`probing.level`), the top rung is verified
+  on every frame and corrected to within 0.5 VMAF of its target (a second
+  secant step when the first falls short), and the top-rung finding reports
+  the verified quality. On a 59-minute title at `--top-vmaf 94`, the AV1 top
+  rung went from 5.00 Mb/s (about 94.6) to 4.23 Mb/s (93.83), 22% below
+  H.264 instead of above it.
+
+- **An encoder freezing no longer hangs a ladder**: an encode whose output
+  stops growing for 5 minutes is stopped and run once more, then reported
+  (`encode.ErrStalled`). SVT-AV1 at its fastest presets was seen to freeze
+  with no CPU use, once in a few dozen builds.
+
+- **Ladders of a video whose first frame is not the container's start**: a
+  video starting after its audio (some concatenations: the first video
+  frame at 0.04 s, the audio at 0), or a container starting before 0 (a
+  Matroska file keeping its AAC priming at −21 ms). ffmpeg counts `-ss`
+  from the container's start, and the digest's segments and the chunks of
+  per-shot rungs were planned on the video's own timeline, so each one
+  started early by the offset (a frame or more at 50 fps). The digest
+  missed its segments' first frames (misplacing the shots' pieces), and the
+  per-shot commands (and `bench/ladderval`'s chunked encodes of the title)
+  duplicated frames at every chunk join. Every seek is now absolute
+  (`-seek_timestamp 1 -ss origin+t`, from the video's first frame), as
+  decoding's already were: the per-shot commands all carry
+  `-seek_timestamp 1`.
+- **Per-shot rungs of Matroska sources at 60, 59.94, 29.97 or 23.976
+  fps** had a hole of one frame in their timestamps at some chunk joins
+  (every frame present and right, but a variable frame rate, e.g. an
+  average of 1350/23 instead of 60 fps, which players and packagers
+  mishandle). Each chunk's time was counted from its output seek, half a
+  frame before its first frame: with Matroska's millisecond timestamps,
+  the frames fell on either side of the encoder's half ticks, and a frame
+  rounded up left a gap. Chunks now trim their preroll in their filter
+  chain and restart their timestamps at their first frame
+  (`trim=start=…,setpts=PTS-STARTPTS`, replacing the output `-ss`), so the
+  concat and MPEG-TS joins are constant frame rate at the source's rate.
+
+### Library API
+
+The packages of the first release, for Go programs that embed qc:
+
+- **Wiring**: services depend on small ports declared by their consumers
+  and are built with constructor injection (see
+  [docs/architecture.md](docs/architecture.md#ports)).
+  `quality.NewMeter(decoder, engine)` takes the scoring engine as a
+  `quality.Engine` (`libvmaf.NewEngine()`); `analysis.New` takes an
+  `analysis.Meter` (`quality.Meter`); `ladder.NewEngine(inspector, encoder,
+  digester, opts...)` takes `ladder.Inspector`, `ladder.Encoder` and
+  `ladder.Digester` (all but the first satisfied by `encode.FFmpeg`), and
+  film grain synthesis needs `ladder.WithGrainLab` (`ladder.ErrNoGrainLab`
+  otherwise).
+- **VMAF without cgo**: package `vmaf` is pure Go (models, devices,
+  backends, the `Models`/`Scorer` contract); the cgo binding lives in
+  `vmaf/libvmaf` (`LoadModel(spec)`, `New(models, vmaf.ScorerConfig)`,
+  `Version`, `InitCUDA`, `CUDABuilt`), so `analysis`, `ladder`, `pipeline`
+  and `quality` build with `CGO_ENABLED=0`. `vmaf.ResolveBackend` takes the
+  CUDA initialisation to use.
+- **No mutable package state**: defaults are functions returning copies
+  (`vmaf.DefaultModelDirs()`, `vmaf.Devices()`, `quality.Metrics()`,
+  `quality.AV2CTCMetrics()`, `ladder.DefaultHeights()`).
+- **Encoding**: `encode.FFmpeg` encodes and extracts digests
+  (`FFmpeg.Digest(ctx, encode.DigestSpec)`, whose `Origin` is the time of
+  the video's first frame on the container's timeline) and encodes chunk
+  by chunk (`FFmpeg.EncodeChunks` and `Codec.ChunkCommandLine`, reading an
+  `encode.ChunkSource`: path, frame rate and origin); codecs are looked up with
+  `encode.Lookup` and `encode.LookupFor(name, encode.HardwareNVENC)`, and
+  say what their encoder supports (`Codec.Supports`); noise measurements
+  are `grain.Stats` (package `analyze/grain`).
+- **Comparisons**: `analysis.CompareOptions{Bitstream, Quality, Reference,
+  Distorted}` reuses reports already computed; `quality.ErrNoFramesToCompare`
+  is returned when an input has no bitstream report or no frame to score.
+- **Runs**: `pipeline.Runner` hands each stage's typed result to
+  `Hooks.Done` (`pipeline.StageResult`: the analysis, comparison or ladder),
+  and `pipeline.Options.LadderSource` builds the ladders from another video
+  than the one analysed (the mezzanine of an encode under test).
+- **Ladders**: `ladder.Result.ShotLadder(rung)` iterates over a per-shot
+  rung's allocation shot by shot, `PerShot.PooledBitrate` prices it over the
+  title, and `ladder.CalibrationTolerance` is the prediction gap beyond which
+  a rung is calibrated. `ladder.Engine.Encode` encodes a ladder's
+  renditions (`ladder.WithRenditionEncoder`, `encode.FFmpeg.EncodeRendition`),
+  `Result.RungParams` gives a rung's encode settings and `Result.Prediction`
+  a rendition's predicted quality and bitrate; `pipeline.Options.Renditions`
+  adds a renditions stage after each ladder.
+- **HDR**: `media.Color.IsHDR`, `media.VideoStream.MeasurableHDR`,
+  `media.MasteringDisplay` primaries and white point, `media.HDR.HDR10Plus`
+  and `media.DynamicRangeHDR10Plus`; `analysis.VideoReport.Light`
+  (`analyze/light`: MaxCLL, robust MaxCLL, MaxFALL) and the `peakNits`,
+  `robustPeakNits`, `averageNits` columns; `quality.Options.HDRMetric`
+  (`quality.HDRMetricPQ`, `HDRMetricToneMap`) and `SkipHDRMetrics`,
+  `quality.Result.HDR` (`quality.HDRReport`), the `quality.SeriesWPSNR*` and
+  `SeriesDeltaEITP*` series; package `quality/hdr`; `decode.Request.ToneMap`,
+  `frame.PoolOptions.SampleStep`, `frame.Pool.GridSize` and `SamplePlanes`;
+  `probe.FFprobe.ProbeStreams` and `ProbeHDR`, `analysis.HDRProber` and
+  `analysis.Options.DeferHDRMetadata` (the first frame's HDR metadata read
+  while decoding or measuring); `encode.Signal`, `encode.SignalOf` and
+  `encode.Params.Signal`; `ladder.Options.HDRMetric`, `ContentLight` and
+  `ladder.Result.HDR` (`ladder.HDRLadder`).
+- **Decoding**: `decode.Request.Origin` (seeks on the container's
+  timeline), `decode.SegmentHWAccelReporter` (the hardware mode of segment
+  decodes, reported in `quality.Result.HWAccel`), and the `segments` plan
+  of `quality.Result.Plans`.
+- **GPUs**: `decode.WithHWAccel` (reported through `decode.HWAccelReporter`),
+  `quality.Options.Backend`, `ladder.Options.Encoder` and `Backend`,
+  `quality.Result.GPUSummary`, and package `nvidia` to check the GPU before
+  a long run (`nvidia.Check`, `nvidia.Available`).
+
+[Unreleased]: https://github.com/eko/qc/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/eko/qc/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/eko/qc/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/eko/qc/compare/v1.2.1...v1.3.0
+[1.2.1]: https://github.com/eko/qc/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/eko/qc/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/eko/qc/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/eko/qc/releases/tag/v1.0.0

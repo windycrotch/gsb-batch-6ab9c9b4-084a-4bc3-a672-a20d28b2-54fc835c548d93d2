@@ -1,0 +1,263 @@
+package ladder
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
+
+	"github.com/eko/qc/analysis"
+	"github.com/eko/qc/media"
+)
+
+// ErrPreparedSource is returned when a build is given the Prepared of
+// another source.
+var ErrPreparedSource = errors.New("prepared for another source")
+
+// Prepared is a source the ladders of several codecs are built from, one
+// build after the other (Options.Prepared): what one build makes of the
+// source, the next ones read instead of making it again. That is its
+// inspection, its frame analysis when a digest placed on the content or
+// per-shot rungs needed one, and its digest, which builds asking for the
+// same segments share as one file: every codec is then measured on the very
+// same frames, by construction. Close removes its files.
+//
+// A Prepared is for builds run one at a time; it is safe to read from the
+// goroutines of one build.
+type Prepared struct {
+	source     string
+	inspection *analysis.Report
+	// program lists the videos of a program, the source first (see
+	// PrepareProgram); nil for one title.
+	program []string
+
+	mu sync.Mutex
+	// frames is the frame analysis of the source, once a build made one.
+	frames *analysis.Report
+	// titles are what the builds made of the videos of a program, by path:
+	// their inspections and frame analyses.
+	titles map[string]preparedTitle
+	// dir holds the digest and cleanup removes it; both are unset for the
+	// Prepared a build makes for itself.
+	dir     string
+	cleanup func()
+	// digest is the digest extracted last: its segments, file and
+	// inspection.
+	digest       []media.Interval
+	digestPath   string
+	digestReport *analysis.Report
+	// decodeCPU is the CPU time decoding its segments from the source
+	// takes (Digest.DecodeCPU), once a build measured it.
+	decodeCPU float64
+}
+
+// preparedTitle is what the builds share of a video of a program.
+type preparedTitle struct {
+	inspection, frames *analysis.Report
+}
+
+// Prepare inspects source and returns what the builds of its ladders share
+// (Options.Prepared). Nothing else is made yet: the first build analyses
+// the source and extracts the digest as it needs them, reporting them
+// through its own Progress and Timings, and the next builds reuse them. The
+// digest is kept in a temporary directory of its own, which outlives the
+// builds: the caller closes the Prepared once they are done.
+func (e *Engine) Prepare(
+	ctx context.Context,
+	source string,
+) (*Prepared, error) {
+	return e.PrepareInspected(ctx, []string{source}, nil)
+}
+
+// PrepareProgram is Prepare for the ladders of a program
+// (Engine.BuildProgram): the builds of its codecs share the inspections and
+// the frame analyses of its videos, and one digest.
+func (e *Engine) PrepareProgram(
+	ctx context.Context,
+	sources []string,
+) (*Prepared, error) {
+	return e.PrepareInspected(ctx, sources, nil)
+}
+
+// PrepareInspected is PrepareProgram for a first source already inspected
+// (or analysed) as inspection says: it is not inspected again, which for
+// an hour of video saves reading its packets a second time. A nil
+// inspection is made here.
+func (e *Engine) PrepareInspected(
+	ctx context.Context,
+	sources []string,
+	inspection *analysis.Report,
+) (*Prepared, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("ladder: %w", ErrNoSource)
+	}
+
+	prepared := &Prepared{source: sources[0], inspection: inspection}
+
+	if inspection == nil || inspection.Info == nil {
+		var err error
+		if prepared, err = e.inspect(ctx, sources[0]); err != nil {
+			return nil, err
+		}
+	}
+
+	var err error
+	if prepared.dir, prepared.cleanup, err = workDir(""); err != nil {
+		return nil, err
+	}
+
+	if len(sources) > 1 {
+		prepared.program = slices.Clone(sources)
+	}
+
+	return prepared, nil
+}
+
+// inspect returns a Prepared holding the inspection of source and nothing
+// else: the one a build makes for itself, whose digest lives and dies in
+// the work directory of that build.
+func (e *Engine) inspect(
+	ctx context.Context,
+	source string,
+) (*Prepared, error) {
+	inspection, err := e.inspector.Analyze(ctx, source, analysis.Options{SkipVideo: true})
+	if err != nil {
+		return nil, fmt.Errorf("ladder: inspect %s: %w", source, err)
+	}
+
+	return &Prepared{source: source, inspection: inspection}, nil
+}
+
+// Close removes the files of the Prepared (its digest). Builds must not use
+// it afterwards. A nil Prepared closes to nothing.
+func (p *Prepared) Close() {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.cleanup != nil {
+		p.cleanup()
+	}
+
+	p.cleanup, p.dir, p.digest = nil, "", nil
+}
+
+// analysis returns the frame analysis a build already made of the source,
+// nil before any.
+func (p *Prepared) analysis() *analysis.Report {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.frames
+}
+
+// keepAnalysis records the frame analysis a build made of the source.
+func (p *Prepared) keepAnalysis(
+	report *analysis.Report,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.frames = report
+}
+
+// title returns what the builds made of the video of a program at path.
+func (p *Prepared) title(
+	path string,
+) preparedTitle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.titles[path]
+}
+
+// keepTitle records what a build made of the video of a program at path.
+func (p *Prepared) keepTitle(
+	path string,
+	title preparedTitle,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.titles == nil {
+		p.titles = map[string]preparedTitle{}
+	}
+
+	p.titles[path] = title
+}
+
+// sharedDigest returns the file and inspection of the digest of these
+// segments, when a build extracted it already.
+func (p *Prepared) sharedDigest(
+	segments []media.Interval,
+) (string, *analysis.Report, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.digest == nil || !slices.Equal(p.digest, segments) {
+		return "", nil, false
+	}
+
+	return p.digestPath, p.digestReport, true
+}
+
+// sharedDecode returns the CPU time of decoding these segments of the
+// digest from the source, when a build measured it already.
+func (p *Prepared) sharedDecode(
+	segments []media.Interval,
+) (float64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.decodeCPU == 0 || !slices.Equal(p.digest, segments) {
+		return 0, false
+	}
+
+	return p.decodeCPU, true
+}
+
+// keepDecode records the CPU time of decoding the segments of the digest
+// from the source.
+func (p *Prepared) keepDecode(
+	segments []media.Interval,
+	cpu float64,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if slices.Equal(p.digest, segments) {
+		p.decodeCPU = cpu
+	}
+}
+
+// digestDir returns the directory the digest is written to: its own, or
+// buildDir, the work directory of the build, for the Prepared that build
+// made for itself.
+func (p *Prepared) digestDir(
+	buildDir string,
+) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.dir == "" {
+		return buildDir
+	}
+
+	return p.dir
+}
+
+// keepDigest records the digest a build extracted.
+func (p *Prepared) keepDigest(
+	segments []media.Interval,
+	path string,
+	report *analysis.Report,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.digest, p.digestPath, p.digestReport, p.decodeCPU = slices.Clone(segments), path, report, 0
+}

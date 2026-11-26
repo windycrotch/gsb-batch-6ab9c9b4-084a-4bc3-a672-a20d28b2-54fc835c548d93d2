@@ -1,0 +1,593 @@
+package tui
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/eko/qc/encode"
+	"github.com/eko/qc/ladder"
+	"github.com/eko/qc/quality"
+)
+
+func renderLadder(
+	t *testing.T,
+	res *ladder.Result,
+	width int,
+	jsonPath string,
+	commands bool,
+) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	require.NoError(t, RenderLadder(&buf, res, ReportOptions{Width: width, JSONPath: jsonPath, Commands: commands}))
+
+	return plain(buf.String())
+}
+
+func TestRenderLadder(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name     string
+		jsonPath string
+		commands bool
+		want     []string
+		wantNot  []string
+	}{
+		{
+			name: "report",
+			want: []string{
+				"◆ qc  ·  ladder",
+				"source      /videos/source.mov",
+				"            h264 · 1920×1080 · 25.000 fps · 1:00.000",
+				"target      h264 (libx264, preset fast)",
+				"digest      2 segment(s) · 0:04.000 · 6.7% of the title · 8 probe encodes",
+				"Rate / quality  (VMAF vs bitrate, log scale)", "━━ 1080p", "━━ 720p", "━━ 360p", "1…3 rungs",
+				"Ladder", "measured VMAF",
+				"⚡ digest 1.2s · probe 40s · verify 12s · total 53.4s",
+			},
+			wantNot: []string{"Encoding commands", "written to", "4.00 Mb/s"},
+		},
+		{
+			name:     "with commands and JSON",
+			jsonPath: "ladder.json",
+			commands: true,
+			want: []string{
+				"Encoding commands\nffmpeg -i source.mov -c:v libx264 -crf 24.5 1080p.mp4\n",
+				"✓ full report written to ladder.json",
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			out := renderLadder(t, sampleLadder(t), 100, testCase.jsonPath, testCase.commands)
+
+			for _, want := range testCase.want {
+				assert.Contains(t, out, want)
+			}
+
+			for _, unwanted := range testCase.wantNot {
+				assert.NotContains(t, out, unwanted)
+			}
+		})
+	}
+}
+
+func TestRenderLadderLayout(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name  string
+		width int
+		want  int
+		ticks []string
+	}{
+		{name: "regular", width: 100, want: 100, ticks: []string{"500k", "1M", "2M"}},
+		{name: "clamped to the table width", width: 20, want: minLadderWidth, ticks: []string{"500k", "1M", "2M"}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			lines := strings.Split(renderLadder(t, sampleLadder(t), testCase.width, "", false), "\n")
+
+			// Every row of the plot, labelled every 10 VMAF from under the
+			// lowest rung (64.1) to 100.
+			plot := append(linesWith(lines, "┤"), linesWith(lines, "│")...)
+			require.Len(t, plot, rqChartHeight)
+
+			labels := make([]string, 0, len(plot))
+			for _, line := range linesWith(lines, "┤") {
+				labels = append(labels, strings.Fields(plain(line))[0])
+			}
+
+			assert.Equal(t, []string{"100", "90", "80", "70", "60", "50"}, labels)
+
+			// The bitrates the rungs span (360 kb/s to 3.1 Mb/s), widened,
+			// ticked at round values.
+			axis := linesWith(lines, "└")
+			require.Len(t, axis, 1)
+
+			ticks := linesStarting(lines, "500k ")
+			require.Len(t, ticks, 1)
+			assert.Equal(t, testCase.ticks, strings.Fields(ticks[0]))
+
+			for _, w := range widths(append(plot, append(axis, ticks...)...)) {
+				assert.Equal(t, testCase.want, w)
+			}
+		})
+	}
+}
+
+// TestLadderTableAlignment checks that coloured cells do not shift columns:
+// fmt widths count escape sequences, display widths do not.
+func TestLadderTableAlignment(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name     string
+		rungs    func() []ladder.Rung
+		wantHead string
+	}{
+		{name: "verified", rungs: sampleRungs, wantHead: "measured VMAF"},
+		{
+			name: "adaptive predictions carry their half-width",
+			rungs: func() []ladder.Rung {
+				rungs := sampleRungs()
+				for i := range rungs {
+					rungs[i].PredictionError = 0.4
+				}
+
+				return rungs
+			},
+			wantHead: "measured VMAF",
+		},
+		{
+			name: "not verified",
+			rungs: func() []ladder.Rung {
+				rungs := sampleRungs()
+				for i := range rungs {
+					rungs[i].Measured, rungs[i].Calibrated = nil, false
+				}
+
+				return rungs
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			lines := plainLines(ladderTable(testCase.rungs()))
+			require.Len(t, lines, 2+3)
+
+			head := lines[1]
+			if testCase.wantHead != "" {
+				assert.Contains(t, head, testCase.wantHead)
+			} else {
+				assert.NotContains(t, head, "measured")
+			}
+
+			for _, row := range lines[2:] {
+				row = strings.TrimSuffix(row, " ✱")
+				assert.Equal(t, len([]rune(head)), len([]rune(row)), "%q\n%q", head, row)
+			}
+
+			assert.True(t, strings.HasPrefix(lines[2], "  1   1920×1080     3.10 Mb/s   24.5   6.20 Mb/s"), lines[2])
+			assert.Contains(t, lines[2], "95.0")
+		})
+	}
+
+	assert.Empty(t, ladderTable(nil))
+}
+
+func TestRungRowCalibrated(
+	t *testing.T,
+) {
+	row := plain(rungRow(1, sampleRungs()[1]))
+
+	assert.True(t, strings.HasSuffix(row, "84.1 ± 0.7   1.10 Mb/s ✱"), row)
+}
+
+func TestLadderFindings(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name   string
+		mutate func(r *ladder.Result)
+		want   []string
+	}{
+		{
+			name:   "verified h264 ladder with a calibrated rung",
+			mutate: func(*ladder.Result) {},
+			want: []string{
+				"✓ VMAF 95.3 at 2.97 Mb/s (1080p): target 95 reached",
+				"✓ top rung 60% lighter than Apple's static 1080p rung (7.8 Mb/s)",
+				"✓ verification: measured VMAF within 2.5 of the prediction on every rung (VBV-capped encodes of the digest)",
+				"✱ 1 rung(s) missed the prediction by more than 1.5 (0.5 for the top rung) and had their CRF corrected (secant step) and re-measured",
+			},
+		},
+		{
+			name: "title never reaching the top VMAF, verification off by more than half a step",
+			mutate: func(r *ladder.Result) {
+				r.Rungs[0].PredictedVMAF = 91
+				r.Rungs[0].Measured.VMAF = 91
+				r.Rungs[0].Bitrate = 9_000_000
+				r.Rungs[1].Calibrated = false
+				r.Rungs[2].Measured.VMAF = 70
+			},
+			want: []string{
+				"▲ top rung at VMAF 91.0 (1080p), below the target 95",
+				"▲ verification: measured VMAF within 5.9 of the prediction on every rung (VBV-capped encodes of the digest)",
+			},
+		},
+		{
+			name: "unverified AV1 ladder",
+			mutate: func(r *ladder.Result) {
+				r.Codec = encode.Codec{Name: "av1", Encoder: "libsvtav1"}
+				for i := range r.Rungs {
+					r.Rungs[i].Measured, r.Rungs[i].Calibrated = nil, false
+				}
+			},
+			want: []string{"✓ VMAF 95.0 at 3.10 Mb/s (1080p): target 95 reached"},
+		},
+		{
+			name: "rung findings grouped by kind, calibrated rungs last",
+			mutate: func(r *ladder.Result) {
+				r.Rungs[0].Grain = &ladder.GrainCheck{Ratio: 0.5}
+				r.Rungs[0].Grain.Source.Sigma, r.Rungs[0].Grain.Output.Sigma = 2, 1
+				r.Rungs[1].Extrapolated = true
+				r.Rungs[2].Extrapolated, r.Rungs[2].Calibrated = true, true
+				r.Rungs[2].Measured.BandedFrames, r.Rungs[2].Measured.ScoredFrames = 10, 20
+				r.Rungs[1].Measured.Metrics = map[string]float64{quality.SeriesXPSNRY: 35}
+				r.Rungs[2].Measured.Metrics = map[string]float64{quality.SeriesXPSNRY: 36}
+			},
+			want: []string{
+				"✓ VMAF 95.3 at 2.97 Mb/s (1080p): target 95 reached",
+				"✓ top rung 60% lighter than Apple's static 1080p rung (7.8 Mb/s)",
+				"✓ verification: measured VMAF within 2.5 of the prediction on every rung (VBV-capped encodes of the digest)",
+				"▲ 720p rung targets a quality outside the probed range of that resolution: its prediction is extrapolated, trust the measured value",
+				"▲ 360p rung targets a quality outside the probed range of that resolution: its prediction is extrapolated, trust the measured value",
+				"▲ 1080p rung: synthesised grain at 50% of the source's (σ 1.00 vs 2.00)",
+				"▲ rung 3 (360p): visible banding on 50% of the scored frames (CAMBI > 5): a 10-bit encode fixes it better than more bitrate",
+				"▲ rungs 2 (720p) and 3 (360p): VMAF ranks 720p higher (84.1 vs 64.5) but XPSNR ranks it lower (35.00 vs 36.00 dB)",
+				"✱ 2 rung(s) missed the prediction by more than 1.5 (0.5 for the top rung) and had their CRF corrected (secant step) and re-measured",
+			},
+		},
+		{
+			name:   "no rung",
+			mutate: func(r *ladder.Result) { r.Rungs = nil },
+			want:   []string{"▲ no rung could be selected"},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			res := sampleLadder(t)
+			testCase.mutate(res)
+
+			var got []string
+			for _, line := range ladderFindings(res) {
+				got = append(got, plain(line))
+			}
+
+			assert.Equal(t, testCase.want, got)
+		})
+	}
+}
+
+func TestRenderLadderWithoutProbes(
+	t *testing.T,
+) {
+	res := sampleLadder(t)
+	res.Probes, res.Timings = nil, nil
+
+	out := renderLadder(t, res, 80, "", false)
+
+	assert.Contains(t, out, "1…3 rungs", "rungs are still plotted")
+	assert.Contains(t, out, "⚡ total 53.4s")
+}
+
+func TestResolutionLegend(
+	t *testing.T,
+) {
+	var got []string
+	for _, l := range resolutionLegend(sampleProbes()) {
+		got = append(got, plain(l))
+	}
+
+	assert.Equal(t, []string{"━━ 1080p", "━━ 720p", "━━ 360p"}, got, "highest resolution first")
+}
+
+func TestVMAFFloor(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name   string
+		lowest float64
+		want   float64
+	}{
+		{name: "rounds down to ten", lowest: 64.1, want: 60},
+		{name: "never below zero", lowest: -3, want: 0},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.InDelta(t, testCase.want, vmafFloor(testCase.lowest), 1e-9)
+		})
+	}
+}
+
+func TestRenderWritten(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name     string
+		jsonPath string
+		htmlPath string
+		want     string
+	}{
+		{name: "nothing written", want: ""},
+		{name: "JSON", jsonPath: "a.json", want: "✓ report written to a.json\n"},
+		{name: "both", jsonPath: "a.json", htmlPath: "a.html", want: "✓ report written to a.json\n✓ report written to a.html\n"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			require.NoError(t, RenderWritten(&buf, testCase.jsonPath, testCase.htmlPath))
+			assert.Equal(t, testCase.want, plain(buf.String()))
+		})
+	}
+}
+
+func TestRenderWrittenVideo(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "no copy", want: ""},
+		{name: "copy", path: "a.mp4", want: "✓ annotated video written to a.mp4\n"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			require.NoError(t, RenderWrittenVideo(&buf, testCase.path))
+			assert.Equal(t, testCase.want, plain(buf.String()))
+		})
+	}
+}
+
+func TestLadderShape(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name   string
+		mutate func(res *ladder.Result)
+		want   []string
+	}{
+		{
+			name:   "automatic",
+			mutate: func(res *ladder.Result) { res.Shape = ladder.ShapeAuto },
+			want:   []string{"shape       automatic: from VMAF 95 down by 6 points"},
+		},
+		{
+			name: "balanced digest of a source analysed first",
+			mutate: func(res *ladder.Result) {
+				res.Digest.Sampling, res.Timings[ladder.StageAnalysis] = ladder.DigestBalanced, "13s"
+			},
+			want: []string{
+				"digest      2 segment(s), balanced on SI/TI · 0:04.000 · 6.7% of the title",
+				"analysis 13s · digest 1.2s · probe 40s",
+			},
+		},
+		{
+			name: "rung count",
+			mutate: func(res *ladder.Result) {
+				res.Shape, res.Constraints.Rungs = ladder.ShapeCount, 5
+			},
+			want: []string{"shape       5 rungs requested, VMAF 95 down to the title's floor, resolutions automatic"},
+		},
+		{
+			name: "imposed resolutions with an extrapolated rung",
+			mutate: func(res *ladder.Result) {
+				res.Shape, res.Constraints.Resolutions = ladder.ShapeResolutions, []int{1080, 720, 360}
+				res.Rungs[len(res.Rungs)-1].Extrapolated = true
+			},
+			want: []string{
+				"shape       resolutions requested (1080p, 720p, 360p), VMAF 95 down to the title's floor",
+				"rung targets a quality outside the probed range of that resolution",
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			res := sampleLadder(t)
+			res.Constraints = res.Constraints.WithDefaults()
+			testCase.mutate(res)
+
+			out := renderLadder(t, res, 100, "", false)
+			for _, want := range testCase.want {
+				assert.Contains(t, out, want)
+			}
+		})
+	}
+}
+
+func TestRenderCodecs(
+	t *testing.T,
+) {
+	compared := func(codec string, pairs ...float64) *ladder.Result {
+		l := sampleLadder(t)
+		l.Codec.Name, l.Rungs = codec, nil
+
+		for i := 0; i < len(pairs); i += 2 {
+			l.Rungs = append(l.Rungs, ladder.Rung{
+				Measured: &ladder.Measurement{Bitrate: int64(pairs[i] * 1000), VMAF: pairs[i+1]},
+			})
+		}
+
+		return l
+	}
+
+	h264 := compared("h264", 8000, 93, 4000, 87, 2000, 81)
+
+	testCases := []struct {
+		name    string
+		ladders []*ladder.Result
+		want    []string
+	}{
+		{name: "a single codec prints nothing", ladders: []*ladder.Result{h264}},
+		{
+			name:    "a newer codec saving bitrate",
+			ladders: []*ladder.Result{h264, compared("av1", 5600, 93, 2800, 87, 1400, 81)},
+			want: []string{
+				"codecs at equal quality",
+				"ℹ av1 needs 30% less bitrate than h264 at VMAF 93.0, the highest quality both ladders reach (30% less on average from VMAF 81)",
+				"Rungs of each codec", "━━ h264  ━━ av1", "1M", "5M",
+			},
+		},
+		{
+			name:    "a newer codec costlier at the top",
+			ladders: []*ladder.Result{h264, compared("av1", 8560, 93, 3600, 87, 1800, 81)},
+			want: []string{
+				"▲ av1 needs 7% more bitrate than h264 at VMAF 93.0, the highest quality both ladders reach (6% less on average from VMAF 81); 7% more at VMAF 93 at worst.",
+				"A newer codec is expected to need less: check the encoder preset",
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var out strings.Builder
+
+			require.NoError(t, RenderCodecs(&out, testCase.ladders, ReportOptions{Width: 100}))
+
+			text := plain(out.String())
+			if len(testCase.want) == 0 {
+				assert.Empty(t, text)
+			}
+
+			for _, want := range testCase.want {
+				assert.Contains(t, text, want)
+			}
+		})
+	}
+
+	require.Error(t, RenderCodecs(failingWriter{}, testCases[1].ladders, ReportOptions{Width: 100}))
+}
+
+func TestLadderLinePerShotRejected(
+	t *testing.T,
+) {
+	res := sampleLadder(t)
+	res.Constraints = res.Constraints.WithDefaults()
+	res.Rungs[0].PerShotRejected = &ladder.PerShot{Gain: -0.18}
+
+	assert.Contains(t, renderLadder(t, res, 200, "", false),
+		"rung 1 (1080p): no per-shot version, the one tried cost 18.0% more than the rung at equal VMAF on the digest")
+}
+
+func TestLadderLineTopDigest(
+	t *testing.T,
+) {
+	res := sampleLadder(t)
+	res.Constraints = res.Constraints.WithDefaults()
+	res.Digest.Sampling = ladder.DigestTop
+	res.Digest.Complexity = &ladder.DigestComplexity{TitleTI: 13.2, TI: 36.7}
+
+	assert.Contains(t, renderLadder(t, res, 200, "", false),
+		"estimated on the most complex scenes of the title (TI 36.7 for 13.2 over the title): the bitrates are what those scenes need, not the title's average")
+}
+
+func TestSamplingLabel(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name string
+		in   ladder.DigestSampling
+		want string
+	}{
+		{name: "title used whole", want: ""},
+		{name: "balanced", in: ladder.DigestBalanced, want: ", balanced on SI/TI"},
+		{name: "uniform", in: ladder.DigestUniform, want: ", evenly spaced"},
+		{name: "top", in: ladder.DigestTop, want: ", the most complex scenes"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(t, testCase.want, samplingLabel(testCase.in))
+		})
+	}
+}
+
+func TestProbingLabel(
+	t *testing.T,
+) {
+	testCases := []struct {
+		name      string
+		in        ladder.ProbingReport
+		predicted int
+		want      string
+	}{
+		{name: "fixed", in: ladder.ProbingReport{Mode: ladder.ProbingFixed, Rounds: 1}, want: ""},
+		{name: "adaptive converged", in: ladder.ProbingReport{Mode: ladder.ProbingAdaptive, Rounds: 4, Budget: 14, Converged: true}, want: " (adaptive: 4 rounds, budget 14, converged)"},
+		{name: "adaptive out of budget", in: ladder.ProbingReport{Mode: ladder.ProbingAdaptive, Rounds: 5, Budget: 14}, want: " (adaptive: 5 rounds, budget 14, budget reached)"},
+		{name: "fixed with challengers", in: ladder.ProbingReport{Mode: ladder.ProbingFixed, Rounds: 3, Challengers: 5}, want: " (5 challenger probes)"},
+		{name: "adaptive with challengers", in: ladder.ProbingReport{Mode: ladder.ProbingAdaptive, Rounds: 6, Budget: 14, Challengers: 2}, want: " (adaptive: 6 rounds, budget 14, budget reached; 2 challenger probes)"},
+		{
+			name:      "model",
+			in:        ladder.ProbingReport{Mode: ladder.ProbingModel, Rounds: 1, Model: &ladder.ModelProbing{Titles: 3, MeanVMAFError: 0.74}},
+			predicted: 35,
+			want:      " (35 more predicted by a model of 3 titles, within 0.7 VMAF on average on titles it had not seen)",
+		},
+		{
+			name: "model not validated, with challengers",
+			in:   ladder.ProbingReport{Mode: ladder.ProbingModel, Rounds: 2, Challengers: 1, Model: &ladder.ModelProbing{Titles: 1}}, predicted: 35,
+			want: " (35 more predicted by a model of 1 titles; 1 challenger probes)",
+		},
+		{
+			name: "model not used",
+			in:   ladder.ProbingReport{Mode: ladder.ProbingFixed, Rounds: 1, Model: &ladder.ModelProbing{Fallback: "the model is for h264 slow on 1080p sources, not h264 fast on 1080p"}},
+			want: " (ladder model not used: the model is for h264 slow on 1080p sources, not h264 fast on 1080p)",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(t, testCase.want, probingLabel(testCase.in, testCase.predicted))
+		})
+	}
+}
+
+func TestRenderLadderRenditions(
+	t *testing.T,
+) {
+	res := sampleLadder(t)
+	res.Renditions = []ladder.Rendition{
+		{Rung: 0, Path: "out/h264/01-1080p.mp4", Width: 1920, Height: 1080, Bitrate: 3_050_000,
+			Checked: &ladder.Measurement{VMAF: 95.1, HalfWidth: 0.3}},
+		{Rung: 1, Path: "out/h264/02-720p.mp4", Width: 1280, Height: 720, Bitrate: 1_450_000,
+			Checked: &ladder.Measurement{VMAF: 81.2, HalfWidth: 0.4}},
+	}
+
+	var out strings.Builder
+	require.NoError(t, RenderLadder(&out, res, ReportOptions{Width: 120}))
+
+	text := plain(out.String())
+	for _, want := range []string{
+		"Renditions", "01-1080p.mp4", "3.05 Mb/s", "95.1 ± 0.3",
+		"02-720p.mp4 on the whole title: VMAF 81.2 ± 0.4, -5.4 from its prediction on the digest",
+		"02-720p.mp4: +26% bitrate over the whole title against the ladder's: declare its measured 1.45 Mb/s in the manifest (Apple HLS: within 10%)",
+	} {
+		assert.Contains(t, text, want)
+	}
+}
