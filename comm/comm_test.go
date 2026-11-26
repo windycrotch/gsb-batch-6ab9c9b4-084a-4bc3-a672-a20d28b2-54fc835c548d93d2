@@ -36,9 +36,10 @@ var testPackages = []proto.Message{
 }
 
 type testPackageHandler struct {
-	packages      []proto.Message
-	packagesMutex sync.RWMutex
-	packagesCond  *sync.Cond
+	packages         []proto.Message
+	consumedPackages int
+	packagesMutex    sync.RWMutex
+	packagesCond     *sync.Cond
 }
 
 func (tph *testPackageHandler) Handle(message proto.Message, _ net.Conn) {
@@ -73,14 +74,21 @@ func (tph *testPackageHandler) Latest() proto.Message {
 }
 
 func (tph *testPackageHandler) WaitForPackage() proto.Message {
+	tph.packagesMutex.Lock()
+	defer tph.packagesMutex.Unlock()
+
 	if tph.packagesCond == nil {
-		tph.packagesCond = sync.NewCond(new(sync.Mutex))
+		tph.packagesCond = sync.NewCond(&tph.packagesMutex)
 	}
 
-	tph.packagesCond.L.Lock()
-	tph.packagesCond.Wait()
-	tph.packagesCond.L.Unlock()
-	return tph.Latest()
+	// Wait until a package that was not returned yet arrived; this is safe even if the package
+	// arrived before WaitForPackage was called.
+	for len(tph.packages) <= tph.consumedPackages {
+		tph.packagesCond.Wait()
+	}
+	m := tph.packages[tph.consumedPackages]
+	tph.consumedPackages++
+	return m
 }
 
 var testPackageChannels = [][]Channel{{Channel_AUDIO}, {Channel_META}, {}, {Channel_AUDIO, Channel_META}}

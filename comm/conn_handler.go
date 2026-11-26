@@ -14,11 +14,17 @@ type packageHandler interface {
 
 func handleConnection(conn net.Conn, h packageHandler) {
 	defer conn.Close()
+	handlePackages(conn, h)
+}
+
+// handlePackages reads and handles messages from conn until reading fails. In contrast to
+// handleConnection, it does not close conn; the caller is responsible for closing it.
+func handlePackages(conn net.Conn, h packageHandler) {
 	for {
 		m, err := readWire(conn)
 		if err != nil {
 			logger.Infof("failed to read data from %s: %v. closing connection", conn.RemoteAddr(), err)
-			break
+			return
 		}
 		h.Handle(m, conn)
 	}
@@ -56,12 +62,14 @@ func serverConnectionAcceptor(mms *multiMessageSender, l net.Listener) {
 		}
 		go func(conn net.Conn) {
 			mms.AddConn(conn)
-			handleConnection(conn, h)
+			if NewClientHandler != nil {
+				NewClientHandler(-1, mms.senderFor(conn))
+			}
+			// Do not close the connection here. DelConn marks the connection as closed before it
+			// closes it, so a broadcast that is in progress cannot write to it after that point.
+			handlePackages(conn, h)
 			mms.DelConn(conn)
 		}(conn)
-		if NewClientHandler != nil {
-			go NewClientHandler(-1, &singleMessageSender{conn})
-		}
 	}
 }
 

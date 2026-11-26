@@ -14,55 +14,45 @@ type testTypedPackageHandler struct {
 	cond        sync.Cond
 }
 
-func (t *testTypedPackageHandler) HandleTimeSyncRequest(p *TimeSyncRequest, _ net.Conn) {
+// setPackage stores the package and its type and wakes up a waiting test. The cond lock is used
+// to synchronize the access with the test that reads the fields after Wait returns.
+func (t *testTypedPackageHandler) setPackage(p proto.Message, pType string) {
+	t.cond.L.Lock()
+	defer t.cond.L.Unlock()
 	t.lastPackage = p
-	t.lastType = "TimeSyncRequest"
+	t.lastType = pType
 	t.cond.Broadcast()
+}
+
+func (t *testTypedPackageHandler) HandleTimeSyncRequest(p *TimeSyncRequest, _ net.Conn) {
+	t.setPackage(p, "TimeSyncRequest")
 }
 func (t *testTypedPackageHandler) HandleTimeSyncResponse(p *TimeSyncResponse, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "TimeSyncResponse"
-	t.cond.Broadcast()
+	t.setPackage(p, "TimeSyncResponse")
 }
 func (t *testTypedPackageHandler) HandleQueueChunkRequest(p *QueueChunkRequest, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "QueueChunkRequest"
-	t.cond.Broadcast()
+	t.setPackage(p, "QueueChunkRequest")
 }
 func (t *testTypedPackageHandler) HandlePingMessage(p *PingMessage, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "PingMessage"
-	t.cond.Broadcast()
+	t.setPackage(p, "PingMessage")
 }
 func (t *testTypedPackageHandler) HandlePongMessage(p *PongMessage, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "PongMessage"
-	t.cond.Broadcast()
+	t.setPackage(p, "PongMessage")
 }
 func (t *testTypedPackageHandler) HandleSetVolumeRequest(p *SetVolumeRequest, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "SetVolumeRequest"
-	t.cond.Broadcast()
+	t.setPackage(p, "SetVolumeRequest")
 }
 func (t *testTypedPackageHandler) HandleSubscribeChannelRequest(p *SubscribeChannelRequest, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "SubscribeChannelRequest"
-	t.cond.Broadcast()
+	t.setPackage(p, "SubscribeChannelRequest")
 }
 func (t *testTypedPackageHandler) HandleNewSongInfo(p *NewSongInfo, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "NewSongInfo"
-	t.cond.Broadcast()
+	t.setPackage(p, "NewSongInfo")
 }
 func (t *testTypedPackageHandler) HandleChunkInfo(p *ChunkInfo, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "ChunkInfo"
-	t.cond.Broadcast()
+	t.setPackage(p, "ChunkInfo")
 }
 func (t *testTypedPackageHandler) HandlePauseInfo(p *PauseInfo, _ net.Conn) {
-	t.lastPackage = p
-	t.lastType = "PauseInfo"
-	t.cond.Broadcast()
+	t.setPackage(p, "PauseInfo")
 }
 
 var typedPackageHandlerHandleCases = []struct {

@@ -94,17 +94,23 @@ type serverPackageHandler struct {
 func (s serverPackageHandler) HandleTimeSyncRequest(tsr *TimeSyncRequest, c net.Conn) {
 	serverRecv := timing.GetRawTime()
 	response := &TimeSyncResponse{ClientSendTime: tsr.ClientSend, ServerRecvTime: serverRecv, ServerSendTime: timing.GetRawTime()}
-	if err := sendWire(response, c); err != nil {
+	if err := s.sender.writeToConn(c, response); err != nil {
 		logger.Warnf("failed to send handle time sync response: %v", err)
 	}
 }
 
 func (s serverPackageHandler) HandleSubscribeChannelRequest(scr *SubscribeChannelRequest, c net.Conn) {
 	s.sender.Subscribe(c, scr.Channel)
-	NewClientHandler(scr.Channel, &singleMessageSender{c})
+	if NewClientHandler != nil {
+		NewClientHandler(scr.Channel, s.sender.senderFor(c))
+	}
 }
 
-func (s serverPackageHandler) HandlePingMessage(_ *PingMessage, c net.Conn) { PingHandler(c) }
+func (s serverPackageHandler) HandlePingMessage(_ *PingMessage, c net.Conn) {
+	if err := s.sender.writeToConn(c, &PongMessage{}); err != nil {
+		logger.Warnf("failed to send ping response: %v", err)
+	}
+}
 
 func newServerPackageHandler(sender *multiMessageSender) TypedPackageHandler {
 	return TypedPackageHandler{TypedPackageHandlerInterface: serverPackageHandler{sender: sender}}

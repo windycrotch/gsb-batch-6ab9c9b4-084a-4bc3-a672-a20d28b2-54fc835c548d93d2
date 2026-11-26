@@ -92,6 +92,11 @@ func sendWire(m proto.Message, conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+	return writeAll(conn, data)
+}
+
+// writeAll writes all of data to conn, handling short writes.
+func writeAll(conn net.Conn, data []byte) error {
 	send := 0
 	for send < len(data) {
 		n, err := conn.Write(data[send:])
