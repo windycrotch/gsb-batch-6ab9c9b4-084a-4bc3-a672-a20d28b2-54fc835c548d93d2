@@ -85,6 +85,8 @@ pub use audio_cpp_sys;
 mod error;
 pub use error::Error;
 
+mod event_collector;
+
 mod ffi;
 
 mod request;
@@ -107,6 +109,10 @@ pub use registry::Registry;
 
 mod model;
 pub use model::Model;
+
+pub use event_collector::{
+    BlockTicket, EventBuffer, EventCollector, EventQueue, EventRouter, EventSender,
+};
 
 pub mod session;
 pub use session::{Session, StreamingSession};
