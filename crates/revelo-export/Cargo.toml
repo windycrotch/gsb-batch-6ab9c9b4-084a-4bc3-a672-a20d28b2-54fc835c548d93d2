@@ -1,0 +1,22 @@
+[package]
+name = "revelo-export"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Output formatters for revelo: XML, JSON, Text, EBUCore, MPEG-7, PBCore, NISO, FIMS, Graph, RevTMD."
+keywords = ["metadata", "export", "json", "xml", "mediainfo"]
+categories = ["encoding", "multimedia", "value-formatting"]
+readme = "README.md"
+
+[lib]
+name = "revelo_export"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7" }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }

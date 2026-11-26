@@ -1,0 +1,24 @@
+[package]
+name = "revelo-parsers-container"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Container-format parsers for revelo (MP4, MKV, MPEG-TS, AVI, WAV, ...)."
+keywords = ["mp4", "mkv", "container", "parser", "media"]
+categories = ["parser-implementations", "multimedia", "parsing"]
+readme = "README.md"
+
+[lib]
+name = "revelo_parsers_container"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7", default-features = false }
+revelo-parsers-audio = { path = "../revelo-parsers-audio", version = "0.5.7" }
+revelo-parsers-video = { path = "../revelo-parsers-video", version = "0.5.7" }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }

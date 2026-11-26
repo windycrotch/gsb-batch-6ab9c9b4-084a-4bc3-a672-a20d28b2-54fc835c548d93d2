@@ -1,0 +1,152 @@
+use clap::{Parser, Subcommand};
+use revelo_core::StreamKind;
+
+const BANNER: &str = include_str!("banner.txt");
+
+#[derive(Parser)]
+#[command(
+    name = "revelo",
+    version,
+    about = None,
+    long_about = None,
+    before_help = BANNER,
+    args_conflicts_with_subcommands = true,
+)]
+pub(crate) struct Cli {
+    /// File path(s) or glob pattern(s) to analyze (e.g. "**/*.mp4"). Quote
+    /// globs so the shell doesn't expand them, letting revelo walk the tree.
+    #[arg(value_name = "PATH")]
+    pub paths: Vec<String>,
+
+    /// XML output
+    #[arg(short = 'x', long)]
+    pub xml: bool,
+
+    /// JSON output
+    #[arg(short = 'j', long)]
+    pub json: bool,
+
+    /// Emit a single JSON array for multi-file input instead of the default
+    /// NDJSON (one compact JSON object per line). Implies --json.
+    #[arg(long)]
+    pub json_array: bool,
+
+    /// YAML output
+    #[arg(short = 'y', long)]
+    pub yaml: bool,
+
+    /// Self-contained HTML report
+    #[arg(long)]
+    pub html: bool,
+
+    /// Text output (default)
+    #[arg(short = 't', long)]
+    pub text: bool,
+
+    /// CSV output
+    #[arg(long)]
+    pub csv: bool,
+
+    /// Summary output (aggregate statistics)
+    #[arg(long)]
+    pub summary: bool,
+
+    /// Demux level
+    #[arg(
+        short = 'd',
+        long = "demux",
+        value_name = "LEVEL",
+        default_value = "frame",
+        value_parser = ["frame", "container", "elementary"],
+    )]
+    pub demux: String,
+
+    /// Trace verbosity (0-9)
+    #[arg(
+        short = 'r',
+        long = "trace",
+        value_name = "N",
+        default_value = "0",
+        value_parser = clap::builder::PossibleValuesParser::new(
+            ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+        ),
+    )]
+    pub trace: String,
+
+    /// Scan companion files (BDMV M2TS, sidecar subtitles)
+    #[arg(short = 'm', long)]
+    pub multi_file: bool,
+
+    /// Video streams only
+    #[arg(long)]
+    pub video_only: bool,
+
+    /// Audio streams only
+    #[arg(long)]
+    pub audio_only: bool,
+
+    /// Select specific streams by kind and index (e.g. 0:1 for General=0,
+    /// Video=1). May be repeated.
+    #[arg(long, value_name = "KIND:INDEX", value_parser = parse_stream_selector)]
+    pub stream: Vec<(StreamKind, usize)>,
+
+    /// Print structural integrity information
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Add library version to text output
+    #[arg(long)]
+    pub inform_version: bool,
+
+    /// Add timestamp to text output
+    #[arg(long)]
+    pub inform_timestamp: bool,
+
+    /// Write output to file instead of stdout
+    #[arg(long, value_name = "FILE")]
+    pub log_file: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Parse a `"KIND:INDEX"` string into a `(StreamKind, usize)` pair.
+fn parse_stream_selector(s: &str) -> Result<(StreamKind, usize), String> {
+    let (kind_str, idx_str) = s
+        .split_once(':')
+        .ok_or_else(|| format!("invalid stream selector '{s}': expected KIND:INDEX (e.g. 0:1)"))?;
+    let kind = match kind_str {
+        "0" | "General" => StreamKind::General,
+        "1" | "Video" => StreamKind::Video,
+        "2" | "Audio" => StreamKind::Audio,
+        "3" | "Text" => StreamKind::Text,
+        "4" | "Other" => StreamKind::Other,
+        "5" | "Image" => StreamKind::Image,
+        "6" | "Menu" => StreamKind::Menu,
+        "7" | "Exif" => StreamKind::Exif,
+        "8" | "Iptc" => StreamKind::Iptc,
+        "9" | "Xmp" => StreamKind::Xmp,
+        "10" | "Icc" => StreamKind::Icc,
+        "11" | "C2pa" => StreamKind::C2pa,
+        "12" | "MakerNotes" => StreamKind::MakerNotes,
+        _ => {
+            return Err(format!(
+                "unknown stream kind '{kind_str}': use 0-12 or General/Video/Audio/Text/Other/Image/Menu/Exif/Iptc/Xmp/Icc/C2pa/MakerNotes"
+            ));
+        }
+    };
+    let index: usize = idx_str.parse().map_err(|_| {
+        format!("invalid stream index '{idx_str}': expected a non-negative integer")
+    })?;
+    Ok((kind, index))
+}
+
+/// Future subcommands (inspect, diff, batch, verify, extract)
+#[derive(Subcommand)]
+pub(crate) enum Command {
+    /// Inspect a media file
+    Inspect {
+        /// File path to analyze
+        path: Option<String>,
+    },
+}

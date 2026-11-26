@@ -1,0 +1,20 @@
+[package]
+name = "revelo-reader"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Input/reader layer for revelo (file and directory sources)."
+keywords = ["file", "reader", "io", "media", "input"]
+categories = ["filesystem", "multimedia"]
+readme = "README.md"
+[lib]
+name = "revelo_reader"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7" }

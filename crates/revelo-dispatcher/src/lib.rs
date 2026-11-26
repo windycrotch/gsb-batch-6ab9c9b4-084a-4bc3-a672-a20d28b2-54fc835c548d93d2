@@ -1,0 +1,504 @@
+//! Parallel format-detection dispatch table for revelo's media parsers.
+//!
+//! This is the single source of truth for format coverage. Both `revelo-cli`
+//! and `revelo-cdylib` call into this crate to identify and parse media files.
+//!
+//! # Public API
+//!
+//! - [`table`] — returns the ordered `[fn(&mut FileAnalyze) -> bool; 179]`
+//!   array of parser function pointers. Containers come before elementary
+//!   streams to prevent false-positive matches on random bytes.
+//! - [`detect`] — returns the first match in table order. Small buffers use
+//!   rayon when the `parallel` feature is enabled. Large buffers use a
+//!   sequential, raw-read-capped probe so speculative parser candidates cannot
+//!   fault or copy the whole file before the real parser is selected.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use revelo_core::FileAnalyze;
+//! use revelo_dispatcher::detect;
+//!
+//! fn analyze(bytes: &[u8]) {
+//!     let Some(parser) = detect(bytes) else { return; };
+//!     let mut fa = FileAnalyze::new(bytes);
+//!     parser(&mut fa);
+//!     println!("{} video stream(s)",
+//!              fa.stream_count(revelo_core::StreamKind::Video));
+//! }
+//! ```
+//!
+//! # Table ordering
+//!
+//! Containers → subtitles → audio → images → video → archives.
+//! Late-matching parsers (Opus, Vorbis, Teletext, …) appear at the end of
+//! their category to minimise false positives.
+
+#![deny(unsafe_code)]
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+use revelo_core::{AccessStats, FileAnalyze};
+
+use revelo_parsers_archive::{
+    parse_7z, parse_ace, parse_bzip2, parse_elf, parse_gzip, parse_iso9660, parse_mach_o,
+    parse_mz_exe, parse_rar, parse_tar, parse_zip,
+};
+use revelo_parsers_audio::{
+    parse_aac, parse_aac_adts, parse_ac3, parse_ac4, parse_adm, parse_adpcm, parse_als, parse_amr,
+    parse_ape, parse_aptx100, parse_au, parse_caf, parse_celt, parse_channel_grouping,
+    parse_channel_splitting, parse_dat, parse_dolby_audio_metadata, parse_dolby_e, parse_dsdiff,
+    parse_dsf, parse_dts, parse_dts_uhd, parse_extended_module, parse_flac, parse_iab, parse_iamf,
+    parse_impulse_tracker, parse_la, parse_mga, parse_midi, parse_module, parse_mp3, parse_mpc,
+    parse_mpc_sv8, parse_mpegh3da, parse_open_mg, parse_opus, parse_pcm, parse_pcm_m2ts,
+    parse_pcm_vob, parse_ps2_audio, parse_rkau, parse_scream_tracker3, parse_smpte_st0302,
+    parse_smpte_st0331, parse_smpte_st0337, parse_speex, parse_tak, parse_truehd, parse_tta,
+    parse_twin_vq, parse_usac, parse_vorbis, parse_wvpk,
+};
+use revelo_parsers_container::{
+    parse_aaf, parse_aiff, parse_amv, parse_avi, parse_bdmv, parse_cdxa, parse_dash_mpd,
+    parse_dcp_am, parse_dcp_cpl, parse_dcp_pkl, parse_dpg, parse_dv_dif, parse_dvdv, parse_dxw,
+    parse_flv, parse_gxf, parse_hds_f4m, parse_hls, parse_ibi, parse_ism, parse_ivf, parse_lxf,
+    parse_mi_xml, parse_mkv, parse_mp4, parse_mpeg_ps, parse_mpeg_ts, parse_mxf, parse_nsv,
+    parse_nut, parse_ogg, parse_p2_clip, parse_pmp, parse_ptx, parse_rm, parse_scte35,
+    parse_sequence_info, parse_skm, parse_swf, parse_vbi, parse_wav, parse_wm, parse_wtv,
+    parse_xdcam_clip,
+};
+use revelo_parsers_image::{
+    parse_amiga_icon, parse_arriraw, parse_bmp, parse_bpg, parse_cr2, parse_dds, parse_dpx,
+    parse_exr, parse_gain_map, parse_gif, parse_ico, parse_jp2, parse_jpeg, parse_pcx, parse_png,
+    parse_psd, parse_raf, parse_tga, parse_tiff, parse_webp,
+};
+use revelo_parsers_text::{
+    parse_arib_std_b24_b37, parse_cdp, parse_cmml, parse_dtvcc_transport, parse_dvb_subtitle,
+    parse_eia608, parse_eia708, parse_kate, parse_n19, parse_other_text, parse_pac, parse_pdf,
+    parse_pgs, parse_scc, parse_scte20, parse_sdp, parse_sub_rip, parse_teletext, parse_timed_text,
+    parse_ttml, parse_webvtt,
+};
+use revelo_parsers_video::{
+    parse_afd_bar_data, parse_aic, parse_apv, parse_av1, parse_avc, parse_avs, parse_avs3,
+    parse_canopus, parse_cineform, parse_dirac, parse_dolby_vision, parse_ffv1, parse_flic,
+    parse_fraps, parse_h263, parse_hdr_vivid, parse_hevc, parse_huffyuv, parse_lagarith,
+    parse_mpeg2, parse_mpeg4v, parse_prores, parse_theora, parse_vc1, parse_vc3, parse_vp8,
+    parse_vp9, parse_vvc, parse_y4m,
+};
+
+const LARGE_INPUT_DETECTION_THRESHOLD: usize = 8 * 1024 * 1024;
+const LARGE_INPUT_RAW_READ_LIMIT: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DetectionStats {
+    candidates_run: usize,
+    bytes_requested: u64,
+    bytes_returned: u64,
+    max_request_len: usize,
+}
+
+impl DetectionStats {
+    fn record_candidate(&mut self, stats: AccessStats) {
+        self.candidates_run += 1;
+        self.bytes_requested = self.bytes_requested.saturating_add(stats.bytes_requested);
+        self.bytes_returned = self.bytes_returned.saturating_add(stats.bytes_returned);
+        self.max_request_len = self.max_request_len.max(stats.max_request_len);
+    }
+}
+
+fn detect_sequential_with_stats(
+    bytes: &[u8],
+    raw_read_limit: Option<usize>,
+) -> (Option<fn(&mut FileAnalyze) -> bool>, DetectionStats) {
+    let mut stats = DetectionStats::default();
+    for parser in table() {
+        let mut fa = if let Some(limit) = raw_read_limit {
+            FileAnalyze::with_raw_read_limit(bytes, limit)
+        } else {
+            FileAnalyze::new(bytes)
+        };
+        let matched = parser(&mut fa);
+        stats.record_candidate(fa.access_stats());
+        if matched {
+            return (Some(parser), stats);
+        }
+    }
+    (None, stats)
+}
+
+/// Returns the complete parser dispatch table (179 entries).
+///
+/// Ordering: containers first (header peek → sub-parser delegation),
+/// then video codecs, audio codecs, images, text, and archives.
+/// Container-vs-elementary ordering matters — a raw codec parser
+/// running before a container could false-match on random bytes.
+pub fn table() -> [fn(&mut FileAnalyze) -> bool; 179] {
+    [
+        // ── Containers ──────────────────────────────────────────
+        parse_wav,           // WAV
+        parse_avi,           // AVI
+        parse_cdxa,          // CD-XA
+        parse_amv,           // AMV
+        parse_webp,          // WebP
+        parse_jp2,           // JPEG 2000
+        parse_aiff,          // AIFF
+        parse_flac,          // FLAC
+        parse_dsdiff,        // DSDIFF
+        parse_caf,           // CAF
+        parse_mp4,           // MP4
+        parse_mkv,           // Matroska
+        parse_ogg,           // Ogg
+        parse_mpeg_ts,       // MPEG-TS
+        parse_mpeg_ps,       // MPEG-PS
+        parse_swf,           // SWF
+        parse_skm,           // SKM
+        parse_dpg,           // DPG
+        parse_hds_f4m,       // HDS F4M
+        parse_hls,           // HLS
+        parse_dash_mpd,      // DASH MPD
+        parse_dcp_am,        // DCP AM
+        parse_dcp_cpl,       // DCP CPL
+        parse_dcp_pkl,       // DCP PKL
+        parse_ibi,           // IBI
+        parse_dxw,           // DXW
+        parse_aaf,           // AAF
+        parse_mxf,           // MXF
+        parse_bdmv,          // BDMV
+        parse_dvdv,          // DVD-Video
+        parse_dv_dif,        // DV
+        parse_flv,           // FLV
+        parse_lxf,           // LXF
+        parse_nut,           // NUT
+        parse_wm,            // Windows Media
+        parse_wtv,           // WTV
+        parse_rm,            // RealMedia
+        parse_ivf,           // IVF
+        parse_ism,           // ISM
+        parse_mi_xml,        // MI XML
+        parse_p2_clip,       // P2 Clip
+        parse_xdcam_clip,    // XDCAM Clip
+        parse_sequence_info, // Sequence Info
+        parse_ptx,           // PTX
+        parse_nsv,           // NSV
+        parse_pmp,           // PMP
+        parse_gxf,           // GXF
+        // ── Subtitles / Text ────────────────────────────────────
+        parse_scte35,           // SCTE 35
+        parse_cdp,              // CDP
+        parse_pgs,              // PGS
+        parse_dvb_subtitle,     // DVB Subtitle
+        parse_arib_std_b24_b37, // ARIB B24/B37
+        parse_kate,             // Kate
+        parse_cmml,             // CMML
+        parse_ttml,             // TTML
+        parse_n19,              // N19
+        parse_sub_rip,          // SubRip
+        parse_other_text,       // Other Text
+        // ── Audio ───────────────────────────────────────────────
+        parse_dsf, // DSF
+        // ── Images ──────────────────────────────────────────────
+        parse_png,        // PNG
+        parse_jpeg,       // JPEG
+        parse_bmp,        // BMP
+        parse_gif,        // GIF
+        parse_cr2,        // Canon CR2
+        parse_raf,        // Fujifilm RAF
+        parse_tiff,       // TIFF
+        parse_ico,        // ICO
+        parse_psd,        // PSD
+        parse_dpx,        // DPX
+        parse_dds,        // DDS
+        parse_exr,        // OpenEXR
+        parse_bpg,        // BPG
+        parse_pcx,        // PCX
+        parse_arriraw,    // ARRIRAW
+        parse_amiga_icon, // Amiga Icon
+        // ── Video ───────────────────────────────────────────────
+        parse_y4m,      // Y4M
+        parse_vc1,      // VC-1
+        parse_mpeg2,    // MPEG-2 Video
+        parse_av1,      // AV1
+        parse_apv,      // APV (Advanced Professional Video)
+        parse_avc,      // AVC / H.264
+        parse_hevc,     // HEVC / H.265
+        parse_vp8,      // VP8
+        parse_vp9,      // VP9
+        parse_theora,   // Theora
+        parse_ffv1,     // FFV1
+        parse_h263,     // H.263
+        parse_mpeg4v,   // MPEG-4 Visual
+        parse_aic,      // Apple Intermediate Codec
+        parse_avs,      // AVS
+        parse_avs3,     // AVS3
+        parse_canopus,  // Canopus HQ
+        parse_cineform, // CineForm
+        parse_dirac,    // Dirac
+        parse_flic,     // FLIC
+        parse_fraps,    // Fraps
+        parse_huffyuv,  // HuffYUV
+        parse_lagarith, // Lagarith
+        // ── Audio codecs ────────────────────────────────────────
+        parse_ac3,               // AC-3
+        parse_ac4,               // AC-4
+        parse_dts,               // DTS
+        parse_dts_uhd,           // DTS-UHD
+        parse_aac_adts,          // AAC ADTS
+        parse_iab,               // IAB
+        parse_iamf,              // IAMF
+        parse_als,               // ALS
+        parse_ape,               // Monkey's Audio
+        parse_au,                // AU
+        parse_amr,               // AMR
+        parse_speex,             // Speex
+        parse_mpc,               // Musepack
+        parse_la,                // LA
+        parse_tak,               // TAK
+        parse_tta,               // True Audio
+        parse_wvpk,              // WavPack
+        parse_twin_vq,           // TwinVQ
+        parse_extended_module,   // Extended Module
+        parse_dat,               // DAT
+        parse_rkau,              // Rkau
+        parse_aptx100,           // aptX 100
+        parse_open_mg,           // OpenMG
+        parse_midi,              // MIDI
+        parse_module,            // Module
+        parse_impulse_tracker,   // Impulse Tracker
+        parse_scream_tracker3,   // Scream Tracker 3
+        parse_mp3,               // MP3
+        parse_celt,              // CELT
+        parse_dolby_e,           // Dolby E
+        parse_mpegh3da,          // MPEG-H 3D Audio
+        parse_mpc_sv8,           // Musepack SV8
+        parse_ps2_audio,         // PS2 Audio
+        parse_truehd,            // TrueHD
+        parse_smpte_st0302,      // SMPTE ST 302
+        parse_smpte_st0331,      // SMPTE ST 331
+        parse_smpte_st0337,      // SMPTE ST 337
+        parse_channel_grouping,  // Channel Grouping
+        parse_channel_splitting, // Channel Splitting
+        // ── Images (fallback / extension) ───────────────────────
+        parse_tga,      // TGA
+        parse_gain_map, // Gain Map
+        // ── Audio (fallback / extension) ────────────────────────
+        // ADPCM, EIA-608, EIA-708, and VBI accept any non-empty buffer.
+        // They stay after every parser that has a real signature.
+        parse_adm,                  // ADM
+        parse_dolby_audio_metadata, // Dolby Audio Metadata
+        parse_pcm,                  // PCM
+        parse_pcm_vob,              // PCM VOB
+        parse_pcm_m2ts,             // PCM M2TS
+        parse_mga,                  // MGA
+        parse_aac,                  // AAC
+        // ── Text (fallback / extension) ─────────────────────────
+        parse_pdf,             // PDF
+        parse_sdp,             // SDP
+        parse_pac,             // PAC
+        parse_dtvcc_transport, // DTVCC Transport
+        parse_scte20,          // SCTE-20
+        parse_webvtt,          // WebVTT
+        // ── Video (fallback / extension) ────────────────────────
+        parse_vvc,          // VVC / H.266
+        parse_prores,       // ProRes
+        parse_vc3,          // VC-3
+        parse_dolby_vision, // Dolby Vision
+        parse_afd_bar_data, // AFD / Bar Data
+        parse_hdr_vivid,    // HDR Vivid
+        // ── Audio (late matching) ───────────────────────────────
+        parse_opus,   // Opus
+        parse_vorbis, // Vorbis
+        parse_usac,   // USAC
+        // ── Text (late matching) ────────────────────────────────
+        parse_teletext,   // Teletext
+        parse_scc,        // SCC
+        parse_timed_text, // Timed Text
+        // ── Archives ────────────────────────────────────────────
+        parse_zip,     // ZIP
+        parse_rar,     // RAR
+        parse_7z,      // 7-Zip
+        parse_tar,     // TAR
+        parse_gzip,    // Gzip
+        parse_bzip2,   // Bzip2
+        parse_iso9660, // ISO 9660
+        parse_elf,     // ELF
+        parse_mach_o,  // Mach-O
+        parse_mz_exe,  // MZ EXE
+        parse_ace,     // ACE
+        // No-magic sub-parsers. Each accepts any non-empty buffer, so they
+        // only run after every signature-based parser has declined.
+        parse_adpcm,  // ADPCM
+        parse_eia608, // EIA-608
+        parse_eia708, // EIA-708
+        parse_vbi,    // VBI
+    ]
+}
+
+/// Return the first parser (in table order) that recognizes `bytes`, or `None`
+/// if none match.
+///
+/// When the `parallel` feature is enabled (the default), small buffers are
+/// evaluated concurrently via rayon and the first match (in table order) wins.
+/// Large buffers are evaluated sequentially with a raw-read cap. This avoids
+/// speculatively running every parser that asks for `peek_raw(fa.remain())` on
+/// a multi-hundred-MiB mmap before an early table match such as MP4 is selected.
+/// When `parallel` is disabled (e.g. WASM builds), parsers are always evaluated
+/// sequentially in table order.
+///
+/// Each candidate runs against a fresh [`FileAnalyze`] over the same buffer —
+/// the caller re-runs the winner to extract full metadata.
+#[cfg(feature = "parallel")]
+pub fn detect(bytes: &[u8]) -> Option<fn(&mut FileAnalyze) -> bool> {
+    if bytes.len() > LARGE_INPUT_DETECTION_THRESHOLD {
+        return detect_sequential_with_stats(bytes, Some(LARGE_INPUT_RAW_READ_LIMIT)).0;
+    }
+    table()
+        .par_iter()
+        .find_first(|&&parser| {
+            let mut fa = FileAnalyze::new(bytes);
+            parser(&mut fa)
+        })
+        .copied()
+}
+
+/// Sequential fallback for platforms without rayon (e.g. WASM).
+#[cfg(not(feature = "parallel"))]
+pub fn detect(bytes: &[u8]) -> Option<fn(&mut FileAnalyze) -> bool> {
+    let raw_read_limit =
+        (bytes.len() > LARGE_INPUT_DETECTION_THRESHOLD).then_some(LARGE_INPUT_RAW_READ_LIMIT);
+    detect_sequential_with_stats(bytes, raw_read_limit).0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_large_mp4() -> Vec<u8> {
+        let mut bytes = vec![0u8; LARGE_INPUT_DETECTION_THRESHOLD + 1024];
+        bytes[0..4].copy_from_slice(&20u32.to_be_bytes());
+        bytes[4..8].copy_from_slice(b"ftyp");
+        bytes[8..12].copy_from_slice(b"M4A ");
+        bytes[12..16].copy_from_slice(&0u32.to_be_bytes());
+        bytes[16..20].copy_from_slice(b"isom");
+        bytes
+    }
+
+    #[test]
+    fn adts_is_aac_and_webvtt_is_text() {
+        use revelo_core::StreamKind;
+
+        let adts = [0xFF, 0xF9, 0x50, 0x80, 0, 0, 0, 0, 0, 0];
+        let parser = detect(&adts).expect("ADTS");
+        let mut fa = FileAnalyze::new(&adts);
+        assert!(parser(&mut fa));
+        assert_eq!(fa.retrieve(StreamKind::Audio, 0, "Format").map(|z| z.as_str()), Some("AAC"));
+        assert_eq!(fa.stream_count(StreamKind::Video), 0);
+
+        let vtt = b"WEBVTT\n\n";
+        let parser = detect(vtt).expect("WebVTT");
+        let mut fa = FileAnalyze::new(vtt);
+        assert!(parser(&mut fa));
+        assert_eq!(fa.retrieve(StreamKind::Text, 0, "Format").map(|z| z.as_str()), Some("WebVTT"));
+        assert_ne!(fa.retrieve(StreamKind::General, 0, "Format").map(|z| z.as_str()), Some("RLE"));
+    }
+
+    #[test]
+    fn large_mp4_detection_stops_before_late_full_scan_candidates() {
+        let bytes = minimal_large_mp4();
+
+        let (parser, stats) =
+            detect_sequential_with_stats(&bytes, Some(LARGE_INPUT_RAW_READ_LIMIT));
+
+        assert!(parser.is_some());
+        assert!(stats.candidates_run < 20, "{stats:?}");
+        assert!(stats.bytes_returned < 64 * 1024, "{stats:?}");
+        assert!(stats.max_request_len < LARGE_INPUT_RAW_READ_LIMIT, "{stats:?}");
+    }
+
+    // --- Malformed-input hardening: fuzz/truncation sweep -----------------
+    //
+    // The dispatcher runs *every* parser in the table against raw input
+    // during detection, so a single parser panicking on truncated or fuzzed
+    // bytes takes down the whole process (and is UB across the C ABI). These
+    // tests run all parsers directly against adversarial buffers; because
+    // they do not catch unwinds, any parser panic fails the suite. Test
+    // builds keep overflow-checks on, so unsigned-underflow bugs surface
+    // here too.
+
+    /// Run every parser in the table against `bytes` on a fresh cursor.
+    fn run_all_parsers(bytes: &[u8]) {
+        for parser in table() {
+            let mut fa = FileAnalyze::new(bytes);
+            let _ = parser(&mut fa);
+        }
+    }
+
+    /// Small deterministic PRNG (xorshift64*). Avoids a dependency and the
+    /// harness-forbidden `Math.random`/`Date` — the seed is fixed so failures
+    /// reproduce exactly.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x >> 32) as u32
+        }
+    }
+
+    #[test]
+    fn parsers_never_panic_on_truncated_magic() {
+        // A representative spread of real format signatures. Feeding every
+        // prefix (including the empty slice) drives each format's detection
+        // and early header reads against a buffer that ends mid-structure.
+        let magics: &[&[u8]] = &[
+            b"RIFF\x00\x00\x00\x00WAVE",
+            b"RIFF\x00\x00\x00\x00AVI ",
+            b"\x00\x00\x00\x20ftypisom",
+            b"\x00\x00\x00\x20ftypM4A ",
+            b"\x1a\x45\xdf\xa3",            // Matroska/WebM EBML
+            b"OggS",                        // Ogg
+            b"fLaC",                        // FLAC
+            b"ID3\x04\x00",                 // MP3/ID3
+            b"FLV\x01\x05\x00\x00\x00\x09", // FLV
+            b"\x47\x40\x00\x10",            // MPEG-TS sync
+            b"\x00\x00\x01\xba",            // MPEG-PS pack
+            b"\x89PNG\r\n\x1a\n",           // PNG
+            b"\xff\xd8\xff\xe0",            // JPEG
+            b"GIF89a",                      // GIF
+            b"BM",                          // BMP
+            b"\x1f\x8b",                    // gzip
+            b"PK\x03\x04",                  // zip
+        ];
+        for m in magics {
+            for len in 0..=m.len() {
+                run_all_parsers(&m[..len]);
+            }
+        }
+    }
+
+    #[test]
+    fn parsers_never_panic_on_random_buffers() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..2000 {
+            let len = (rng.next_u32() % 600) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| (rng.next_u32() & 0xFF) as u8).collect();
+            run_all_parsers(&buf);
+        }
+    }
+
+    #[test]
+    fn parsers_never_panic_on_degenerate_buffers() {
+        // All-zero and all-0xFF buffers exercise the "everything is the same
+        // byte" edge (zero lengths, sentinel counts) that random data rarely
+        // hits, plus a magic followed by a run of zeros (declared-but-absent
+        // payloads / oversized length fields).
+        for len in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 63, 64, 255, 256, 1023, 4096] {
+            run_all_parsers(&vec![0u8; len]);
+            run_all_parsers(&vec![0xFFu8; len]);
+        }
+        for magic in [&b"RIFF"[..], b"\x1a\x45\xdf\xa3", b"\x00\x00\x00\x20ftypisom"] {
+            let mut buf = magic.to_vec();
+            buf.resize(2048, 0);
+            run_all_parsers(&buf);
+        }
+    }
+}

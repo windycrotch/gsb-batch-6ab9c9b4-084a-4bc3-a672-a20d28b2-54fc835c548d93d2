@@ -1,0 +1,22 @@
+[package]
+name = "revelo-parsers-archive"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Archive-format parsers for revelo (ZIP, 7z, RAR, tar, gzip, ...)."
+keywords = ["archive", "zip", "tar", "parser", "metadata"]
+categories = ["parser-implementations", "compression", "parsing"]
+readme = "README.md"
+
+[lib]
+name = "revelo_parsers_archive"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7", default-features = false }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }

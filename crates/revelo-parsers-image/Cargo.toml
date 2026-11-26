@@ -1,0 +1,22 @@
+[package]
+name = "revelo-parsers-image"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Image-format parsers for revelo (JPEG, PNG, TIFF, WebP, HEIF, ...)."
+keywords = ["exif", "jpeg", "png", "heif", "parser"]
+categories = ["parser-implementations", "multimedia::images", "parsing"]
+readme = "README.md"
+
+[lib]
+name = "revelo_parsers_image"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7", default-features = false }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }

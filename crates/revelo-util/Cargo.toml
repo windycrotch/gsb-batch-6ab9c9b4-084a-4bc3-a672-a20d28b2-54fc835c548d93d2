@@ -1,0 +1,18 @@
+[package]
+name = "revelo-util"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Low-level string, number, and bitstream primitives (Ztring, radix conversion) underpinning revelo."
+keywords = ["bitstream", "string", "ztring", "primitives", "parsing"]
+categories = ["parsing", "value-formatting"]
+readme = "README.md"
+
+[lib]
+name = "revelo_util"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

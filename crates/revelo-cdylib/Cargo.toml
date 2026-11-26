@@ -1,0 +1,25 @@
+[package]
+name = "revelo-cdylib"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Drop-in libmediainfo replacement — C ABI exposing the MediaInfo_* entry points, backed by revelo's pure-Rust engine"
+keywords = ["mediainfo", "ffi", "c-api", "media", "metadata"]
+categories = ["multimedia", "external-ffi-bindings", "api-bindings"]
+readme = "README.md"
+
+[lib]
+name = "revelo_cdylib"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-dispatcher = { path = "../revelo-dispatcher", version = "0.5.7" }
+revelo-core = { path = "../revelo-core", version = "0.5.7" }
+revelo-export = { path = "../revelo-export", version = "0.5.7" }
+revelo-parsers-tag = { path = "../revelo-parsers-tag", version = "0.5.7" }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }

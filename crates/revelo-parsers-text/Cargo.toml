@@ -1,0 +1,22 @@
+[package]
+name = "revelo-parsers-text"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Text and subtitle parsers for revelo (SubRip, WebVTT, TTML, teletext, ...)."
+keywords = ["subtitles", "webvtt", "subrip", "ttml", "parser"]
+categories = ["parser-implementations", "text-processing", "parsing"]
+readme = "README.md"
+
+[lib]
+name = "revelo_parsers_text"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7", default-features = false }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }

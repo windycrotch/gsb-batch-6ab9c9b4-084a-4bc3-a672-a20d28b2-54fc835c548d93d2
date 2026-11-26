@@ -1,0 +1,34 @@
+[package]
+name = "revelo-cli"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust media metadata extractor — MediaInfo- and ExifTool-compatible output, no system dependencies"
+keywords = ["mediainfo", "exif", "metadata", "parser", "ffprobe"]
+categories = ["command-line-utilities", "multimedia", "parser-implementations"]
+readme = "README.md"
+
+[[bin]]
+name = "revelo"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Passthrough: build the CLI with ExifTool-derived maker-note tables.
+# Pulls in the GPL/Artistic `revelo-exiftool-tables` crate, so a CLI built
+# with this feature is subject to GPL/Artistic terms. Default build is BSD.
+exiftool-tables = ["revelo-parsers-tag/exiftool-tables"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+memmap2 = "0.9"
+revelo-dispatcher = { path = "../revelo-dispatcher", version = "0.5.7" }
+revelo-core = { path = "../revelo-core", version = "0.5.7" }
+revelo-export = { path = "../revelo-export", version = "0.5.7" }
+revelo-util = { path = "../revelo-util", version = "0.5.7" }
+revelo-parsers-tag = { path = "../revelo-parsers-tag", version = "0.5.7" }

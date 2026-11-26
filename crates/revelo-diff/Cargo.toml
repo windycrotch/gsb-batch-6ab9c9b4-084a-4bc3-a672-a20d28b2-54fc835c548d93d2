@@ -1,0 +1,23 @@
+[package]
+name = "revelo-diff"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Differential testing against mediainfo oracle"
+readme = "README.md"
+
+[[bin]]
+name = "revelo-diff"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+revelo-core = { path = "../revelo-core", version = "0.5.7" }
+revelo-dispatcher = { path = "../revelo-dispatcher", version = "0.5.7" }
+revelo-export = { path = "../revelo-export", version = "0.5.7" }
+revelo-parsers-tag = { path = "../revelo-parsers-tag", version = "0.5.7" }

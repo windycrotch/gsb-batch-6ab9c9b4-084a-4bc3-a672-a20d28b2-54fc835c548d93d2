@@ -1,0 +1,2 @@
+# revelo build configuration
+# CI sets RUSTFLAGS="-D warnings" separately

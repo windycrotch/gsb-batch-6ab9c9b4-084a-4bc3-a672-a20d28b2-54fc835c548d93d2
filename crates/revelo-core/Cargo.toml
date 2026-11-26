@@ -1,0 +1,26 @@
+[package]
+name = "revelo-core"
+version = "0.5.7"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core engine for revelo: the FileAnalyze byte reader, stream collection, element tree, and ergonomic Reader API."
+keywords = ["media", "metadata", "parser", "mediainfo", "reader"]
+categories = ["multimedia", "parsing", "parser-implementations"]
+readme = "README.md"
+
+[lib]
+name = "revelo_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["mmap"]
+mmap = ["dep:memmap2"]
+
+[dependencies]
+revelo-util = { path = "../revelo-util", version = "0.5.7" }
+memmap2 = { version = "0.9", optional = true }

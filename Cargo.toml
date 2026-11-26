@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/revelo",
+    "crates/revelo-diff",
+    "crates/revelo-exif-diff",
+    "crates/revelo-cli",
+    "crates/revelo-core",
+    "crates/revelo-export",
+    "crates/revelo-parsers-archive",
+    "crates/revelo-reader",
+    "crates/revelo-dispatcher",
+    "crates/revelo-parsers-audio",
+    "crates/revelo-parsers-container",
+    "crates/revelo-parsers-image",
+    "crates/revelo-parsers-tag",
+    "crates/revelo-exiftool-tables",
+    "crates/revelo-parsers-text",
+    "crates/revelo-parsers-video",
+    "crates/revelo-util",
+    "crates/revelo-cdylib",
+    "crates/revelo-wasm",
+    "crates/revelo-bench",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "BSD-2-Clause"
+repository = "https://github.com/vbasky/revelo"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unused_import_braces = "warn"
+unused_extern_crates = "warn"
+
+[workspace.lints.rustdoc]
+invalid_html_tags = "allow"
+broken_intra_doc_links = "allow"
+
+[workspace.lints.clippy]
+# Pedantic/restriction lints that are pure noise in a binary-parser codebase
+# (pervasive intentional casts, doc identifiers, test unwraps).
+unwrap_used = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# Pre-existing minor style lints — allowed to keep the `-D warnings` gate green;
+# can be fixed individually later without touching parser logic.
+doc_lazy_continuation = "allow"
+explicit_counter_loop = "allow"
+field_reassign_with_default = "allow"
+if_same_then_else = "allow"
+manual_checked_ops = "allow"
+manual_strip = "allow"
+match_like_matches_macro = "allow"
+missing_safety_doc = "allow"
+needless_range_loop = "allow"
+same_item_push = "allow"
+type_complexity = "allow"
+unusual_byte_groupings = "allow"
+vec_init_then_push = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.dependencies]
+rayon = "1"
