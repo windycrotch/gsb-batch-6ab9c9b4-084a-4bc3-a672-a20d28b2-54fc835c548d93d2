@@ -1021,9 +1021,15 @@ func (s *Subtitles) Optimize() {
 	s.removeUnusedRegionsAndStyles()
 }
 
-// removeUnusedRegionsAndStyles removes unused regions and styles
+// removeUnusedRegionsAndStyles removes unused regions and styles.
+//
+// References are followed transitively: a style that is kept also keeps the
+// parent styles it inherits through Style.Style, and a kept region keeps the
+// style referenced by that region (and its parents). This guarantees the
+// resulting TTML/WebVTT references stay self-consistent instead of pointing at
+// styles removed by the cleanup.
 func (s *Subtitles) removeUnusedRegionsAndStyles() {
-	// Loop through items
+	// Loop through items and collect directly referenced regions and styles.
 	var usedRegions, usedStyles = make(map[string]bool), make(map[string]bool)
 	for _, item := range s.Items {
 		// Add region
@@ -1031,28 +1037,29 @@ func (s *Subtitles) removeUnusedRegionsAndStyles() {
 			usedRegions[item.Region.ID] = true
 		}
 
-		// Add style
+		// Add style, including its inherited parent chain
 		if item.Style != nil {
-			usedStyles[item.Style.ID] = true
+			markStyleChainUsed(item.Style, s.Styles, usedStyles)
 		}
 
 		// Loop through lines
 		for _, line := range item.Lines {
 			// Loop through line items
 			for _, lineItem := range line.Items {
-				// Add style
+				// Add style referenced by an inline fragment
 				if lineItem.Style != nil {
-					usedStyles[lineItem.Style.ID] = true
+					markStyleChainUsed(lineItem.Style, s.Styles, usedStyles)
 				}
 			}
 		}
 	}
 
-	// Loop through regions
+	// A used region keeps the style it references; markStyleChainUsed also
+	// follows the referenced style's parent chain.
 	for id, region := range s.Regions {
 		if _, ok := usedRegions[region.ID]; ok {
 			if region.Style != nil {
-				usedStyles[region.Style.ID] = true
+				markStyleChainUsed(region.Style, s.Styles, usedStyles)
 			}
 		} else {
 			delete(s.Regions, id)
@@ -1064,6 +1071,34 @@ func (s *Subtitles) removeUnusedRegionsAndStyles() {
 		if _, ok := usedStyles[style.ID]; !ok {
 			delete(s.Styles, id)
 		}
+	}
+}
+
+// markStyleChainUsed marks st and every style it inherits through Style.Style
+// as used. stylesByID, when non-nil, provides the canonical map instance for
+// an ID so parent links created during parsing are followed even when the
+// passed pointer is a detached copy (as in some hand-built test graphs).
+func markStyleChainUsed(st *Style, stylesByID map[string]*Style, usedStyles map[string]bool) {
+	visited := make(map[*Style]bool)
+	for st != nil {
+		if visited[st] {
+			return
+		}
+		visited[st] = true
+		if st.ID != "" {
+			usedStyles[st.ID] = true
+		}
+		// Prefer the canonical map instance for this ID as it carries the
+		// parsed parent link.
+		next := st.Style
+		if stylesByID != nil && st.ID != "" {
+			if canonical, ok := stylesByID[st.ID]; ok && canonical != nil {
+				if canonical.Style != nil {
+					next = canonical.Style
+				}
+			}
+		}
+		st = next
 	}
 }
 
@@ -1148,21 +1183,8 @@ func (s Subtitles) Write(dst string) (err error) {
 	}
 	defer f.Close()
 
-	// Write the content
-	switch filepath.Ext(strings.ToLower(dst)) {
-	case ".srt":
-		err = s.WriteToSRT(f)
-	case ".ssa", ".ass":
-		err = s.WriteToSSA(f)
-	case ".stl":
-		err = s.WriteToSTL(f)
-	case ".ttml":
-		err = s.WriteToTTML(f)
-	case ".vtt":
-		err = s.WriteToWebVTT(f)
-	default:
-		err = ErrInvalidExtension
-	}
+	// Write the content through the shared extension dispatch.
+	err = WriteToWriter(&s, f, dst)
 	return
 }
 

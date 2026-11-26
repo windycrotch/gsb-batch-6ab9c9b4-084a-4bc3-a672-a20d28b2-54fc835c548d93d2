@@ -52,6 +52,55 @@ var buf = &bytes.Buffer{}
 s2.WriteToTTML(buf)
 ```
 
+# Batch converting files
+
+`ConvertBatch` converts any number of source/target pairs in one call. It
+returns exactly one `BatchResult` per `BatchJob`, at the same index and in the
+same order as the inputs; a parse or write failure on one file never aborts the
+other files:
+
+```go
+jobs := []astisub.BatchJob{
+    {Source: "first.srt",  Target: "first.ttml"},
+    {Source: "second.srt", Target: "second.vtt", Optimize: true},
+}
+results := astisub.ConvertBatch(ctx, jobs, astisub.WithConcurrency(4))
+for _, r := range results {
+    if !r.OK {
+        log.Printf("%s -> %s failed (cancelled=%v): %s", r.Source, r.Target, r.Cancelled, r.Reason)
+    }
+}
+```
+
+Guarantees:
+
+- **Same parse/write chain per file**: jobs go through `Open` and the same
+  extension-dispatched `WriteTo*` implementations as single-file conversion.
+- **Atomic target replacement**: each job is rendered into a unique temporary
+  file in the target directory and committed with a rename only after full
+  success. If parsing, rendering, cancellation or commit fails, the temporary
+  file is removed and a pre-existing target keeps its original bytes. Repeating
+  the same batch therefore produces identical results and file contents.
+- **Ordered, exactly-once results under concurrency**: result `i` always
+  corresponds to job `i`.
+- **Cancellation**: when `ctx` is cancelled, completed jobs are kept, jobs not
+  handed to a worker are not opened, and an in-flight write is aborted with its
+  previous target preserved. Re-running the batch afterwards converges to the
+  same state as an uninterrupted run.
+- **Style-safe `Optimize`**: `Subtitles.Optimize` keeps styles and regions
+  referenced by items or inline fragments, including inherited parent styles
+  and region-referenced styles; only unreferenced definitions are removed.
+  Documents are never shared between batch jobs, so one file's failure cannot
+  affect another file's style graph.
+
+Parse/render steps are injectable through `WithOpen` and `WithRenderer`, which
+makes mid-write failure and cancellation scenarios easy to exercise in tests
+(see `batch_test.go`).
+
+The CLI exposes the same entry point:
+
+        astisub convert-batch -i first.srt -i second.srt -os first.ttml -os second.vtt -c 4
+
 # Using the CLI
 
 If **astisub** has been installed properly you can:
@@ -59,6 +108,11 @@ If **astisub** has been installed properly you can:
 - convert any type of subtitle to any other type of subtitle:
 
         astisub convert -i example.srt -o example.ttml
+
+- batch convert several pairs at once (ordered per-file results, atomic
+  replacement, cancellation-safe):
+
+        astisub convert-batch -i first.srt -i second.srt -os first.ttml -os second.vtt -c 4 -batch-optimize
 
 - apply linear correction to any type of subtitle:
 

@@ -18,6 +18,9 @@ var (
 	inputPath        = astikit.NewFlagStrings()
 	teletextPage     = flag.Int("p", 0, "the teletext page")
 	outputPath       = flag.String("o", "", "the output path")
+	outputPaths      = astikit.NewFlagStrings()
+	batchConcurrency = flag.Int("c", 0, "convert-batch: maximum number of concurrent conversions (0 = default)")
+	batchOptimize    = flag.Bool("batch-optimize", false, "convert-batch: optimize each subtitle before writing")
 	syncDuration     = flag.Duration("s", 0, "the sync duration")
 )
 
@@ -25,11 +28,19 @@ func main() {
 	// Init
 	cmd := astikit.FlagCmd()
 	flag.Var(&inputPath, "i", "the input paths")
+	flag.Var(&outputPaths, "os", "convert-batch output paths, paired by index with repeated -i flags")
 	flag.Parse()
 
 	// Validate input path
 	if len(*inputPath.Slice) == 0 {
 		log.Fatal("Use -i to provide at least one input path")
+	}
+
+	// Batch conversion handles its own -os outputs and per-file failures, so it
+	// must bypass the single-file open/-o validation below.
+	if cmd == "convert-batch" {
+		runConvertBatch()
+		return
 	}
 
 	// Validate output path
