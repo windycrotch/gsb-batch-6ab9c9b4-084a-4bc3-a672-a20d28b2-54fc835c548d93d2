@@ -48,7 +48,12 @@ func logf(format string, a ...interface{}) {
 
 var (
 	ErrNegativeFrameSize = errors.New("Frame size is negative, possibly corrupted.")
+	ErrFrameTooLarge     = errors.New("Frame size exceeds the maximum allowed, possibly corrupted.")
 )
+
+// maxFrameLen is a sanity limit for a single dca frame (one opus packet). An
+// opus packet is at most a few KiB, anything above this is corruption.
+const maxFrameLen = 64 << 10
 
 // DecodeFrame decodes a dca frame from an io.Reader and returns the raw opus audio ready to be sent to discord
 func DecodeFrame(r io.Reader) (frame []byte, err error) {
@@ -62,7 +67,13 @@ func DecodeFrame(r io.Reader) (frame []byte, err error) {
 		return nil, ErrNegativeFrameSize
 	}
 
+	if int(size) > maxFrameLen {
+		return nil, ErrFrameTooLarge
+	}
+
 	frame = make([]byte, size)
-	err = binary.Read(r, binary.LittleEndian, &frame)
+	// io.ReadFull reports a truncated frame as io.ErrUnexpectedEOF instead of
+	// returning a half filled buffer.
+	_, err = io.ReadFull(r, frame)
 	return
 }

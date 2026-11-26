@@ -3,6 +3,7 @@ package dca
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -32,6 +33,14 @@ var (
 
 var (
 	ErrBadFrame = errors.New("Bad Frame")
+
+	// ErrNotRunning is returned by Stop when the session has already been
+	// stopped or has already finished on its own.
+	ErrNotRunning = errors.New("Encode session is not running")
+
+	// ErrSessionStopped is returned by internal writers when the session has
+	// been stopped while they were trying to publish a frame.
+	ErrSessionStopped = errors.New("Encode session stopped")
 )
 
 // EncodeOptions is a set of options for encoding dca
@@ -89,6 +98,10 @@ func (opts *EncodeOptions) Validate() error {
 		return errors.New("Number of threads can't be less than 0")
 	}
 
+	if opts.BufferedFrames < 0 {
+		return errors.New("Number of buffered frames can't be less than 0")
+	}
+
 	return nil
 }
 
@@ -120,17 +133,47 @@ type Frame struct {
 	metaData bool
 }
 
+// EncodeSession is a single transcode session.
+//
+// The session has exactly one observable outcome: either the frames of the
+// input are produced until ffmpeg is done (readers see io.EOF), or the session
+// is stopped through Stop/Cleanup (readers see io.EOF as well, and the ffmpeg
+// process has been reaped before Cleanup returns).
+//
+// Ownership rules that make that guarantee hold:
+//   - The run goroutine is the only goroutine that sends to and closes
+//     frameChannel, and it closes it exactly once when it is completely done.
+//   - All sends select on stopCh, so a stop never leaves a writer blocked
+//     forever and never sends into a closed channel.
+//   - All receives select on stopCh as well, so a blocked ReadFrame can never
+//     outlive a stop.
 type EncodeSession struct {
 	sync.Mutex
 	options    *EncodeOptions
 	pipeReader io.Reader
 	filePath   string
 
-	running      bool
-	started      time.Time
+	running bool
+	stopped bool
+	started time.Time
+
 	frameChannel chan *Frame
-	process      *os.Process
-	lastStats    *EncodeStats
+
+	// stopCh is closed exactly once, by the first Stop call.
+	stopCh chan struct{}
+	// doneCh is closed by the run goroutine once ffmpeg has been reaped and
+	// frameChannel has been closed.
+	doneCh chan struct{}
+
+	process *os.Process
+	// cancel aborts the context the ffprobe/cover helper processes are started
+	// with. The ffmpeg process itself is killed synchronously by Stop. May be
+	// nil before the run goroutine gets going.
+	cancel context.CancelFunc
+	// stdin is the write side of ffmpeg's stdin when encoding from memory.
+	stdin io.WriteCloser
+
+	lastStats *EncodeStats
 
 	lastFrame int
 	err       error
@@ -149,11 +192,8 @@ func EncodeMem(r io.Reader, options *EncodeOptions) (session *EncodeSession, err
 		return
 	}
 
-	session = &EncodeSession{
-		options:      options,
-		pipeReader:   r,
-		frameChannel: make(chan *Frame, options.BufferedFrames),
-	}
+	session = newEncodeSession(options)
+	session.pipeReader = r
 	go session.run()
 	return
 }
@@ -165,37 +205,56 @@ func EncodeFile(path string, options *EncodeOptions) (session *EncodeSession, er
 		return
 	}
 
-	session = &EncodeSession{
-		options:      options,
-		filePath:     path,
-		frameChannel: make(chan *Frame, options.BufferedFrames),
-	}
+	session = newEncodeSession(options)
+	session.filePath = path
 	go session.run()
 	return
 }
 
+func newEncodeSession(options *EncodeOptions) *EncodeSession {
+	return &EncodeSession{
+		options:      options,
+		frameChannel: make(chan *Frame, options.BufferedFrames),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
+		// The session counts as running from the moment it is created: the run
+		// goroutine is about to be started and Stop must be able to cancel it
+		// even if it hasn't reached its first statement yet.
+		running: true,
+	}
+}
+
 func (e *EncodeSession) run() {
-	// Reset running state
+	// The run goroutine owns frameChannel and doneCh. Closing them here, in a
+	// single place, is what makes "the session is over" unambiguous.
 	defer func() {
 		e.Lock()
 		e.running = false
 		e.Unlock()
+
+		close(e.frameChannel)
+		close(e.doneCh)
 	}()
 
 	e.Lock()
-	e.running = true
+	options := e.options
+	if options == nil {
+		options = StdEncodeOptions
+		e.options = options
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancel = cancel
+	e.Unlock()
+	defer cancel()
 
 	inFile := "pipe:0"
 	if e.filePath != "" {
 		inFile = e.filePath
 	}
 
-	if e.options == nil {
-		e.options = StdEncodeOptions
-	}
-
 	vbrStr := "on"
-	if !e.options.VBR {
+	if !options.VBR {
 		vbrStr = "off"
 	}
 
@@ -211,85 +270,168 @@ func (e *EncodeSession) run() {
 		"-acodec", "libopus",
 		"-f", "ogg",
 		"-vbr", vbrStr,
-		"-compression_level", strconv.Itoa(e.options.CompressionLevel),
-		"-vol", strconv.Itoa(e.options.Volume),
-		"-ar", strconv.Itoa(e.options.FrameRate),
-		"-ac", strconv.Itoa(e.options.Channels),
-		"-b:a", strconv.Itoa(e.options.Bitrate * 1000),
-		"-application", string(e.options.Application),
-		"-frame_duration", strconv.Itoa(e.options.FrameDuration),
-		"-packet_loss", strconv.Itoa(e.options.PacketLoss),
-		"-threads", strconv.Itoa(e.options.Threads),
-		"-ss", strconv.Itoa(e.options.StartTime),
+		"-compression_level", strconv.Itoa(options.CompressionLevel),
+		"-ar", strconv.Itoa(options.FrameRate),
+		"-ac", strconv.Itoa(options.Channels),
+		"-b:a", strconv.Itoa(options.Bitrate * 1000),
+		"-application", string(options.Application),
+		"-frame_duration", strconv.Itoa(options.FrameDuration),
+		"-packet_loss", strconv.Itoa(options.PacketLoss),
+		"-threads", strconv.Itoa(options.Threads),
+		"-ss", strconv.Itoa(options.StartTime),
 	}
 
-	if e.options.AudioFilter != "" {
-		// Lit af
-		args = append(args, "-af", e.options.AudioFilter)
+	// Apply the volume as part of the audio filter chain. The old -vol option
+	// has been removed from recent ffmpeg releases, this works on all of them.
+	filters := make([]string, 0, 2)
+	if options.Volume != 256 {
+		filters = append(filters, fmt.Sprintf("volume=%.6f", float64(options.Volume)/256))
+	}
+	if options.AudioFilter != "" {
+		filters = append(filters, options.AudioFilter)
+	}
+	if len(filters) > 0 {
+		args = append(args, "-af", strings.Join(filters, ","))
 	}
 
 	args = append(args, "pipe:1")
 
+	// Deliberately not exec.CommandContext: the session drives the lifetime of
+	// the process itself (Stop kills it synchronously), so there must not be a
+	// second, asynchronous killer racing with it. The context below is only used
+	// for the short-lived ffprobe/cover helper processes.
 	ffmpeg := exec.Command("ffmpeg", args...)
 
-	// logln(ffmpeg.Args)
-
+	var stdin io.WriteCloser
 	if e.pipeReader != nil {
-		ffmpeg.Stdin = e.pipeReader
+		var err error
+		stdin, err = ffmpeg.StdinPipe()
+		if err != nil {
+			logln("StdinPipe Error:", err)
+			e.setErr(err)
+			return
+		}
 	}
 
 	stdout, err := ffmpeg.StdoutPipe()
 	if err != nil {
-		e.Unlock()
 		logln("StdoutPipe Error:", err)
-		close(e.frameChannel)
+		e.setErr(err)
 		return
 	}
 
 	stderr, err := ffmpeg.StderrPipe()
 	if err != nil {
-		e.Unlock()
 		logln("StderrPipe Error:", err)
-		close(e.frameChannel)
+		e.setErr(err)
 		return
-	}
-
-	if !e.options.RawOutput {
-		e.writeMetadataFrame()
 	}
 
 	// Starts the ffmpeg command
 	err = ffmpeg.Start()
 	if err != nil {
-		e.Unlock()
 		logln("RunStart Error:", err)
-		close(e.frameChannel)
+		e.setErr(err)
 		return
 	}
 
+	e.Lock()
 	e.started = time.Now()
-
 	e.process = ffmpeg.Process
+	e.stdin = stdin
 	e.Unlock()
+
+	// A stop may have been requested while we were starting up; if so the
+	// process must not be allowed to keep running.
+	if e.isStopped() {
+		_ = ffmpeg.Process.Kill()
+		_ = ffmpeg.Wait()
+		return
+	}
+
+	if stdin != nil {
+		// Copy the input in a goroutine of our own: cmd.Wait would otherwise
+		// block on an io.Reader that never returns, keeping Cleanup hanging.
+		go func() {
+			_, _ = io.Copy(stdin, e.pipeReader)
+			_ = stdin.Close()
+		}()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go e.readStderr(stderr, &wg)
 
-	defer close(e.frameChannel)
-	e.readStdout(stdout)
+	// The metadata frame is written only once ffmpeg is actually running, so a
+	// failed start can't hand the caller a metadata frame without any audio,
+	// and it is always written before any audio frame.
+	if !options.RawOutput {
+		e.writeMetadataFrame(ctx, options)
+	}
+
+	if err := e.readStdout(stdout); err != nil && !e.isStopped() {
+		e.setErr(err)
+		// Tear the process down so Wait below can't block on live pipes. The
+		// process was started without a context, so kill it explicitly.
+		_ = ffmpeg.Process.Kill()
+	}
+
 	wg.Wait()
 	err = ffmpeg.Wait()
-	if err != nil {
-		if err.Error() != "signal: killed" {
-			e.Lock()
-			e.err = err
-			e.Unlock()
-		}
+	if err != nil && !e.isStopped() {
+		e.setErr(err)
 	}
 }
 
-func (e *EncodeSession) writeMetadataFrame() {
+func (e *EncodeSession) setErr(err error) {
+	if err == nil {
+		return
+	}
+	e.Lock()
+	if e.err == nil {
+		e.err = err
+	}
+	e.Unlock()
+}
+
+// isStopped reports wether a stop has been requested for this session.
+func (e *EncodeSession) isStopped() bool {
+	if e.stopCh == nil {
+		return false
+	}
+	select {
+	case <-e.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// sendFrame hands a frame to the readers. It never blocks past a stop and it
+// never sends on a channel that has already been closed (the run goroutine is
+// the only closer, and it stops sending before it closes).
+func (e *EncodeSession) sendFrame(f *Frame) error {
+	if e.stopCh == nil {
+		e.frameChannel <- f
+		return nil
+	}
+
+	// Prefer reporting the stop over queueing one more frame.
+	select {
+	case <-e.stopCh:
+		return ErrSessionStopped
+	default:
+	}
+
+	select {
+	case <-e.stopCh:
+		return ErrSessionStopped
+	case e.frameChannel <- f:
+		return nil
+	}
+}
+
+func (e *EncodeSession) writeMetadataFrame(ctx context.Context, options *EncodeOptions) {
 	// Setup the metadata
 	metadata := Metadata{
 		Dca: &DCAMetadata{
@@ -302,107 +444,29 @@ func (e *EncodeSession) writeMetadataFrame() {
 			},
 		},
 		Opus: &OpusMetadata{
-			Bitrate:     e.options.Bitrate * 1000,
-			SampleRate:  e.options.FrameRate,
-			Application: string(e.options.Application),
-			FrameSize:   e.options.PCMFrameLen(),
-			Channels:    e.options.Channels,
-			VBR:         e.options.VBR,
+			Bitrate:     options.Bitrate * 1000,
+			SampleRate:  options.FrameRate,
+			Application: string(options.Application),
+			FrameSize:   options.PCMFrameLen(),
+			Channels:    options.Channels,
+			VBR:         options.VBR,
 		},
 		SongInfo: &SongMetadata{},
 		Origin:   &OriginMetadata{},
 		Extra:    &ExtraMetadata{},
 	}
+
 	var cmdBuf bytes.Buffer
 	// get ffprobe data
 	if e.pipeReader == nil {
-		ffprobe := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", e.filePath)
-		ffprobe.Stdout = &cmdBuf
-
-		err := ffprobe.Start()
-		if err != nil {
-			logln("RunStart Error:", err)
-			return
-		}
-
-		err = ffprobe.Wait()
-		if err != nil {
-			logln("FFprobe Error:", err)
-			return
-		}
-		var ffprobeData *FFprobeMetadata
-		err = json.Unmarshal(cmdBuf.Bytes(), &ffprobeData)
-		if err != nil {
-			logln("Erorr unmarshaling the FFprobe JSON:", err)
-			return
-		}
-
-		if ffprobeData.Format == nil {
-			ffprobeData.Format = &FFprobeFormat{}
-		}
-
-		if ffprobeData.Format.Tags == nil {
-			ffprobeData.Format.Tags = &FFprobeTags{}
-		}
-
-		bitrateInt, err := strconv.Atoi(ffprobeData.Format.Bitrate)
-		if err != nil {
-			logln("Could not convert bitrate to int:", err)
-			return
-		}
-
-		metadata.SongInfo = &SongMetadata{
-			Title:    ffprobeData.Format.Tags.Title,
-			Artist:   ffprobeData.Format.Tags.Artist,
-			Album:    ffprobeData.Format.Tags.Album,
-			Genre:    ffprobeData.Format.Tags.Genre,
-			Comments: e.options.Comment,
-		}
-
-		metadata.Origin = &OriginMetadata{
-			Source:   "file",
-			Bitrate:  bitrateInt,
-			Channels: e.options.Channels,
-			Encoding: ffprobeData.Format.FormatLongName,
-		}
-
-		cmdBuf.Reset()
-
-		// get cover art
-		cover := exec.Command("ffmpeg", "-loglevel", "0", "-i", e.filePath, "-f", "singlejpeg", "pipe:1")
-		cover.Stdout = &cmdBuf
-
-		err = cover.Start()
-		if err != nil {
-			logln("RunStart Error:", err)
-			return
-		}
-		var pngBuf bytes.Buffer
-		err = cover.Wait()
-		if err == nil {
-			buf := bytes.NewBufferString(cmdBuf.String())
-			var coverImage string
-			if e.options.CoverFormat == "png" {
-				img, err := jpeg.Decode(buf)
-				if err == nil { // silently drop it, no image
-					err = png.Encode(&pngBuf, img)
-					if err == nil {
-						coverImage = base64.StdEncoding.EncodeToString(pngBuf.Bytes())
-					}
-				}
-			} else {
-				coverImage = base64.StdEncoding.EncodeToString(cmdBuf.Bytes())
-			}
-
-			metadata.SongInfo.Cover = &coverImage
-		}
-
-		cmdBuf.Reset()
-		pngBuf.Reset()
+		// Everything in here is best effort: if ffprobe or the cover extraction
+		// fails we still emit the metadata frame, the fields are just left
+		// empty. The frame itself must be there exactly once either way.
+		e.populateFileMetadata(ctx, options, &metadata, &cmdBuf)
 	} else {
 		metadata.Origin = &OriginMetadata{
 			Source:   "pipe",
-			Channels: e.options.Channels,
+			Channels: options.Channels,
 		}
 	}
 
@@ -424,7 +488,120 @@ func (e *EncodeSession) writeMetadataFrame() {
 	}
 
 	buf.Write(jsonData)
-	e.frameChannel <- &Frame{buf.Bytes(), true}
+	if err := e.sendFrame(&Frame{buf.Bytes(), true}); err != nil {
+		// The session was stopped before the metadata could be delivered;
+		// dropping it is correct, there will be no audio either.
+		return
+	}
+}
+
+// populateFileMetadata fills in the song/origin/cover fields from ffprobe.
+// Failures are logged and ignored: the metadata frame is still sent, just with
+// less information in it. Nothing in here may prevent the frame from being
+// emitted, because it has to be there exactly once.
+func (e *EncodeSession) populateFileMetadata(ctx context.Context, options *EncodeOptions, metadata *Metadata, cmdBuf *bytes.Buffer) {
+	// Sensible defaults for a file source; ffprobe refines them below.
+	metadata.SongInfo = &SongMetadata{Comments: options.Comment}
+	metadata.Origin = &OriginMetadata{
+		Source:   "file",
+		Channels: options.Channels,
+	}
+
+	if e.isStopped() {
+		return
+	}
+
+	ffprobe := exec.CommandContext(ctx, "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", e.filePath)
+	ffprobe.Stdout = cmdBuf
+
+	err := ffprobe.Start()
+	if err != nil {
+		logln("RunStart Error:", err)
+		return
+	}
+
+	err = ffprobe.Wait()
+	if err != nil {
+		logln("FFprobe Error:", err)
+		return
+	}
+	var ffprobeData *FFprobeMetadata
+	err = json.Unmarshal(cmdBuf.Bytes(), &ffprobeData)
+	if err != nil {
+		logln("Erorr unmarshaling the FFprobe JSON:", err)
+		return
+	}
+	if ffprobeData == nil {
+		return
+	}
+
+	if ffprobeData.Format == nil {
+		ffprobeData.Format = &FFprobeFormat{}
+	}
+
+	if ffprobeData.Format.Tags == nil {
+		ffprobeData.Format.Tags = &FFprobeTags{}
+	}
+
+	metadata.SongInfo = &SongMetadata{
+		Title:    ffprobeData.Format.Tags.Title,
+		Artist:   ffprobeData.Format.Tags.Artist,
+		Album:    ffprobeData.Format.Tags.Album,
+		Genre:    ffprobeData.Format.Tags.Genre,
+		Comments: options.Comment,
+	}
+
+	metadata.Origin = &OriginMetadata{
+		Source:   "file",
+		Channels: options.Channels,
+		Encoding: ffprobeData.Format.FormatLongName,
+	}
+
+	// bit_rate is missing for some containers (raw ogg and such); that is not
+	// a reason to drop the rest of the metadata.
+	if bitrateInt, err := strconv.Atoi(ffprobeData.Format.Bitrate); err == nil {
+		metadata.Origin.Bitrate = bitrateInt
+	} else {
+		logln("Could not convert bitrate to int:", err)
+	}
+
+	cmdBuf.Reset()
+
+	if e.isStopped() {
+		return
+	}
+
+	// get cover art
+	cover := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "0", "-i", e.filePath, "-f", "singlejpeg", "pipe:1")
+	cover.Stdout = cmdBuf
+
+	err = cover.Start()
+	if err != nil {
+		logln("RunStart Error:", err)
+		return
+	}
+	var pngBuf bytes.Buffer
+	err = cover.Wait()
+	if err == nil && cmdBuf.Len() > 0 {
+		buf := bytes.NewBufferString(cmdBuf.String())
+		var coverImage string
+		if options.CoverFormat == "png" {
+			img, err := jpeg.Decode(buf)
+			if err == nil { // silently drop it, no image
+				err = png.Encode(&pngBuf, img)
+				if err == nil {
+					coverImage = base64.StdEncoding.EncodeToString(pngBuf.Bytes())
+				}
+			}
+		} else {
+			coverImage = base64.StdEncoding.EncodeToString(cmdBuf.Bytes())
+		}
+
+		metadata.SongInfo.Cover = &coverImage
+	}
+
+	cmdBuf.Reset()
+	pngBuf.Reset()
 }
 
 func (e *EncodeSession) readStderr(stderr io.ReadCloser, wg *sync.WaitGroup) {
@@ -435,7 +612,7 @@ func (e *EncodeSession) readStderr(stderr io.ReadCloser, wg *sync.WaitGroup) {
 	for {
 		r, _, err := bufReader.ReadRune()
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !e.isStopped() {
 				logln("Error Reading stderr:", err)
 			}
 			break
@@ -466,29 +643,57 @@ func (e *EncodeSession) handleStderrLine(line string) {
 		return // Not stats info
 	}
 
-	var size int
+	// The stats line format changed over ffmpeg versions. Older releases print
+	//   size=    1234kB time=00:00:15.06 bitrate=  51.7kbits/s speed=14.1x
+	// while newer ones (ffmpeg 6+) print
+	//   size=      95KiB time=00:00:15.06 bitrate=  51.7kbits/s speed=14.1x elapsed=0:00:00.10
+	// and may omit bitrate/speed entirely, so parse field by field.
+	stats := &EncodeStats{}
+	recognised := false
+	fields := strings.Fields(line)
+	for i := 0; i < len(fields); i++ {
+		key, value, ok := strings.Cut(fields[i], "=")
+		if !ok {
+			continue
+		}
+		if value == "" && i+1 < len(fields) {
+			// Padding after '=' ("size=      95KiB") splits key and value
+			// into two tokens; rejoin them.
+			i++
+			value = fields[i]
+		}
 
-	var timeH int
-	var timeM int
-	var timeS float32
-
-	var bitrate float32
-	var speed float32
-
-	_, err := fmt.Sscanf(line, "size=%dkB time=%d:%d:%f bitrate=%fkbits/s speed=%fx", &size, &timeH, &timeM, &timeS, &bitrate, &speed)
-	if err != nil {
-		logln("Error parsing ffmpeg stats:", err)
+		switch key {
+		case "size":
+			// Strip the unit (kB, KiB, ...).
+			num := strings.TrimRight(value, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+			if size, err := strconv.Atoi(num); err == nil {
+				stats.Size = size
+				recognised = true
+			}
+		case "time":
+			stats.Duration = parseFFmpegDuration(value)
+			recognised = true
+		case "bitrate":
+			num := strings.TrimSuffix(value, "kbits/s")
+			if b, err := strconv.ParseFloat(num, 32); err == nil {
+				stats.Bitrate = float32(b)
+			}
+		case "speed":
+			num := strings.TrimSuffix(value, "x")
+			if s, err := strconv.ParseFloat(num, 32); err == nil {
+				stats.Speed = float32(s)
+			}
+		}
 	}
 
-	dur := time.Duration(timeH) * time.Hour
-	dur += time.Duration(timeM) * time.Minute
-	dur += time.Duration(timeS) * time.Second
-
-	stats := &EncodeStats{
-		Size:     size,
-		Duration: dur,
-		Bitrate:  bitrate,
-		Speed:    speed,
+	if !recognised {
+		// ffmpeg also emits a bare "size=" line when it shuts down, don't log
+		// that as a parsing error.
+		if strings.TrimSpace(line) != "size=" {
+			logln("Error parsing ffmpeg stats: unrecognised stats line:", line)
+		}
+		return
 	}
 
 	e.Lock()
@@ -496,29 +701,62 @@ func (e *EncodeSession) handleStderrLine(line string) {
 	e.Unlock()
 }
 
-func (e *EncodeSession) readStdout(stdout io.ReadCloser) {
+// parseFFmpegDuration parses the "HH:MM:SS.mmm" form used in ffmpeg stats.
+func parseFFmpegDuration(value string) time.Duration {
+	parts := strings.Split(value, ":")
+	if len(parts) != 3 {
+		return 0
+	}
+
+	hours, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0
+	}
+	minutes, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0
+	}
+	seconds, err := strconv.ParseFloat(parts[2], 64)
+	if err != nil {
+		return 0
+	}
+
+	dur := time.Duration(hours) * time.Hour
+	dur += time.Duration(minutes) * time.Minute
+	dur += time.Duration(seconds * float64(time.Second))
+	return dur
+}
+
+func (e *EncodeSession) readStdout(stdout io.ReadCloser) error {
 	decoder := ogg.NewPacketDecoder(ogg.NewDecoder(stdout))
 
 	// the first 2 packets are ogg opus metadata
 	skipPackets := 2
 	for {
+		if e.isStopped() {
+			return nil
+		}
+
 		// Retrieve a packet
 		packet, _, err := decoder.Decode()
+		if err != nil {
+			if err == io.EOF || e.isStopped() {
+				return nil
+			}
+			return err
+		}
+
 		if skipPackets > 0 {
 			skipPackets--
 			continue
 		}
-		if err != nil {
-			if err != io.EOF {
-				logln("Error reading ffmpeg stdout:", err)
-			}
-			break
-		}
 
 		err = e.writeOpusFrame(packet)
 		if err != nil {
-			logln("Error writing opus frame:", err)
-			break
+			if errors.Is(err, ErrSessionStopped) {
+				return nil
+			}
+			return err
 		}
 	}
 }
@@ -536,7 +774,9 @@ func (e *EncodeSession) writeOpusFrame(opusFrame []byte) error {
 		return err
 	}
 
-	e.frameChannel <- &Frame{dcaBuf.Bytes(), false}
+	if err := e.sendFrame(&Frame{dcaBuf.Bytes(), false}); err != nil {
+		return err
+	}
 
 	e.Lock()
 	e.lastFrame++
@@ -545,24 +785,118 @@ func (e *EncodeSession) writeOpusFrame(opusFrame []byte) error {
 	return nil
 }
 
-// Stop stops the encoding session
+// Stop stops the encoding session.
+//
+// It is safe to call Stop at any point in the session's lifetime and from any
+// goroutine. Readers blocked in ReadFrame/OpusFrame/Read are woken up and
+// return io.EOF. The ffmpeg process is killed; Cleanup waits for it to be
+// reaped.
+//
+// Stop returns ErrNotRunning when the session was already stopped (or had
+// already finished).
 func (e *EncodeSession) Stop() error {
 	e.Lock()
-	defer e.Unlock()
-	if !e.running || e.process == nil {
-		return errors.New("Not running")
+	if e.stopCh == nil || e.stopped || !e.running {
+		e.Unlock()
+		return ErrNotRunning
 	}
 
-	err := e.process.Kill()
-	return err
+	e.stopped = true
+	e.running = false
+	process := e.process
+	cancel := e.cancel
+	stdin := e.stdin
+	e.Unlock()
+
+	// Closing stopCh is what unblocks every pending reader and writer.
+	close(e.stopCh)
+
+	// Kill before cancelling the context: the context's own kill is
+	// asynchronous, and racing it makes Kill report "Access is denied" on
+	// Windows for a process that is merely already terminating.
+	var killErr error
+	if process != nil {
+		killErr = process.Kill()
+		if errors.Is(killErr, os.ErrProcessDone) {
+			killErr = nil
+		}
+	}
+
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cancel != nil {
+		cancel()
+	}
+
+	if process == nil {
+		// The run goroutine hasn't started ffmpeg yet; it will notice the
+		// stop as soon as it does and kill the process itself.
+		return nil
+	}
+
+	if killErr != nil {
+		// On Windows, a process that has already exited but not been reaped
+		// yet can make Kill fail with "Access is denied". Give the run
+		// goroutine a moment to reap it and report success in that case;
+		// the session is stopped either way, and returning a spurious error
+		// would confuse callers that treat Stop's error as fatal.
+		select {
+		case <-e.doneCh:
+			return nil
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	return killErr
+}
+
+// nextFrame returns the next frame produced by the session.
+//
+// The result is deterministic once the session has been stopped: a reader that
+// was blocked in this call, or that calls it later, always observes io.EOF,
+// never a frame belonging to a previous position of the session.
+func (e *EncodeSession) nextFrame() (*Frame, error) {
+	if e.frameChannel == nil {
+		return nil, io.EOF
+	}
+
+	// Deterministic behaviour once stopped: no stale frames from an earlier
+	// position of the session are handed out.
+	if e.isStopped() {
+		return nil, io.EOF
+	}
+
+	if e.stopCh == nil {
+		f := <-e.frameChannel
+		if f == nil {
+			return nil, io.EOF
+		}
+		return f, nil
+	}
+
+	select {
+	case <-e.stopCh:
+		return nil, io.EOF
+	case f, ok := <-e.frameChannel:
+		// The stop may have landed while this select was racing, so check
+		// again before handing the frame out.
+		if e.isStopped() {
+			return nil, io.EOF
+		}
+		if !ok || f == nil {
+			return nil, io.EOF
+		}
+		return f, nil
+	}
 }
 
 // ReadFrame blocks until a frame is read or there are no more frames
 // Note: If rawoutput is not set, the first frame will be a metadata frame
 func (e *EncodeSession) ReadFrame() (frame []byte, err error) {
-	f := <-e.frameChannel
-	if f == nil {
-		return nil, io.EOF
+	f, err := e.nextFrame()
+	if err != nil {
+		return nil, err
 	}
 
 	return f.data, nil
@@ -570,21 +904,23 @@ func (e *EncodeSession) ReadFrame() (frame []byte, err error) {
 
 // OpusFrame implements OpusReader, returning the next opus frame
 func (e *EncodeSession) OpusFrame() (frame []byte, err error) {
-	f := <-e.frameChannel
-	if f == nil {
-		return nil, io.EOF
-	}
+	for {
+		f, err := e.nextFrame()
+		if err != nil {
+			return nil, err
+		}
 
-	if f.metaData {
-		// Return the next one then...
-		return e.OpusFrame()
-	}
+		if f.metaData {
+			// Skip the metadata frame(s) and return the next audio frame.
+			continue
+		}
 
-	if len(f.data) < 2 {
-		return nil, ErrBadFrame
-	}
+		if len(f.data) < 2 {
+			return nil, ErrBadFrame
+		}
 
-	return f.data[2:], nil
+		return f.data[2:], nil
+	}
 }
 
 // Running returns true if running
@@ -620,13 +956,28 @@ func (e *EncodeSession) Truncate() {
 	e.Cleanup()
 }
 
-// Cleanup cleans up the encoding session, throwring away all unread frames and stopping ffmpeg
-// ensuring that no ffmpeg processes starts piling up on your system
-// You should always call this after it's done
+// Cleanup cleans up the encoding session, throwing away all unread frames and
+// stopping ffmpeg, ensuring that no ffmpeg processes starts piling up on your
+// system. You should always call this after it's done.
+//
+// Cleanup blocks until the ffmpeg process has been reaped and the frame channel
+// has been closed, then drains whatever is left. It is safe to call Cleanup
+// repeatedly and concurrently; it never panics and never deadlocks.
 func (e *EncodeSession) Cleanup() {
-	e.Stop()
+	if e.frameChannel == nil {
+		return
+	}
 
-	for _ = range e.frameChannel {
+	// ErrNotRunning just means the session already finished on its own.
+	_ = e.Stop()
+
+	// Wait for the run goroutine: it reaps ffmpeg and closes the channel.
+	if e.doneCh != nil {
+		<-e.doneCh
+	}
+
+	// Drain whatever is left so no frame buffers are retained.
+	for range e.frameChannel {
 		// empty till closed
 		// Cats can be right-pawed or left-pawed.
 	}

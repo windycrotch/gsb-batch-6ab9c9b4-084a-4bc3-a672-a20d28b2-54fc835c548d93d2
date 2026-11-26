@@ -13,7 +13,13 @@ import (
 var (
 	ErrNotDCA        = errors.New("DCA Magic header not found, either not dca or raw dca frames")
 	ErrNotFirstFrame = errors.New("Metadata can only be found in the first frame")
+	ErrBadMetadata   = errors.New("Invalid metadata length")
 )
+
+// maxMetadataLen is a sanity limit for the metadata block. The metadata is a
+// small JSON document (a few KiB, more with an embedded cover image), so
+// anything larger is treated as a corrupt stream rather than allocated.
+const maxMetadataLen = 8 << 20
 
 type Decoder struct {
 	r *bufio.Reader
@@ -68,18 +74,37 @@ func (d *Decoder) ReadMetadata() error {
 		return err
 	}
 
-	// Read in the metadata itself
+	// A negative length would turn into a huge allocation below, and a length
+	// larger than the sanity limit can only mean a corrupt stream.
+	if metaLen < 0 {
+		return ErrBadMetadata
+	}
+	if int64(metaLen) > maxMetadataLen {
+		return ErrBadMetadata
+	}
+
+	// Read in the metadata itself. A truncated stream must be reported as such
+	// (io.ErrUnexpectedEOF) instead of silently returning a short buffer.
 	jsonBuf := make([]byte, metaLen)
-	err = binary.Read(d.r, binary.LittleEndian, &jsonBuf)
+	_, err = io.ReadFull(d.r, jsonBuf)
 	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return err
 	}
 
 	// And unmarshal it
 	var metadata *Metadata
 	err = json.Unmarshal(jsonBuf, &metadata)
+	if err != nil {
+		return err
+	}
+	if metadata == nil {
+		return ErrBadMetadata
+	}
 	d.Metadata = metadata
-	return err
+	return nil
 }
 
 // OpusFrame returns the next audio frame
@@ -106,11 +131,23 @@ func (d *Decoder) OpusFrame() (frame []byte, err error) {
 
 // FrameDuration implements OpusReader, returnining the specified duration per frame
 func (d *Decoder) FrameDuration() time.Duration {
-	if d.Metadata == nil {
-		return 20
+	defaultDuration := time.Duration(20) * time.Millisecond
+
+	// The metadata is untrusted input, guard against a missing opus block and
+	// against a channel count/frame size that would divide by zero.
+	if d.Metadata == nil || d.Metadata.Opus == nil {
+		return defaultDuration
+	}
+	if d.Metadata.Opus.Channels <= 0 || d.Metadata.Opus.FrameSize <= 0 {
+		return defaultDuration
+	}
+
+	pcmPerChannel := d.Metadata.Opus.FrameSize / d.Metadata.Opus.Channels
+	if pcmPerChannel <= 0 {
+		return defaultDuration
 	}
 
 	// I don't understand nick, why does it have to be like this nick, please nick, im not having a good time nick.
 	// 960B = pcm framesize of 20ms 1 channel audio
-	return time.Duration(((d.Metadata.Opus.FrameSize/d.Metadata.Opus.Channels)/960)*20) * time.Millisecond
+	return time.Duration((pcmPerChannel/960)*20) * time.Millisecond
 }

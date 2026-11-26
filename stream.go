@@ -48,11 +48,12 @@ func NewStream(source OpusReader, vc *discordgo.VoiceConnection, done chan error
 }
 
 func (s *StreamingSession) stream() {
-	// Check if we are already running and if so stop
+	// Check if we are already running and if so stop. This used to panic,
+	// which took down the whole process when a streamer was restarted by a
+	// concurrent pause/play cycle.
 	s.Lock()
 	if s.running {
 		s.Unlock()
-		panic("Stream is already running!")
 		return
 	}
 	s.running = true

@@ -143,7 +143,7 @@ func main() {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed creating an encoding session: ", err)
+		fmt.Fprintf(os.Stderr, "Failed creating an encoding session: %v\n", err)
 		os.Exit(1)
 	}
 
