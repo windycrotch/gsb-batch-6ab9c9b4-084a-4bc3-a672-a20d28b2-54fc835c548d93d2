@@ -192,6 +192,48 @@ func main() {
 }
 ```
 
+## Scene Drawer
+
+The `gfx.SceneDrawer` gives block rendering a single stable entry point for
+"sort — project — land". It depth-sorts the blocks with `Block.Behind`,
+draws them far-to-near onto a fresh offscreen canvas, then composites the
+whole canvas onto the target with `draw.Src`. Starting from a blank canvas
+every frame makes repeated renders idempotent — no triangle data is left
+behind to accumulate.
+
+The viewport origin and destination image can be replaced between frames
+via `SetOrigin` and `SetTarget`; blocks already queued are reprojected from
+scratch on the next `Draw`, so stale coordinates never survive. Blocks that
+fall completely outside the target are skipped, and a `nil` target makes
+`Draw` return `gfx.ErrNilTarget` without invalidating the drawer.
+
+```go
+package main
+
+import "github.com/peterhellberg/gfx"
+
+func main() {
+	dst := gfx.NewImage(256, 256)
+
+	scene := gfx.NewSceneDrawer(gfx.Blocks{
+		gfx.NewBlock(gfx.V3(0, 0, 0), gfx.V3(20, 20, 20), gfx.BlockColorBlue),
+		gfx.NewBlock(gfx.V3(25, 0, 0), gfx.V3(20, 20, 20), gfx.BlockColorRed),
+	}, gfx.V3(100, -130, 3), dst)
+
+	// First render: far-to-near occlusion onto a blank offscreen canvas.
+	if err := scene.Draw(); err != nil {
+		panic(err)
+	}
+
+	// Move the viewport; queued blocks are reprojected on the next Draw.
+	scene.SetOrigin(gfx.V3(60, -90, 2))
+
+	if err := scene.Draw(); err != nil {
+		panic(err)
+	}
+}
+```
+
 ## Signed Distance Functions
 
 The `gfx.SignedDistance` type allows you to use basic [signed distance functions](http://jamie-wong.com/2016/07/15/ray-marching-signed-distance-functions/) (and operations) to produce some interesting graphics.
