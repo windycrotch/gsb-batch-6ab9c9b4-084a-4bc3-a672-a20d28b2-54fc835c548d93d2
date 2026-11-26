@@ -254,7 +254,21 @@ type Reader struct {
 // Initialize initializes the Reader.
 func (r *Reader) Initialize() {
 	r.bufr = bufio.NewReader(r.BR)
+	r.Reset()
+}
+
+// Reset resets the Reader to its initial state: the maximum chunk size goes
+// back to the default value, the window acknowledgement size and the number of
+// acknowledged bytes are cleared and any message that was being assembled from
+// multiple chunks is discarded.
+//
+// Bytes that have already been buffered are not discarded; they belong to the
+// next message stream of the underlying connection.
+func (r *Reader) Reset() {
 	r.chunkSize = 128
+	r.ackWindowSize = 0
+	r.LastAckCount = 0
+	r.msg = Message{}
 	r.chunkStreams = make(map[byte]*readerChunkStream)
 }
 

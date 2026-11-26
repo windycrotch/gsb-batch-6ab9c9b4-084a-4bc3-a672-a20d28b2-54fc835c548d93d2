@@ -12,7 +12,6 @@ import (
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
 	"github.com/bluenviron/gortmplib/pkg/handshake"
 	"github.com/bluenviron/gortmplib/pkg/message"
-	"github.com/bluenviron/gortmplib/pkg/rc4rw"
 )
 
 const (
@@ -133,34 +132,49 @@ type ServerConn struct {
 	URL     *url.URL
 	Publish bool
 
-	bc             *bytecounter.ReadWriter
-	mrw            *message.ReadWriter
 	actionCommand  *message.CommandAMF0
 	actionAccepted bool
+
+	state connState
 }
 
 // Initialize initializes ServerConn.
+//
+// The handshake is performed from scratch: any state left by a previous
+// attempt on the same connection is discarded. When the handshake fails or
+// times out, the connection is reset to the not handshaked state and can be
+// initialized again.
 func (c *ServerConn) Initialize() error {
-	c.bc = bytecounter.NewReadWriter(c.RW)
+	c.Reset()
 
-	keyIn, keyOut, err := handshake.DoServer(c.bc, false)
+	gen, bc, err := c.state.begin(c.RW)
 	if err != nil {
 		return err
 	}
 
-	var rw io.ReadWriter
-	if keyIn != nil {
-		rw, err = rc4rw.New(c.bc, keyIn, keyOut)
-		if err != nil {
-			return err
-		}
-	} else {
-		rw = c.bc
+	err = c.initializeHandshake(gen, bc)
+	if err != nil {
+		c.state.failHandshake(gen)
+		c.resetSessionFields()
+		return err
 	}
 
-	c.mrw = message.NewReadWriter(rw, c.bc, false)
+	return nil
+}
 
-	connectCmd, err := readCommand(c.mrw)
+// initializeHandshake performs the handshake and reads the connect command.
+func (c *ServerConn) initializeHandshake(gen uint64, bc *bytecounter.ReadWriter) error {
+	keyIn, keyOut, err := handshake.DoServer(bc, false)
+	if err != nil {
+		return err
+	}
+
+	err = c.state.finishHandshake(gen, keyIn, keyOut, false)
+	if err != nil {
+		return err
+	}
+
+	connectCmd, err := c.state.readCommand()
 	if err != nil {
 		return err
 	}
@@ -206,10 +220,46 @@ func (c *ServerConn) Initialize() error {
 	return nil
 }
 
+// Reset resets the connection lifecycle: the handshake is considered not
+// performed, the negotiated keys and the chunk read/write state are discarded,
+// and a partially assembled message is dropped. The progress of the connect and
+// of the action (play or publish) phases is discarded as well. The underlying
+// transport is left open, so that Initialize can be called again on the same
+// connection.
+func (c *ServerConn) Reset() {
+	c.resetSessionFields()
+
+	c.state.Reset()
+}
+
+// resetSessionFields discards the progress of the connect and action phases.
+func (c *ServerConn) resetSessionFields() {
+	c.connectChunkStreamID = 0
+	c.connectCommandID = 0
+	c.app = ""
+	c.tcURL = ""
+	c.FourCcList = nil
+	c.FlashVer = ""
+	c.URL = nil
+	c.Publish = false
+	c.actionCommand = nil
+	c.actionAccepted = false
+}
+
+// Handshaked reports whether the handshake has been completed successfully.
+func (c *ServerConn) Handshaked() bool {
+	return c.state.Handshaked()
+}
+
+// Close closes the underlying connection and resets its state.
+func (c *ServerConn) Close() error {
+	return c.state.close()
+}
+
 func (c *ServerConn) checkCredentials(expectedUser string, expectedPass string) error {
 	i := strings.Index(c.tcURL, "?authmod=adobe")
 	if i < 0 {
-		err := c.mrw.Write(&message.CommandAMF0{
+		err := c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: c.connectChunkStreamID,
 			Name:          "_error",
 			CommandID:     c.connectCommandID,
@@ -241,7 +291,7 @@ func (c *ServerConn) checkCredentials(expectedUser string, expectedPass string) 
 	response := vals["response"]
 
 	if clientChallenge == "" || response == "" {
-		err := c.mrw.Write(&message.CommandAMF0{
+		err := c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: c.connectChunkStreamID,
 			Name:          "_error",
 			CommandID:     c.connectCommandID,
@@ -267,7 +317,7 @@ func (c *ServerConn) checkCredentials(expectedUser string, expectedPass string) 
 
 	expectedResponse := authResponse(expectedUser, expectedPass, serverSalt, "", serverChallenge, clientChallenge)
 	if expectedResponse != response {
-		err := c.mrw.Write(&message.CommandAMF0{
+		err := c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: c.connectChunkStreamID,
 			Name:          "_error",
 			CommandID:     c.connectCommandID,
@@ -323,14 +373,14 @@ func (c *ServerConn) AcceptConnIfCredentialsMatch(expectedUser, expectedPass str
 
 // AcceptConn accepts the connection.
 func (c *ServerConn) AcceptConn() error {
-	err := c.mrw.Write(&message.SetWindowAckSize{
+	err := c.state.Write(&message.SetWindowAckSize{
 		Value: 2500000,
 	})
 	if err != nil {
 		return err
 	}
 
-	err = c.mrw.Write(&message.SetPeerBandwidth{
+	err = c.state.Write(&message.SetPeerBandwidth{
 		Value: 2500000,
 		Type:  2,
 	})
@@ -338,14 +388,14 @@ func (c *ServerConn) AcceptConn() error {
 		return err
 	}
 
-	err = c.mrw.Write(&message.SetChunkSize{
+	err = c.state.Write(&message.SetChunkSize{
 		Value: 65536,
 	})
 	if err != nil {
 		return err
 	}
 
-	err = c.mrw.Write(&message.CommandAMF0{
+	err = c.state.Write(&message.CommandAMF0{
 		ChunkStreamID: c.connectChunkStreamID,
 		Name:          "_result",
 		CommandID:     c.connectCommandID,
@@ -383,14 +433,14 @@ func (c *ServerConn) AcceptConn() error {
 
 	for {
 		var cmd *message.CommandAMF0
-		cmd, err = readCommand(c.mrw)
+		cmd, err = c.state.readCommand()
 		if err != nil {
 			return err
 		}
 
 		switch cmd.Name {
 		case "createStream":
-			err = c.mrw.Write(&message.CommandAMF0{
+			err = c.state.Write(&message.CommandAMF0{
 				ChunkStreamID: cmd.ChunkStreamID,
 				Name:          "_result",
 				CommandID:     cmd.CommandID,
@@ -451,21 +501,21 @@ func (c *ServerConn) AcceptAction() error {
 	c.actionAccepted = true
 
 	if !c.Publish {
-		err := c.mrw.Write(&message.UserControlStreamIsRecorded{
+		err := c.state.Write(&message.UserControlStreamIsRecorded{
 			StreamID: 1,
 		})
 		if err != nil {
 			return err
 		}
 
-		err = c.mrw.Write(&message.UserControlStreamBegin{
+		err = c.state.Write(&message.UserControlStreamBegin{
 			StreamID: 1,
 		})
 		if err != nil {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   5,
 			MessageStreamID: 0x1000000,
 			Name:            "onStatus",
@@ -483,7 +533,7 @@ func (c *ServerConn) AcceptAction() error {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   5,
 			MessageStreamID: 0x1000000,
 			Name:            "onStatus",
@@ -501,7 +551,7 @@ func (c *ServerConn) AcceptAction() error {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   5,
 			MessageStreamID: 0x1000000,
 			Name:            "onStatus",
@@ -519,7 +569,7 @@ func (c *ServerConn) AcceptAction() error {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   5,
 			MessageStreamID: 0x1000000,
 			Name:            "onStatus",
@@ -537,7 +587,7 @@ func (c *ServerConn) AcceptAction() error {
 			return err
 		}
 	} else {
-		err := c.mrw.Write(&message.CommandAMF0{
+		err := c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   5,
 			Name:            "onStatus",
 			CommandID:       c.actionCommand.CommandID,
@@ -569,7 +619,7 @@ func (c *ServerConn) RejectAction() error {
 		description = "authentication failed"
 	}
 
-	err := c.mrw.Write(&message.CommandAMF0{
+	err := c.state.Write(&message.CommandAMF0{
 		ChunkStreamID:   5,
 		MessageStreamID: 0x1000000,
 		Name:            "onStatus",
@@ -592,20 +642,20 @@ func (c *ServerConn) RejectAction() error {
 
 // BytesReceived returns the number of bytes received.
 func (c *ServerConn) BytesReceived() uint64 {
-	return c.bc.Reader.Count()
+	return c.state.bytesReceived()
 }
 
 // BytesSent returns the number of bytes sent.
 func (c *ServerConn) BytesSent() uint64 {
-	return c.bc.Writer.Count()
+	return c.state.bytesSent()
 }
 
 // Read reads a message.
 func (c *ServerConn) Read() (message.Message, error) {
-	return c.mrw.Read()
+	return c.state.Read()
 }
 
 // Write writes a message.
 func (c *ServerConn) Write(msg message.Message) error {
-	return c.mrw.Write(msg)
+	return c.state.Write(msg)
 }

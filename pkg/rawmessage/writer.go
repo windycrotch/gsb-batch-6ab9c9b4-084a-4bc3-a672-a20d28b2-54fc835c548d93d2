@@ -172,8 +172,31 @@ type Writer struct {
 
 // Initialize initializes the Writer.
 func (w *Writer) Initialize() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
 	w.bufw = bufio.NewWriter(w.BW)
+	w.resetLocked()
+}
+
+// Reset resets the Writer to its initial state: the maximum chunk size goes
+// back to the default value, the window acknowledgement size and the last
+// received acknowledge are cleared and the per-chunk-stream state (used to
+// compress chunk headers and timestamps) is discarded, so that the next
+// message is written as the first message of a new connection.
+//
+// It is safe to call it concurrently with Write.
+func (w *Writer) Reset() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	w.resetLocked()
+}
+
+func (w *Writer) resetLocked() {
 	w.chunkSize = 128
+	w.ackWindowSize = 0
+	w.AckValue = 0
 	w.chunkStreams = make(map[byte]*writerChunkStream)
 }
 

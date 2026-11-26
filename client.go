@@ -17,7 +17,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/gortmplib/pkg/amf0"
-	"github.com/bluenviron/gortmplib/pkg/bytecounter"
 	"github.com/bluenviron/gortmplib/pkg/handshake"
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
@@ -94,57 +93,6 @@ func splitURL(u *url.URL) (string, string, string) {
 	return tcURL, app, streamKey
 }
 
-func readCommand(mrw *message.ReadWriter) (*message.CommandAMF0, error) {
-	for {
-		msg, err := mrw.Read()
-		if err != nil {
-			return nil, err
-		}
-
-		if cmd, ok := msg.(*message.CommandAMF0); ok {
-			return cmd, nil
-		}
-	}
-}
-
-func readCommandResult(
-	mrw *message.ReadWriter,
-	commandID int,
-) (*message.CommandAMF0, error) {
-	for {
-		msg, err := mrw.Read()
-		if err != nil {
-			return nil, err
-		}
-
-		if cmd, ok := msg.(*message.CommandAMF0); ok {
-			if cmd.CommandID == commandID || (cmd.CommandID == 0) &&
-				(cmd.Name == "_result" || cmd.Name == "_error") {
-				return cmd, nil
-			}
-		}
-	}
-}
-
-func waitOnStatus(
-	mrw *message.ReadWriter,
-	commandID int,
-) (*message.CommandAMF0, error) {
-	for {
-		msg, err := mrw.Read()
-		if err != nil {
-			return nil, err
-		}
-
-		if cmd, ok := msg.(*message.CommandAMF0); ok {
-			if cmd.CommandID == commandID || (cmd.CommandID == 0 &&
-				cmd.Name == "onStatus") {
-				return cmd, nil
-			}
-		}
-	}
-}
-
 // Client is a client-side RTMP connection.
 type Client struct {
 	//
@@ -155,6 +103,9 @@ type Client struct {
 	URL *url.URL
 	// Whether to publish or play.
 	Publish bool
+	// Whether to encrypt the connection with RTMPE.
+	// It defaults to false.
+	Encrypted bool
 
 	//
 	// RTMP parameters (all optional)
@@ -175,11 +126,11 @@ type Client struct {
 	DialTLSContext func(ctx context.Context, network string, addr string) (net.Conn, error)
 
 	nconn         net.Conn
-	bc            *bytecounter.ReadWriter
-	mrw           *message.ReadWriter
 	authState     int
 	authSalt      string
 	authChallenge string
+
+	state connState
 }
 
 // Initialize initializes Client.
@@ -273,6 +224,7 @@ func (c *Client) initialize2(ctx context.Context) error {
 
 	err = c.initialize3()
 	if err != nil {
+		c.state.Reset()
 		c.nconn.Close()
 		return err
 	}
@@ -281,23 +233,30 @@ func (c *Client) initialize2(ctx context.Context) error {
 }
 
 func (c *Client) initialize3() error {
-	c.bc = bytecounter.NewReadWriter(c.nconn)
-
-	_, _, err := handshake.DoClient(c.bc, false, false)
+	gen, bc, err := c.state.begin(c.nconn)
 	if err != nil {
 		return err
 	}
 
-	c.mrw = message.NewReadWriter(c.bc, c.bc, false)
+	keyIn, keyOut, err := handshake.DoClient(bc, c.Encrypted, false)
+	if err != nil {
+		c.state.failHandshake(gen)
+		return err
+	}
 
-	err = c.mrw.Write(&message.SetWindowAckSize{
+	err = c.state.finishHandshake(gen, keyIn, keyOut, false)
+	if err != nil {
+		return err
+	}
+
+	err = c.state.Write(&message.SetWindowAckSize{
 		Value: 2500000,
 	})
 	if err != nil {
 		return err
 	}
 
-	err = c.mrw.Write(&message.SetPeerBandwidth{
+	err = c.state.Write(&message.SetPeerBandwidth{
 		Value: 2500000,
 		Type:  2,
 	})
@@ -305,7 +264,7 @@ func (c *Client) initialize3() error {
 		return err
 	}
 
-	err = c.mrw.Write(&message.SetChunkSize{
+	err = c.state.Write(&message.SetChunkSize{
 		Value: 65536,
 	})
 	if err != nil {
@@ -392,7 +351,7 @@ func (c *Client) initialize3() error {
 		)
 	}
 
-	err = c.mrw.Write(&message.CommandAMF0{
+	err = c.state.Write(&message.CommandAMF0{
 		ChunkStreamID: 3,
 		Name:          "connect",
 		CommandID:     1,
@@ -402,7 +361,7 @@ func (c *Client) initialize3() error {
 		return err
 	}
 
-	res, err := readCommandResult(c.mrw, 1)
+	res, err := c.state.readCommandResult(1)
 	if err != nil {
 		return err
 	}
@@ -463,7 +422,7 @@ func (c *Client) initialize3() error {
 	}
 
 	if !c.Publish {
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: 3,
 			Name:          "createStream",
 			CommandID:     2,
@@ -475,7 +434,7 @@ func (c *Client) initialize3() error {
 			return err
 		}
 
-		res, err = readCommandResult(c.mrw, 2)
+		res, err = c.state.readCommandResult(2)
 		if err != nil {
 			return err
 		}
@@ -484,14 +443,14 @@ func (c *Client) initialize3() error {
 			return fmt.Errorf("bad result: %v", res)
 		}
 
-		err = c.mrw.Write(&message.UserControlSetBufferLength{
+		err = c.state.Write(&message.UserControlSetBufferLength{
 			BufferLength: 0x64,
 		})
 		if err != nil {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   4,
 			MessageStreamID: 0x1000000,
 			Name:            "play",
@@ -505,7 +464,7 @@ func (c *Client) initialize3() error {
 			return err
 		}
 
-		res, err = waitOnStatus(c.mrw, 3)
+		res, err = c.state.waitOnStatus(3)
 		if err != nil {
 			return err
 		}
@@ -514,7 +473,7 @@ func (c *Client) initialize3() error {
 			return fmt.Errorf("bad result: %v", res)
 		}
 	} else {
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: 3,
 			Name:          "releaseStream",
 			CommandID:     2,
@@ -527,7 +486,7 @@ func (c *Client) initialize3() error {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: 3,
 			Name:          "FCPublish",
 			CommandID:     3,
@@ -540,7 +499,7 @@ func (c *Client) initialize3() error {
 			return err
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID: 3,
 			Name:          "createStream",
 			CommandID:     4,
@@ -552,7 +511,7 @@ func (c *Client) initialize3() error {
 			return err
 		}
 
-		res, err = readCommandResult(c.mrw, 4)
+		res, err = c.state.readCommandResult(4)
 		if err != nil {
 			return err
 		}
@@ -561,7 +520,7 @@ func (c *Client) initialize3() error {
 			return fmt.Errorf("bad result: %v", res)
 		}
 
-		err = c.mrw.Write(&message.CommandAMF0{
+		err = c.state.Write(&message.CommandAMF0{
 			ChunkStreamID:   4,
 			MessageStreamID: 0x1000000,
 			Name:            "publish",
@@ -576,7 +535,7 @@ func (c *Client) initialize3() error {
 			return err
 		}
 
-		res, err = waitOnStatus(c.mrw, 5)
+		res, err = c.state.waitOnStatus(5)
 		if err != nil {
 			return err
 		}
@@ -591,7 +550,20 @@ func (c *Client) initialize3() error {
 
 // Close closes the connection.
 func (c *Client) Close() {
-	c.nconn.Close()
+	c.state.close() //nolint:errcheck
+}
+
+// Reset resets the connection lifecycle: the handshake is considered not
+// performed, the negotiated keys and the chunk read/write state are discarded,
+// and a partially assembled message is dropped. The underlying connection is
+// left open, so that Initialize can be called again on the same connection.
+func (c *Client) Reset() {
+	c.state.Reset()
+}
+
+// Handshaked reports whether the handshake has been completed successfully.
+func (c *Client) Handshaked() bool {
+	return c.state.Handshaked()
 }
 
 // NetConn returns the underlying net.Conn.
@@ -601,20 +573,20 @@ func (c *Client) NetConn() net.Conn {
 
 // BytesReceived returns the number of bytes received.
 func (c *Client) BytesReceived() uint64 {
-	return c.bc.Reader.Count()
+	return c.state.bytesReceived()
 }
 
 // BytesSent returns the number of bytes sent.
 func (c *Client) BytesSent() uint64 {
-	return c.bc.Writer.Count()
+	return c.state.bytesSent()
 }
 
 // Read reads a message.
 func (c *Client) Read() (message.Message, error) {
-	return c.mrw.Read()
+	return c.state.Read()
 }
 
 // Write writes a message.
 func (c *Client) Write(msg message.Message) error {
-	return c.mrw.Write(msg)
+	return c.state.Write(msg)
 }

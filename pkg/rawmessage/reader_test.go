@@ -599,3 +599,151 @@ func FuzzReader(f *testing.F) {
 		}
 	})
 }
+
+func TestReaderReset(t *testing.T) {
+	// after a reset, the chunk size goes back to the default value and the
+	// number of acknowledged bytes is cleared.
+	var buf bytes.Buffer
+	bc := bytecounter.NewReader(&buf)
+	r := &rawmessage.Reader{
+		BR:          bc,
+		BCR:         bc,
+		OnAckNeeded: func(uint32) error { return nil },
+	}
+	r.Initialize()
+
+	require.NoError(t, r.SetChunkSize(65536))
+	r.SetWindowAckSize(1000)
+	r.LastAckCount = 500
+
+	r.Reset()
+
+	// a message larger than the default chunk size must be split into chunks.
+	w := &rawmessage.Writer{
+		BW:               &buf,
+		BCW:              bytecounter.NewWriter(&buf),
+		CheckAcknowledge: false,
+	}
+	w.Initialize()
+
+	body := bytes.Repeat([]byte{0x03}, 300)
+	require.NoError(t, w.Write(&rawmessage.Message{
+		ChunkStreamID: 6,
+		Type:          9,
+		Body:          body,
+	}))
+
+	// the writer above starts from the default chunk size as well.
+	msg, err := r.Read()
+	require.NoError(t, err)
+	require.Equal(t, body, msg.Body)
+}
+
+func TestReaderResetDropsPartialMessage(t *testing.T) {
+	// encode a 300-byte message with the default chunk size (128): it becomes
+	// three chunks (type 0 + type 3 + type 3).
+	encode := func(msgs ...*rawmessage.Message) []byte {
+		var buf bytes.Buffer
+		w := &rawmessage.Writer{
+			BW:               &buf,
+			BCW:              bytecounter.NewWriter(&buf),
+			CheckAcknowledge: false,
+		}
+		w.Initialize()
+		for _, msg := range msgs {
+			require.NoError(t, w.Write(msg))
+		}
+		return buf.Bytes()
+	}
+
+	enc := encode(&rawmessage.Message{
+		ChunkStreamID: 6,
+		Type:          9,
+		Body:          bytes.Repeat([]byte{0x05}, 300),
+	})
+
+	// keep only the first two chunks, i.e. drop the third one.
+	third := bytes.LastIndexByte(enc, 0xC0|6)
+	require.Greater(t, third, 0)
+	partial := enc[:third]
+
+	next := encode(&rawmessage.Message{
+		ChunkStreamID: 6,
+		Type:          9,
+		Body:          []byte{0x0A, 0x0B, 0x0C},
+	})
+
+	src := &switchReader{}
+	src.set(partial)
+
+	r := &rawmessage.Reader{
+		BR:          src,
+		BCR:         bytecounter.NewReader(src),
+		OnAckNeeded: func(uint32) error { return nil },
+	}
+	r.Initialize()
+
+	// the partial message cannot be completed: the reader reaches the end of
+	// the source while a message is being assembled.
+	_, err := r.Read()
+	require.Error(t, err)
+
+	// a reset must drop the assembly state, so that a fresh type 0 chunk on the
+	// same chunk stream is accepted instead of being refused as "expected type
+	// 3 chunk".
+	r.Reset()
+	src.set(next)
+
+	msg, err := r.Read()
+	require.NoError(t, err)
+	require.Equal(t, []byte{0x0A, 0x0B, 0x0C}, msg.Body)
+}
+
+// switchReader is a byte source whose content can be replaced.
+type switchReader struct {
+	data []byte
+}
+
+func (s *switchReader) set(data []byte) {
+	s.data = data
+}
+
+func (s *switchReader) Read(p []byte) (int, error) {
+	if len(s.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data)
+	s.data = s.data[n:]
+	return n, nil
+}
+
+func TestWriterReset(t *testing.T) {
+	var buf bytes.Buffer
+	bc := bytecounter.NewWriter(&buf)
+	w := &rawmessage.Writer{BW: bc, BCW: bc, CheckAcknowledge: true}
+	w.Initialize()
+
+	w.SetChunkSize(65536)
+	w.SetWindowAckSize(100)
+	w.SetAcknowledgeValue(1234)
+
+	w.Reset()
+
+	// after the reset, a message larger than 128 bytes must be split into
+	// chunks, and the acknowledge window must be disabled again.
+	body := bytes.Repeat([]byte{0x07}, 300)
+	require.NoError(t, w.Write(&rawmessage.Message{
+		ChunkStreamID: 6,
+		Type:          9,
+		Body:          body,
+	}))
+
+	bc.SetCount(4294967096)
+
+	// with the window cleared, no acknowledge is expected.
+	require.NoError(t, w.Write(&rawmessage.Message{
+		ChunkStreamID: 6,
+		Type:          9,
+		Body:          body,
+	}))
+}

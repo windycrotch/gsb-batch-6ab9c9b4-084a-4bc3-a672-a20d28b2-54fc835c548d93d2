@@ -42,6 +42,15 @@ func NewReadWriter(
 	}
 }
 
+// Reset resets the underlying chunk reader and writer to their initial state.
+// The maximum chunk size goes back to the default value, the window
+// acknowledgement size and the last received acknowledge are cleared and any
+// message that was being assembled from multiple chunks is discarded.
+func (rw *ReadWriter) Reset() {
+	rw.r.Reset()
+	rw.w.Reset()
+}
+
 // Read reads a message.
 func (rw *ReadWriter) Read() (Message, error) {
 	msg, err := rw.r.Read()

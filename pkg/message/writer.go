@@ -29,6 +29,16 @@ func (w *Writer) Initialize() {
 	w.rmw.Initialize()
 }
 
+// Reset resets the Writer to its initial state: the maximum chunk size goes
+// back to the default value, the window acknowledgement size and the last
+// received acknowledge are cleared and the per-chunk-stream state is discarded.
+func (w *Writer) Reset() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	w.rmw.Reset()
+}
+
 // NewWriter allocates a Writer.
 //
 // Deprecated: use Initialize() instead.
@@ -52,6 +62,9 @@ func (w *Writer) SetAcknowledgeValue(v uint32) {
 }
 
 // Write writes a message. It is safe to call it concurrently.
+//
+// The message body is always written entirely: an error means that the
+// connection is unusable and that the peers must not accept the message.
 func (w *Writer) Write(msg Message) error {
 	// this is necessary to synchronize rmw.Write with SetChunkSize and SetWindowAckSize.
 	w.mutex.Lock()

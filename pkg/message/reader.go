@@ -157,6 +157,14 @@ func (r *Reader) Initialize() {
 	r.rmr.Initialize()
 }
 
+// Reset resets the Reader to its initial state: the maximum chunk size goes
+// back to the default value, the window acknowledgement size and the number of
+// acknowledged bytes are cleared and any message that was being assembled from
+// multiple chunks is discarded.
+func (r *Reader) Reset() {
+	r.rmr.Reset()
+}
+
 // NewReader allocates a Reader.
 //
 // Deprecated: use Initialize() instead.

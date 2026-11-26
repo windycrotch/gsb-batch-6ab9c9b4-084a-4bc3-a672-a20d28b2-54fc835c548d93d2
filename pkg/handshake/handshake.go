@@ -151,6 +151,11 @@ func doClientPlain(rw io.ReadWriter, strict bool, randRead func([]byte) (int, er
 }
 
 // DoClient performs a client-side handshake.
+//
+// When an encrypted handshake is used, the two returned keys are oriented towards
+// the client: the first one decrypts bytes received from the server, the second
+// one encrypts bytes sent to the server. They are the same keys returned by
+// DoServer with reversed order.
 func DoClient(rw io.ReadWriter, encrypted bool, strict bool) ([]byte, []byte, error) {
 	return DoClientWithRand(rw, encrypted, strict, rand.Read)
 }
@@ -295,6 +300,11 @@ func doServerPlain(rw io.ReadWriter, strict bool, randRead func([]byte) (int, er
 }
 
 // DoServer performs a server-side handshake.
+//
+// When encrypted handshake is used, the two returned keys are oriented towards
+// the server: the first one decrypts bytes received from the client, the second
+// one encrypts bytes sent to the client. They are the same keys returned by
+// DoClient with reversed order.
 func DoServer(rw io.ReadWriter, strict bool) ([]byte, []byte, error) {
 	return DoServerWithRand(rw, strict, rand.Read)
 }
