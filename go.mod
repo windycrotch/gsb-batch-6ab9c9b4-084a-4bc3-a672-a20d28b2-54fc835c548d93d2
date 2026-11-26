@@ -3,6 +3,7 @@ module github.com/gaetanlhf/rtp2webrtc
 go 1.20
 
 require (
+	github.com/pion/interceptor v0.1.29
 	github.com/pion/webrtc/v3 v3.2.38
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -13,7 +14,6 @@ require (
 	github.com/pion/datachannel v1.5.6 // indirect
 	github.com/pion/dtls/v2 v2.2.10 // indirect
 	github.com/pion/ice/v2 v2.3.19 // indirect
-	github.com/pion/interceptor v0.1.29 // indirect
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/mdns v0.0.12 // indirect
 	github.com/pion/randutil v0.1.0 // indirect

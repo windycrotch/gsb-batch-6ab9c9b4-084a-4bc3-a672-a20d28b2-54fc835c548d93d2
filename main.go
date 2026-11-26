@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/pion/webrtc/v3"
 	"gopkg.in/yaml.v3"
@@ -70,5 +75,39 @@ func main() {
 
 	http.HandleFunc(config.ApiLocation, OnConnect)
 	log.Printf("Serving API on %s:%s", config.ServeIp, config.ServePort)
-	log.Panicln(http.ListenAndServe(config.ServeIp+":"+config.ServePort, nil))
+
+	httpServer := &http.Server{
+		Addr:    config.ServeIp + ":" + config.ServePort,
+		Handler: nil, // use http.DefaultServeMux, where OnConnect was registered
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+		}
+	}()
+
+	stopSignals := make(chan os.Signal, 1)
+	signal.Notify(stopSignals, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErrors:
+		log.Fatalf("HTTP server failed: %v", err)
+	case sig := <-stopSignals:
+		log.Printf("Received signal %s, shutting down", sig)
+	}
+
+	// Stop accepting new offers and bound the wait for in-flight responses.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful HTTP shutdown failed: %v", err)
+	}
+	shutdownCancel()
+
+	// Close every PeerConnection so all shared-track bindings/subscriptions
+	// are removed before the process exits.
+	closeAllViewers()
+
+	log.Println("Shutdown complete")
 }
