@@ -5,14 +5,15 @@ import (
 )
 
 func TestFFProbeRun(t *testing.T) {
+	requireFFmpeg(t, "ffprobe")
 	ffprobe := &FFProbe{}
 	probe, err := ffprobe.Run(testFile)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	if len(probe.Streams) != 2 {
-		t.Error()
+		t.Fatal()
 	}
 
 	if probe.Streams[0].Index != 0 {

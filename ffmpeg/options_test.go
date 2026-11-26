@@ -2,7 +2,9 @@ package ffmpeg
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -327,6 +329,16 @@ func TestNvencSkipsTwoPass(t *testing.T) {
 }
 
 func TestTwoPass(t *testing.T) {
+	// Where x265 stats can be given as a path depends on the platform, so the
+	// expectations use the stats suffix the encoder will actually receive.
+	x265Stats := func(pass string) string {
+		stats := filepath.ToSlash(filepath.Join("LOG", "x265.log"))
+		if runtime.GOOS == "windows" || strings.Contains(stats, ":") {
+			return "pass=" + pass
+		}
+		return "pass=" + pass + ":stats=" + stats
+	}
+
 	tests := []struct {
 		name          string
 		payload       string
@@ -341,14 +353,14 @@ func TestTwoPass(t *testing.T) {
 		{
 			"x265",
 			`{"video": {"codec": "libx265", "pass": "2", "bitrate": "2M"}}`,
-			"-c:v libx265 -b:v 2M -x265-params pass=1:stats=LOG/x265.log -an -f null " + os.DevNull,
-			"-c:v libx265 -b:v 2M -x265-params pass=2:stats=LOG/x265.log",
+			"-c:v libx265 -b:v 2M -x265-params " + x265Stats("1") + " -an -f null " + os.DevNull,
+			"-c:v libx265 -b:v 2M -x265-params " + x265Stats("2"),
 		},
 		{
 			"x265 with codec options",
 			`{"video": {"codec": "libx265", "pass": "2", "codec_options": "keyint=48"}}`,
-			"-c:v libx265 -x265-params keyint=48:pass=1:stats=LOG/x265.log -an -f null " + os.DevNull,
-			"-c:v libx265 -x265-params keyint=48:pass=2:stats=LOG/x265.log",
+			"-c:v libx265 -x265-params keyint=48:" + x265Stats("1") + " -an -f null " + os.DevNull,
+			"-c:v libx265 -x265-params keyint=48:" + x265Stats("2"),
 		},
 		{
 			"audio already disabled",

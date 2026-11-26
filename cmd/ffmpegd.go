@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,9 +41,15 @@ Options:
   --host address   Address to listen on. Use 0.0.0.0 to let other machines on
                    your network connect. Can also be set with $FFMPEGD_HOST.
 	`
-	progressInterval = time.Second * 1
-	writeTimeout     = time.Second * 10
-	maxQueuedJobs    = 100
+	progressIntervalDefault = time.Second * 1
+	writeTimeout            = time.Second * 10
+	maxQueuedJobs           = 100
+)
+
+var (
+	// progressInterval is how often a running encode reports progress. It is a
+	// variable so tests can shorten it.
+	progressInterval = progressIntervalDefault
 )
 
 var (
@@ -59,16 +66,19 @@ var (
 	allowedOrigins []string
 
 	clients  = &hub{conns: make(map[*websocket.Conn]bool)}
-	jobs     = make(chan Message, maxQueuedJobs)
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return isAllowedOrigin(r.Header.Get("Origin"))
 		},
 	}
 
-	// The running encode, so a cancel message can stop it.
-	currentMu sync.Mutex
-	current   *ffmpeg.FFmpeg
+	// probeInput reads the input's stream and duration. Tests replace it.
+	probeInput = func(input string) (*ffmpeg.FFProbeResponse, error) {
+		return ffmpeg.FFProbe{}.Run(input)
+	}
+
+	// session queues encodes and owns the status stream. startServer sets it.
+	sess *session
 )
 
 // Message payload from client.
@@ -81,6 +91,9 @@ type Message struct {
 
 // Status response to client.
 type Status struct {
+	// JobID is the session-assigned id of the task this status belongs to, so
+	// clients can tell one task's status apart from the next task's.
+	JobID     uint64  `json:"job_id,omitempty"`
 	Percent   float64 `json:"percent"`
 	Speed     string  `json:"speed"`
 	FPS       float64 `json:"fps"`
@@ -253,7 +266,7 @@ func startServer() {
 	}
 
 	// Handles queued encodes, one at a time.
-	go handleMessages()
+	sess = newSession(maxQueuedJobs, encodeJob, func(st Status) { clients.broadcast(st) })
 
 	fmt.Println("  Server started on \u001b[33mhttp://" + net.JoinHostPort(host, port) + "\u001b[0m.")
 	if !isLoopback(host) {
@@ -287,6 +300,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
+	serveClient(w, r, clients, sess)
+}
+
+// serveClient upgrades the request and routes its messages to the session.
+func serveClient(w http.ResponseWriter, r *http.Request, clients *hub, sess *session) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Printf("\rWaiting for connection...\u001b[31m websocket connection failed!\u001b[0m")
@@ -311,13 +329,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 		case "encode":
-			select {
-			case jobs <- msg:
-			default:
-				clients.send(ws, Status{Err: "too many encodes queued, try again later"})
+			if err := sess.submit(msg); err != nil {
+				clients.send(ws, Status{Err: err.Error()})
 			}
 		case "cancel":
-			cancelEncode()
+			sess.cancel()
 		default:
 			clients.send(ws, Status{Err: fmt.Sprintf("unknown message type %q", msg.Type)})
 		}
@@ -384,12 +400,6 @@ func cors(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func handleMessages() {
-	for msg := range jobs {
-		runEncode(msg)
-	}
-}
-
 func verifyFFmpeg() error {
 	f := &ffmpeg.FFmpeg{}
 	version, err := f.Version()
@@ -407,73 +417,91 @@ func verifyFFmpeg() error {
 	return nil
 }
 
-func cancelEncode() {
-	currentMu.Lock()
-	defer currentMu.Unlock()
-	if current != nil {
-		current.Cancel()
-	}
-}
+// clearLine erases what's left of a progress line after \r.
+const clearLine = "\u001b[K"
 
-func runEncode(msg Message) {
-	// Registered before anything slow, so a cancel that arrives while the
-	// input is still being probed is not lost.
-	f := &ffmpeg.FFmpeg{}
-	currentMu.Lock()
-	current = f
-	currentMu.Unlock()
-	defer func() {
-		currentMu.Lock()
-		current = nil
-		currentMu.Unlock()
-	}()
-
+// encodeJob runs one encode job. Progress is reported through report, which the
+// session associates with this job only. Cancelling ctx stops the encode as
+// soon as possible and yields ffmpeg.ErrCancelled.
+func encodeJob(ctx context.Context, msg Message, report func(Status)) error {
 	fmt.Printf("\rEncoding %s -> %s%s\n", msg.Input, msg.Output, clearLine)
 
 	e, err := ffmpeg.NewEncode(msg.Input, msg.Output, msg.Payload)
 	if err != nil {
-		sendError(err)
-		return
+		return err
 	}
 	defer e.Close()
 
-	probe, err := ffmpeg.FFProbe{}.Run(msg.Input)
+	// A cancel may arrive while the input is being probed. The probe itself
+	// cannot be interrupted, so run it in the background and stop waiting.
+	probe, err := probeInputInterruptible(ctx, msg.Input)
 	if err != nil {
-		sendError(err)
-		return
+		return err
 	}
+	// The probe finished, but a cancel that came in during it still wins: the
+	// encode must not start.
+	if ctx.Err() != nil {
+		return ffmpeg.ErrCancelled
+	}
+
+	f := &ffmpeg.FFmpeg{}
+	// Bridge the job's cancellation to the encoder. Cancelling before the
+	// process starts is handled by FFmpeg itself, so nothing is lost.
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	defer stopOnce.Do(func() { close(stop) })
+	go func() {
+		select {
+		case <-ctx.Done():
+			f.Cancel()
+		case <-stop:
+		}
+	}()
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		trackEncodeProgress(f, e.OutputDuration(probe.Duration()), totalFrames(probe), done)
+		trackEncodeProgress(f, e.OutputDuration(probe.Duration()), totalFrames(probe), done, report)
 	}()
 	err = f.RunEncode(e)
-	// Stop progress updates before the final status so none can follow it.
+	// Stop progress updates before returning, so the session can emit the one
+	// final status without a stale tick following it.
 	close(done)
 	wg.Wait()
+	stopOnce.Do(func() { close(stop) })
 
-	switch {
-	case errors.Is(err, ffmpeg.ErrCancelled):
+	if errors.Is(err, ffmpeg.ErrCancelled) {
 		fmt.Printf("\rEncode cancelled.%s\n", clearLine)
-		clients.broadcast(Status{Cancelled: true})
-	case err != nil:
-		sendError(err)
-	default:
+	} else if err != nil {
+		fmt.Printf("\r\u001b[31mEncode failed:\u001b[0m %s%s\n", err, clearLine)
+	} else {
 		fmt.Printf("\rEncode finished: %s%s\n", msg.Output, clearLine)
-		clients.broadcast(Status{Percent: 100})
 	}
 	fmt.Printf("Waiting for next job...")
+	return err
 }
 
-// clearLine erases what's left of a progress line after \r.
-const clearLine = "\u001b[K"
+// probeInputInterruptible waits for probeInput, giving up when ctx is
+// cancelled. The probe goroutine is left to finish on its own.
+func probeInputInterruptible(ctx context.Context, input string) (*ffmpeg.FFProbeResponse, error) {
+	type result struct {
+		probe *ffmpeg.FFProbeResponse
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		p, err := probeInput(input)
+		ch <- result{p, err}
+	}()
 
-func sendError(err error) {
-	fmt.Printf("\r\u001b[31mEncode failed:\u001b[0m %s%s\n", err, clearLine)
-	clients.broadcast(Status{Err: err.Error()})
+	select {
+	case <-ctx.Done():
+		return nil, ffmpeg.ErrCancelled
+	case r := <-ch:
+		return r.probe, r.err
+	}
 }
 
 // totalFrames returns the frame count of the first video stream, or 0.
@@ -490,7 +518,7 @@ func totalFrames(p *ffmpeg.FFProbeResponse) int {
 // trackEncodeProgress reports progress to clients until done is closed.
 // Progress is measured against the output duration when it is known, and the
 // frame count otherwise. Each pass of a two-pass encode is half the total.
-func trackEncodeProgress(f *ffmpeg.FFmpeg, duration float64, frames int, done <-chan struct{}) {
+func trackEncodeProgress(f *ffmpeg.FFmpeg, duration float64, frames int, done <-chan struct{}, report func(Status)) {
 	ticker := time.NewTicker(progressInterval)
 	defer ticker.Stop()
 
@@ -530,7 +558,7 @@ func trackEncodeProgress(f *ffmpeg.FFmpeg, duration float64, frames int, done <-
 				fmt.Printf("\rEncoding...%s %0.1fs done %s @ %0.2f fps%s", pass, float64(p.OutTimeUS)/1e6, p.Speed, p.FPS, clearLine)
 			}
 
-			clients.broadcast(Status{Percent: pct, Speed: p.Speed, FPS: p.FPS})
+			report(Status{Percent: pct, Speed: p.Speed, FPS: p.FPS})
 		}
 	}
 }

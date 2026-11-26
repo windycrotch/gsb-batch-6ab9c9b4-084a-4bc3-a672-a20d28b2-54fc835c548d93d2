@@ -12,7 +12,12 @@ import (
 	"sync"
 )
 
-const ffmpegCmd = "ffmpeg"
+// Exec builds the command that runs ffmpeg. Tests and embedders may replace it
+// to use a different executable, or a stub encoder whose progress and exit can
+// be controlled.
+var Exec = func(args ...string) *exec.Cmd {
+	return exec.Command("ffmpeg", args...)
+}
 
 // ErrCancelled is returned by Run when the encode was stopped with Cancel.
 var ErrCancelled = errors.New("cancelled")
@@ -65,7 +70,7 @@ func (f *FFmpeg) RunEncode(e *Encode) error {
 }
 
 func (f *FFmpeg) run(args []string) error {
-	cmd := exec.Command(ffmpegCmd, args...)
+	cmd := Exec(args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -94,16 +99,24 @@ func (f *FFmpeg) run(args []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cmd = nil
-	if f.cancelled {
+	return exitError(err, f.cancelled, stderr.String())
+}
+
+// exitError decides what a finished process means. A process that exited
+// successfully completed the encode, even if a cancel arrived just as it was
+// exiting, so a late cancel can never turn a finished job into a cancelled one.
+// Only a process that failed after a cancel is a cancellation.
+func exitError(waitErr error, cancelled bool, stderr string) error {
+	if waitErr == nil {
+		return nil
+	}
+	if cancelled {
 		return ErrCancelled
 	}
-	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return errors.New(msg)
-		}
-		return err
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		return errors.New(msg)
 	}
-	return nil
+	return waitErr
 }
 
 // Cancel stops the encode. Safe to call at any time, from any goroutine.
@@ -125,7 +138,7 @@ func (f *FFmpeg) Progress() Progress {
 
 // Version gets the ffmpeg version.
 func (f *FFmpeg) Version() (string, error) {
-	out, err := exec.Command(ffmpegCmd, "-version").Output()
+	out, err := Exec("-version").Output()
 	if err != nil {
 		return "", errors.New("ffmpeg not available on $PATH")
 	}

@@ -73,21 +73,23 @@ Paths are relative to the directory `ffmpegd` was started in. Encodes run one at
 The server sends progress about once a second while encoding:
 
 ```JSON
-{"percent":34.68,"speed":"3.37x","fps":80.77}
+{"job_id":1,"percent":34.68,"speed":"3.37x","fps":80.77}
 ```
 
 Progress is measured against the length of the output, so it works for audio-only encodes and clips. For two-pass encodes, each pass is half of the total. `percent` stays below 100 until the encode is finished.
 
+`job_id` identifies the encode a status belongs to. It increases with each submitted job, so a client can tell one job's statuses apart from the next job's, even when a late update from the previous job would otherwise be ambiguous. Statuses that belong to no job (such as a rejected queue) omit it.
+
 When the encode finishes:
 
 ```JSON
-{"percent":100,"speed":"","fps":0}
+{"job_id":1,"percent":100,"speed":"","fps":0}
 ```
 
 If the encode fails, or a message can't be read, `err` holds the reason, usually ffmpeg's error output:
 
 ```JSON
-{"percent":0,"speed":"","fps":0,"err":"Unknown encoder 'libaom-av1'"}
+{"job_id":1,"percent":0,"speed":"","fps":0,"err":"Unknown encoder 'libaom-av1'"}
 ```
 
 ## Cancelling
@@ -97,8 +99,12 @@ Stop the running encode with:
 websocket.send(JSON.stringify({ type: 'cancel' }));
 ```
 
-The server kills ffmpeg and replies:
+Cancelling affects only the encode that is running when the message arrives. Queued encodes are untouched and still run in order after it, and if nothing is running the message is a no-op.
+
+The server kills ffmpeg and replies once:
 
 ```JSON
-{"percent":0,"speed":"","fps":0,"cancelled":true}
+{"job_id":1,"percent":0,"speed":"","fps":0,"cancelled":true}
 ```
+
+A cancelled job sends no further progress and no completion status, so a job is never reported as both cancelled and finished. Its final status is either this cancellation, a `percent:100` completion, or one `err`, never more than one of them. Every connected client sees the same statuses in the same order.
