@@ -5,12 +5,9 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
-
-	"strings"
-
-	"runtime"
 
 	"github.com/DheerendraRathor/GoTracer/models"
 	"github.com/DheerendraRathor/GoTracer/net/constants"
@@ -20,186 +17,276 @@ import (
 )
 
 const (
+	// Agent side heartbeat: if no pong is received within pongTimeout the
+	// master is considered gone and the connection (and its render round)
+	// is torn down.
 	pongTimeout = 60 * time.Second
-	pongWait    = 20 * time.Second
-	pingMessage = "a"
+	pingPeriod  = 20 * time.Second
 )
 
+// renderRound is a single rendering round served by this agent. A round
+// owns its own result channel so pixels produced by a previous round can
+// never leak into the stream of a newer one.
+type renderRound struct {
+	operationId string
+	results     chan *models.Pixel
+	cancel      chan struct{}
+	cancelOnce  sync.Once
+	done        chan struct{} // closed when the round's forwarder exits
+}
+
+func (r *renderRound) cancelRound() {
+	r.cancelOnce.Do(func() {
+		close(r.cancel)
+	})
+}
+
 type RenderingClient struct {
-	Conn                *websocket.Conn
-	Results             chan *models.Pixel
-	IsTracingInProgress bool
-	CloseChan           chan bool
-	OperationId         string
-	PongChannel         chan bool
-	WaitGroup           sync.WaitGroup
+	Conn    *websocket.Conn
+	writeMu sync.Mutex
+
+	mu     sync.Mutex
+	round  *renderRound // nil when idle
+	closed chan struct{}
+}
+
+func (c *RenderingClient) writeJSON(v interface{}) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.Conn.WriteJSON(v)
+}
+
+// currentRound returns the active round, or nil if the agent is idle.
+func (c *RenderingClient) currentRound() *renderRound {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.round
+}
+
+// clearRound marks the agent idle, but only if the given round is still
+// the active one (a newer round may already have replaced it).
+func (c *RenderingClient) clearRound(round *renderRound) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.round == round {
+		c.round = nil
+	}
+}
+
+// stopActiveRound cancels the active round (if any) and waits until its
+// forwarder goroutine has exited, so no goroutine or pixel of the old
+// round survives the connection.
+func (c *RenderingClient) stopActiveRound() {
+	round := c.currentRound()
+	if round == nil {
+		return
+	}
+	round.cancelRound()
+	<-round.done
 }
 
 func (c *RenderingClient) Initialize() {
-	c.WaitGroup = sync.WaitGroup{}
-
 	c.Conn.SetPongHandler(
-		func(message string) error {
-			c.PongChannel <- true
-			return nil
+		func(string) error {
+			return c.Conn.SetReadDeadline(time.Now().Add(pongTimeout))
 		},
 	)
+	c.Conn.SetReadDeadline(time.Now().Add(pongTimeout))
 
-	go pingThread(c.Conn, c.PongChannel)
+	go c.pingLoop()
 
-	c.WaitGroup.Add(2)
+	c.readLoop()
 
-	go c.ReadHandler()
-	go c.ResultSender()
+	// The connection is gone: the current round must terminate instead of
+	// leaking its tracer goroutines or blocking the next connection.
+	c.stopActiveRound()
+}
 
-	c.WaitGroup.Wait()
+func (c *RenderingClient) pingLoop() {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-ticker.C:
+			c.writeMu.Lock()
+			err := c.Conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(10*time.Second))
+			c.writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (c *RenderingClient) readLoop() {
+	var message messages.WebSocketMessage
+	var renderReqMsg messages.RenderRequestMessage
+	for {
+		_, msgStr, err := c.Conn.ReadMessage()
+		if err != nil {
+			log.Printf("Connection closed: %s", err)
+			return
+		}
+
+		if err := json.Unmarshal(msgStr, &message); err != nil {
+			log.Printf("Unable to understand message: %s", err)
+			continue
+		}
+
+		if message.Type == messages.RenderRequest {
+			if err := json.Unmarshal(msgStr, &renderReqMsg); err != nil {
+				log.Printf("Unable to parse render request: %s", err)
+				continue
+			}
+			c.handleRenderRequest(&renderReqMsg)
+		}
+	}
+}
+
+func (c *RenderingClient) handleRenderRequest(renderReqMsg *messages.RenderRequestMessage) {
+	operationId := renderReqMsg.OperationId
+	if operationId == "" {
+		byteOpId, _ := uuid.NewRandom()
+		operationId = byteOpId.String()
+	}
+
+	responseMessage := messages.RenderRequestResponseMessage{
+		Type:        messages.RenderRequestResponse,
+		OperationId: operationId,
+	}
+
+	c.mu.Lock()
+	if c.round != nil {
+		c.mu.Unlock()
+		// Exactly one round at a time: reject the new request and keep
+		// serving the current round.
+		responseMessage.Code = messages.RenderRequestTracingAlreadyInProgress
+		if err := c.writeJSON(responseMessage); err != nil {
+			log.Printf("Unable to send busy response: %s", err)
+		}
+		return
+	}
+
+	round := &renderRound{
+		operationId: operationId,
+		results:     make(chan *models.Pixel, 1024),
+		cancel:      make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+	c.round = round
+	c.mu.Unlock()
+
+	responseMessage.Code = messages.RenderRequestAccepted
+	if err := c.writeJSON(responseMessage); err != nil {
+		log.Printf("Unable to send accept response: %s", err)
+		round.cancelRound()
+		c.clearRound(round)
+		close(round.done)
+		return
+	}
+
+	spec := renderReqMsg.Data
+	go tracer.GoTrace(&spec, true, round.results, true, round.cancel)
+	go c.forwardRound(round)
+}
+
+// forwardRound streams the pixels of exactly one round to the master,
+// each tagged with the round's operation id. It exits when the round
+// completes or is cancelled; pixels of any other round never enter this
+// stream.
+func (c *RenderingClient) forwardRound(round *renderRound) {
+	defer close(round.done)
+	defer c.clearRound(round)
+
+	for {
+		select {
+		case pixel := <-round.results:
+			if pixel == nil {
+				completion := messages.WebSocketMessage{
+					Type:        messages.RenderingCompleted,
+					OperationId: round.operationId,
+				}
+				if err := c.writeJSON(completion); err != nil {
+					log.Printf("Unable to send completion: %s", err)
+				}
+				return
+			}
+
+			if pixelDelay > 0 {
+				time.Sleep(pixelDelay)
+			}
+
+			pixelMessage := messages.PixelResultMessage{
+				Type:        messages.PixelResult,
+				Data:        *pixel,
+				OperationId: round.operationId,
+			}
+			if err := c.writeJSON(pixelMessage); err != nil {
+				log.Printf("Unable to send pixel: %s", err)
+				round.cancelRound()
+				return
+			}
+		case <-round.cancel:
+			return
+		}
+	}
 }
 
 var addr = flag.String("addr", "", "http service address")
+var pixelDelayFlag = flag.Int("pixeldelay", 0, "artificial delay in milliseconds before sending each pixel (testing hook)")
+
+var pixelDelay time.Duration
 
 var upgrader = websocket.Upgrader{}
 var mutex = &sync.Mutex{}
 
 var activeConn *websocket.Conn = nil
 
-func sendPing(conn *websocket.Conn) error {
-	err := conn.WriteControl(websocket.PingMessage, []byte(pingMessage), time.Now().Add(time.Hour))
-	return err
-}
-
-func pingThread(conn *websocket.Conn, pongChan <-chan bool) {
-	ticker := time.NewTicker(pongWait)
-	timer := time.NewTimer(pongTimeout)
-
-	for {
-		select {
-		case <-timer.C:
-			conn.WriteControl(websocket.CloseNoStatusReceived, []byte("No pong received"), time.Now().Add(time.Hour))
-			conn.Close()
-			return
-		case <-ticker.C:
-			err := sendPing(conn)
-			if err != nil {
-				ticker.Stop()
-				return
-			}
-		case <-pongChan:
-			if !timer.Stop() {
-				<-timer.C
-			}
-			timer.Reset(pongTimeout)
-		}
-	}
-}
-
-func (c *RenderingClient) ReadHandler() {
-	closeChan := make(chan bool)
-
-	defer func() {
-		c.WaitGroup.Done()
-		closeChan <- true
-	}()
-
-	var message messages.WebSocketMessage
-	var renderReqMsg messages.RenderRequestMessage
-	for {
-		_, msgStr, err := c.Conn.ReadMessage()
-		if err != nil {
-			log.Printf("Unable to understand message: %s", err)
-			break
-		}
-
-		json.Unmarshal(msgStr, &message)
-
-		if message.Type == messages.RenderRequest {
-			json.Unmarshal(msgStr, &renderReqMsg)
-			operationId := renderReqMsg.OperationId
-			if strings.TrimSpace(operationId) == "" {
-				byteOpId, _ := uuid.NewRandom()
-				operationId = byteOpId.String()
-			}
-			c.OperationId = operationId
-
-			responseMessage := messages.RenderRequestResponseMessage{
-				Type:        messages.RenderRequestResponse,
-				OperationId: c.OperationId,
-			}
-
-			if !c.IsTracingInProgress {
-				go tracer.GoTrace(&renderReqMsg.Data, true, c.Results, true, closeChan)
-				c.IsTracingInProgress = true
-				responseMessage.Code = messages.RenderRequestAccepted
-			} else {
-				responseMessage.Code = messages.RenderRequestTracingAlreadyInProgress
-			}
-
-			c.Conn.WriteJSON(message)
-		}
-	}
-}
-
-func (c *RenderingClient) ResultSender() {
-	defer c.WaitGroup.Done()
-
-	message := messages.WebSocketMessage{
-		Type: messages.PixelResult,
-	}
-
-	for pixel := range c.Results {
-		message.OperationId = c.OperationId
-		if pixel == nil {
-			message.Type = messages.RenderingCompleted
-			c.Conn.WriteJSON(message)
-			break
-		}
-
-		message.Data = pixel
-		c.Conn.WriteJSON(message)
-	}
-}
-
 func agentHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Received a connection request")
-	shouldConnect := true
 
 	mutex.Lock()
 	if activeConn != nil {
+		mutex.Unlock()
 		log.Print("An active connection already exists")
 		http.Error(w, "An active connection already exists", http.StatusConflict)
-		shouldConnect = false
+		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		mutex.Unlock()
 		log.Print("upgrade:", err)
-		shouldConnect = false
+		return
 	}
 	activeConn = conn
 	mutex.Unlock()
 
 	defer func() {
+		mutex.Lock()
 		activeConn = nil
+		mutex.Unlock()
 		conn.Close()
 	}()
 
-	if !shouldConnect {
-		return
-	}
-
 	client := RenderingClient{
-		Conn:                conn,
-		PongChannel:         make(chan bool),
-		Results:             make(chan *models.Pixel, 100),
-		IsTracingInProgress: false,
-		OperationId:         "",
+		Conn:   conn,
+		closed: make(chan struct{}),
 	}
+	defer close(client.closed)
 
 	client.Initialize()
 }
 
 func agentStatusHandler(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	available := activeConn == nil
+	mutex.Unlock()
+
 	status := messages.AgentStatus{
-		Available: activeConn == nil,
+		Available: available,
 		Cores:     runtime.NumCPU(),
 	}
 
@@ -220,6 +307,8 @@ func main() {
 		flag.Usage()
 		log.Fatalf("Agent address \"%s\" is invalid.", *addr)
 	}
+
+	pixelDelay = time.Duration(*pixelDelayFlag) * time.Millisecond
 
 	log.SetFlags(0)
 	http.HandleFunc("/", agentHandler)

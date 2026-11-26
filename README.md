@@ -47,6 +47,37 @@ master --spec=/path/to/spec.json --agents=/path/to/agents.json
 
 4. Sit back and relax while image is being rendered :)
 
+#### Reliability semantics
+
+A distributed render is an all-or-nothing task:
+
+- The image is split into column patches. Every patch assignment is a
+  **round** identified by an operation id that is attached to the render
+  request, every returned pixel and the completion message. The master
+  discards pixels that do not belong to an agent's current round, and
+  writes each pixel of the final image exactly once.
+- The final PNG is written **only after every patch has been confirmed
+  delivered** (all of its pixels received).
+- If an agent disconnects, fails to answer heartbeats
+  (`-pingperiod`/`-pongtimeout` flags, defaults 10s/30s) or stops
+  responding mid-render, the master stops waiting for it and re-assigns
+  its patch to a remaining agent.
+- If no usable agent remains, the task **fails observably**: the master
+  logs `RENDER FAILED` and exits with a non-zero status without writing
+  an image.
+- An agent serves exactly one round at a time. A new request while
+  rendering is rejected as busy; when a round is cancelled (e.g. the
+  master disconnects), its background tracer goroutines are stopped and
+  its pixels can never leak into a later round's stream.
+
+Run the end-to-end acceptance scenarios (normal completion, agent
+disconnect mid-render, all agents unavailable, heartbeat timeout and
+consecutive rounds on one agent) with:
+
+```bash
+go test ./net/integration/
+```
+
 ### As library
 
 ```go

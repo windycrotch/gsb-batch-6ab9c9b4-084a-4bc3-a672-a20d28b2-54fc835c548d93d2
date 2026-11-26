@@ -19,7 +19,7 @@ type TracerOutput struct {
 func GoTrace(
 	env *models.Specification,
 	sharePixelProgress bool, progress chan<- *models.Pixel,
-	isClosable bool, closeChan <-chan bool,
+	isClosable bool, closeChan <-chan struct{},
 ) *TracerOutput {
 	if env.Settings.RenderDepth > 0 {
 		MaxRenderDepth = env.Settings.RenderDepth
@@ -41,7 +41,7 @@ func GoTrace(
 
 	processingGroupData := make([][][2]int, renderRoutines)
 	for i := range processingGroupData {
-		processingGroupData[i] = make([][2]int, 2)
+		processingGroupData[i] = make([][2]int, 0)
 	}
 
 	imin, imax, jmin, jmax := env.Image.GetPatch()
@@ -65,17 +65,6 @@ func GoTrace(
 			processingGroupData[processingGroup] = append(processingGroupData[processingGroup], [2]int{i, j})
 			division += 1
 
-			/*
-				// Check if go tracer is asked for close
-				if isClosable {
-					select {
-					case <-closeChan:
-						break IMAGE_PROCESSING
-					default:
-					}
-				}
-			*/
-
 		}
 	}
 
@@ -91,10 +80,32 @@ func GoTrace(
 			rng := rand.New(rand.NewSource(time.Now().Unix() + rand.Int63()))
 
 			for _, point := range data {
+				// Check if go tracer is asked to close. A closed (or
+				// valued) closeChan means the caller is no longer
+				// interested in the result of this round.
+				if isClosable {
+					select {
+					case <-closeChan:
+						return
+					default:
+					}
+				}
+
 				i, j := point[0], point[1]
 				pixel := processPixel(i, j, width, height, samples, scene, rng)
 				if sharePixelProgress {
-					progress <- pixel
+					// The send must remain cancellation aware: if the
+					// consumer went away nobody drains progress and a
+					// plain send would block this goroutine forever.
+					if isClosable {
+						select {
+						case progress <- pixel:
+						case <-closeChan:
+							return
+						}
+					} else {
+						progress <- pixel
+					}
 				} else {
 					output.Pixels[i][j] = pixel
 				}
@@ -105,7 +116,16 @@ func GoTrace(
 	renderWg.Wait()
 
 	if sharePixelProgress {
-		progress <- nil
+		// Signal completion, but never block forever if the consumer
+		// cancelled us while we were rendering.
+		if isClosable {
+			select {
+			case progress <- nil:
+			case <-closeChan:
+			}
+		} else {
+			progress <- nil
+		}
 	}
 
 	return output
