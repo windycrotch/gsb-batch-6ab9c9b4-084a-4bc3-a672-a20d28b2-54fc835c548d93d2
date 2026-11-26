@@ -702,3 +702,48 @@ test("a cast that ends while the window is closed still restores mute later", ()
   p.fire("iina.file-loaded");
   assert.equal(p.flags.mute, false, "the deferred mute restore lands on file-loaded");
 });
+
+// ---- cast tokens and handover (issue: a superseded cast's events/log) ----
+
+test("serve carries a fresh -token, and stop echoes that same token", () => {
+  const p = loadPlugin();
+  p.clickMenu();
+  const serve = serves(p)[0];
+  const token = argAfter(serve.args, "-token");
+  assert.ok(token && token.startsWith("cast-"), "serve must carry -token");
+  p.send("stop", {});
+  assert.equal(stops(p).length, 1);
+  assert.equal(argAfter(stops(p)[0].args, "-token"), token,
+    "stop must target the cast it is stopping, not whatever runs later");
+});
+
+test("a stop with no cast running runs nothing", () => {
+  const p = loadPlugin();
+  p.send("stop", {}); // idle: nothing of this window's to stop
+  // A token-less `stop` means "kill whatever holds the output dir", which in a
+  // second IINA window idle on the same @tmp/hls would tear down this one's
+  // cast. An idle window must send nothing at all.
+  assert.equal(stops(p).length, 0);
+});
+
+test("a superseded helper's late event cannot overwrite the new cast's state", () => {
+  const p = loadPlugin();
+  p.clickMenu();
+  const oldToken = argAfter(serves(p)[0].args, "-token");
+  p.send("stop", {});
+  p.send("start", {}); // cast N+1
+  const newToken = argAfter(serves(p).at(-1).args, "-token");
+  assert.notEqual(oldToken, newToken);
+  // The old helper's "packaged"/"ready" arrive on the new cast's callback (a
+  // rearranged pipe), still tagged with the old token: drop them.
+  p.helperSays({ event: "ready", url: "http://192.168.1.2:5000/index.m3u8", token: oldToken });
+  p.helperSays({ event: "packaged", token: oldToken });
+  p.send("getState", {});
+  assert.equal(p.state().phase, "starting", "a stale ready/packaged must not mark the new cast ready");
+  // The new cast's own events still land.
+  const url = "http://192.168.1.2:5001/index.m3u8";
+  p.helperSays({ event: "ready", url, token: newToken });
+  p.send("getState", {});
+  assert.equal(p.state().phase, "ready");
+  assert.equal(p.state().url, url);
+});

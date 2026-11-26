@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -321,10 +322,19 @@ func castingStub(t *testing.T, out, tail string) string {
 
 func startServe(t *testing.T, bin, out, stub string, parent int) (*exec.Cmd, io.Reader) {
 	t.Helper()
-	cmd := exec.Command(bin, "serve",
+	return startServeWith(t, bin, out, stub, parent, "")
+}
+
+func startServeWith(t *testing.T, bin, out, stub string, parent int, token string) (*exec.Cmd, io.Reader) {
+	t.Helper()
+	args := []string{"serve",
 		"-source", "/dev/null", "-out", out, "-ffmpeg", stub,
 		"-parent", fmt.Sprint(parent), "-duration", "60",
-		"-vcodec", "h264", "-acodec", "aac", "-achannels", "2", "-vmap", "0", "-amap", "1")
+		"-vcodec", "h264", "-acodec", "aac", "-achannels", "2", "-vmap", "0", "-amap", "1"}
+	if token != "" {
+		args = append(args, "-token", token)
+	}
+	cmd := exec.Command(bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -433,4 +443,218 @@ func TestFailedCastSweepsOutDir(t *testing.T) {
 		t.Fatalf("expected an error event, got:\n%s", b)
 	}
 	assertSwept(t, out)
+}
+
+// ---- handover: a new cast takes over from a live one ----
+
+// eventsOf splits captured helper stdout into decoded events.
+func eventsOf(t *testing.T, b []byte) []map[string]any {
+	t.Helper()
+	var evs []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var ev map[string]any
+		if json.Unmarshal([]byte(line), &ev) == nil && ev["event"] != nil {
+			evs = append(evs, ev)
+		}
+	}
+	return evs
+}
+
+// The handover the user sees: cast A is live and serving, cast B starts on the
+// same output directory. B must not announce ready until A is gone, and A's
+// files must be swept and replaced by B's own — so B's URL does not briefly
+// serve A's playlist and then 404 when A sweeps it.
+func TestTakeoverReplacesLiveCastCleanly(t *testing.T) {
+	bin := buildHelper(t)
+	out := t.TempDir()
+	stubA := castingStub(t, out, "trap 'exit 0' TERM\nsleep 60")
+	first, stdoutA := startServeWith(t, bin, out, stubA, os.Getpid(), "cast-a")
+	waitReady(t, stdoutA, 15*time.Second)
+
+	// B's stub tags its playlist so the two casts are distinguishable.
+	stubB := filepath.Join(t.TempDir(), "ffmpeg")
+	os.WriteFile(stubB, []byte(fmt.Sprintf(
+		"#!/bin/sh\necho '#EXTM3U' > %s/index.m3u8\necho '#EXTM3U-B' > /dev/null\necho init > %s/init.mp4\necho seg > %s/seg_0000.m4s\ntrap 'exit 0' TERM\nsleep 60\n",
+		out, out, out)), 0o755)
+	second, stdoutB := startServeWith(t, bin, out, stubB, os.Getpid(), "cast-b")
+	urlB := waitReady(t, stdoutB, 20*time.Second)
+
+	if !strings.HasSuffix(urlB, "/index.m3u8") {
+		t.Fatalf("bad ready url %q", urlB)
+	}
+	// B announced ready only after A exited; A must be gone by now.
+	waitExit(t, first, 5*time.Second)
+	resp, err := http.Get(urlB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("the new cast's playlist 404s right after ready: %d", resp.StatusCode)
+	}
+	// A's event stream ends at "stopped" and carries no events after it.
+	rest, _ := io.ReadAll(stdoutA)
+	for _, ev := range eventsOf(t, rest) {
+		if ev["event"] != "stopped" {
+			t.Errorf("superseded cast emitted %v after handing over", ev)
+		}
+	}
+
+	// B is the live cast; its stop sweeps and leaves nothing behind.
+	if err := exec.Command(bin, "stop", "-out", out, "-token", "cast-b").Run(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	waitExit(t, second, 5*time.Second)
+	assertSwept(t, out)
+}
+
+// A superseded instance must go quiet the moment it is told to stop: no
+// progress or "packaged" events belonging to its cast may land in the next
+// cast's log (the mixed-log symptom).
+func TestSupersededCastEmitsNothingAfterStopSignal(t *testing.T) {
+	bin := buildHelper(t)
+	out := t.TempDir()
+	// A stub that keeps emitting progress right up to the SIGTERM, so there is
+	// something to leak if sealing fails.
+	stub := castingStub(t, out, "trap 'exit 0' TERM\nwhile true; do echo out_time_us=1000000; sleep 0.05; done")
+	cmd, stdout := startServeWith(t, bin, out, stub, os.Getpid(), "cast-a")
+	waitReady(t, stdout, 15*time.Second)
+
+	cmd.Process.Signal(syscall.SIGTERM)
+	// Read to EOF before Wait: cmd.Wait closes the pipe, so anything buffered
+	// in it would otherwise be lost.
+	rest, _ := io.ReadAll(stdout)
+	waitExit(t, cmd, 5*time.Second)
+	evs := eventsOf(t, rest)
+	sawStopped := false
+	sawAfter := false
+	for _, ev := range evs {
+		if ev["event"] == "stopped" {
+			sawStopped = true
+			continue
+		}
+		if sawStopped {
+			sawAfter = true
+		}
+	}
+	if !sawStopped {
+		t.Fatalf("no stopped event:\n%s", rest)
+	}
+	if sawAfter {
+		t.Fatalf("events after stopped (the cast narrated into the next one):\n%s", rest)
+	}
+}
+
+// A stop aimed at a cast that is no longer serving is a no-op: it must not
+// kill the newer instance nor sweep its files.
+func TestStaleStopLeavesNewerCastAlone(t *testing.T) {
+	bin := buildHelper(t)
+	out := t.TempDir()
+	stub := castingStub(t, out, "trap 'exit 0' TERM\nsleep 60")
+	cmd, stdout := startServeWith(t, bin, out, stub, os.Getpid(), "cast-new")
+	waitReady(t, stdout, 15*time.Second)
+
+	if err := exec.Command(bin, "stop", "-out", out, "-token", "cast-old").Run(); err != nil {
+		t.Fatalf("a stale stop must exit 0, got %v", err)
+	}
+	// The new cast is untouched: still running, still serving its files. Its
+	// process handle is probed with kill(0), not Wait — the later stop needs
+	// Wait's single caller.
+	if !processAlive(cmd.Process.Pid) {
+		t.Fatal("a stale stop killed the newer cast")
+	}
+	for _, f := range castFiles {
+		if _, err := os.Stat(filepath.Join(out, f)); err != nil {
+			t.Fatalf("a stale stop swept the newer cast's %s", f)
+		}
+	}
+	// And its own stop still works.
+	if err := exec.Command(bin, "stop", "-out", out, "-token", "cast-new").Run(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	waitExit(t, cmd, 5*time.Second)
+	assertSwept(t, out)
+}
+
+// TestTakeoverFailsWhenPredecessorNeverExits: a predecessor that keeps the
+// directory locked past the grace must fail the new instance outright — with
+// an error event, a non-zero exit, and the predecessor's files left alone.
+func TestTakeoverFailsWhenPredecessorNeverExits(t *testing.T) {
+	bin := buildHelper(t)
+	out := t.TempDir()
+	// A real second process holds the directory and ignores SIGTERM: the wedged
+	// predecessor. Its pidfile is written by startLockHolder.
+	h := startLockHolder(t, out, "cast-old", true)
+	os.WriteFile(filepath.Join(out, "index.m3u8"), []byte("#EXTM3U\n"), 0o644)
+
+	cmd := exec.Command(bin, "serve",
+		"-source", "/dev/null", "-out", out, "-ffmpeg", "/bin/true",
+		"-parent", fmt.Sprint(os.Getpid()), "-duration", "60",
+		"-vcodec", "h264", "-acodec", "aac", "-achannels", "2", "-vmap", "0", "-amap", "1",
+		"-token", "cast-new")
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	b, _ := io.ReadAll(stdout)
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("the new instance must exit non-zero when it cannot take over")
+	}
+	if !strings.Contains(string(b), `"event":"error"`) {
+		t.Fatalf("expected an error event, got:\n%s", b)
+	}
+	// The wedged predecessor's files and pidfile are untouched.
+	if _, err := os.Stat(filepath.Join(out, "index.m3u8")); err != nil {
+		t.Fatal("a failed takeover swept the predecessor's files")
+	}
+	if _, err := os.Stat(filepath.Join(out, "helper.pid")); err != nil {
+		t.Fatal("a failed takeover removed the predecessor's pidfile")
+	}
+	if !processAlive(h.pid()) {
+		t.Fatal("the takeover killed a predecessor that was holding the directory")
+	}
+}
+
+// The ready URL must never serve a superseded cast's playlist. Cast B announces
+// ready only after it has taken the directory and swept A's files, so a TV that
+// fetches the URL the instant it is advertised gets B's playlist — not A's
+// (which A would then delete underneath the fetch: the "404 right after the
+// address arrived" symptom).
+func TestReadyURLNeverServesThePreviousCastsPlaylist(t *testing.T) {
+	bin := buildHelper(t)
+	out := t.TempDir()
+	// A writes a recognisable playlist and keeps running until taken over.
+	stubA := filepath.Join(t.TempDir(), "ffmpeg")
+	os.WriteFile(stubA, []byte(fmt.Sprintf(
+		"#!/bin/sh\necho '#EXTM3U' > %[1]s/index.m3u8\necho '#OLD-CAST' >> %[1]s/index.m3u8\necho init > %[1]s/init.mp4\necho seg > %[1]s/seg_0000.m4s\ntrap 'exit 0' TERM\nsleep 60\n",
+		out)), 0o755)
+	first, stdoutA := startServeWith(t, bin, out, stubA, os.Getpid(), "cast-a")
+	waitReady(t, stdoutA, 15*time.Second)
+
+	// B blocks its first playlist until the test says so, which pins the window
+	// where a handover could wrongly advertise A's still-present file.
+	gate := filepath.Join(t.TempDir(), "gate")
+	stubB := filepath.Join(t.TempDir(), "ffmpeg")
+	os.WriteFile(stubB, []byte(fmt.Sprintf(
+		"#!/bin/sh\nwhile [ ! -f %[3]s ]; do sleep 0.05; done\necho '#EXTM3U' > %[1]s/index.m3u8\necho init > %[1]s/init.mp4\necho seg > %[1]s/seg_0000.m4s\ntrap 'exit 0' TERM\nsleep 60\n",
+		out, out, gate)), 0o755)
+	second, stdoutB := startServeWith(t, bin, out, stubB, os.Getpid(), "cast-b")
+
+	// B has been started but has not written anything; A has been asked to stop.
+	// Nothing may be advertised yet — and A's playlist must already be gone by
+	// the time B's own appears, so there is no instant at which the eventual
+	// URL serves A's file.
+	waitExit(t, first, 10*time.Second)
+	os.WriteFile(gate, []byte("go"), 0o644)
+	urlB := waitReady(t, stdoutB, 20*time.Second)
+	body := getBody(t, urlB)
+	if strings.Contains(body, "#OLD-CAST") {
+		t.Fatalf("the new cast announced a playlist that was still the old cast's:\n%s", body)
+	}
+	if !strings.Contains(body, "#EXTM3U") {
+		t.Fatalf("implausible playlist at ready:\n%s", body)
+	}
+	second.Process.Kill()
+	second.Wait()
 }

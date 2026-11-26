@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -167,7 +168,11 @@ func ProgressPct(outTimeUS int64, duration float64) float64 {
 	return pct
 }
 
+// RunJob starts ffmpeg for c and reports its -progress stream to out. Pass a
+// *Protocol to let a stop seal the stream: a superseded instance must not keep
+// narrating its cast into the next one's log.
 func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
+	emit := sinkFor(out)
 	done := make(chan error, 1)
 	cmd := exec.Command(c.FFmpeg, BuildArgs(c)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -183,6 +188,10 @@ func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 		done <- err
 		return func() {}, done
 	}
+	// Record the process group so a successor can reap it after this helper
+	// dies without sweeping (kill -9 leaves ffmpeg running and still writing).
+	jobPid := filepath.Join(c.OutDir, jobPidName)
+	os.WriteFile(jobPid, []byte(strconv.Itoa(cmd.Process.Pid)), 0o644)
 
 	// Flag to track when job has completed (0 = running, 1 = done)
 	var jobDone atomic.Int32
@@ -200,11 +209,11 @@ func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 			switch k {
 			case "out_time_us":
 				if us, perr := strconv.ParseInt(v, 10, 64); perr == nil {
-					Emit(out, "progress", map[string]any{"pct": ProgressPct(us, c.Duration)})
+					emit("progress", map[string]any{"pct": ProgressPct(us, c.Duration)})
 				}
 			case "progress":
 				if v == "end" {
-					Emit(out, "packaged", nil)
+					emit("packaged", nil)
 				}
 			}
 		}
@@ -215,6 +224,7 @@ func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 		}
 		// Mark job as done before sending to channel
 		jobDone.Store(1)
+		os.Remove(jobPid)
 		done <- werr
 		close(finished)
 	}()
@@ -223,8 +233,8 @@ func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 	// exited: the caller sweeps the output directory next, and a segment
 	// ffmpeg was still flushing would otherwise reappear after the sweep.
 	// ffmpeg honours SIGTERM within a fraction of a second; a process that
-	// ignores it is SIGKILLed after a grace period chosen to stay inside the
-	// 3s the `stop` subcommand's TakeOver waits for the old instance.
+	// ignores it is SIGKILLed after a grace period chosen to stay well inside
+	// the handoverGrace a successor waits for this instance (pidfile.go).
 	// Safe to call more than once and after done has fired.
 	stop := func() {
 		// Only signal if job is still running

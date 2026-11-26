@@ -30,3 +30,42 @@ func TestEmitNilFields(t *testing.T) {
 		t.Fatalf("got %q", buf.String())
 	}
 }
+
+// A sealed instance is how a superseded cast goes quiet: after Seal, progress
+// and "packaged" events belonging to its cast must never reach the next cast's
+// log, while the closing "stopped" (and a terminal "error") still must.
+func TestProtocolSealSilencesEverythingButTerminalEvents(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewProtocol(&buf, "")
+	p.Seal()
+	p.Emit("progress", map[string]any{"pct": 42})
+	p.Emit("packaged", nil)
+	p.Emit("ready", map[string]any{"url": "http://x/index.m3u8"})
+	if buf.Len() != 0 {
+		t.Fatalf("a sealed instance emitted non-terminal events:\n%s", buf.String())
+	}
+	p.Emit("stopped", nil)
+	p.Emit("error", map[string]any{"msg": "boom"})
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want stopped and error, got:\n%s", buf.String())
+	}
+}
+
+// Every event carries the cast's token so a consumer can tell casts apart.
+func TestProtocolStampsToken(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewProtocol(&buf, "cast-a")
+	fields := map[string]any{"pct": 1}
+	p.Emit("progress", fields)
+	if _, leaked := fields["token"]; leaked {
+		t.Fatal("Emit mutated the caller's map")
+	}
+	var ev map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev["token"] != "cast-a" || ev["event"] != "progress" {
+		t.Fatalf("event not stamped: %v", ev)
+	}
+}

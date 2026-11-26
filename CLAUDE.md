@@ -122,6 +122,31 @@ From reading the IINA source (`github.com/iina/iina`) and Apple's docs:
   `Info.json`; nothing ships from `plugin/Info.json`. `main.js` finds its own
   `bin/` by the identifier in its `@data` path, so never hardcode the
   identifier there. Reasoning in `packaging/dev-manifest.mjs`.
+- **Casts hand over through a directory lock, not a pidfile.** Every serving
+  helper holds an exclusive `flock` on `.cast.lock` in the HLS output dir and
+  releases it only after ffmpeg has exited and its own segments are swept. A new
+  cast takes that lock before touching the directory, SIGTERMs the recorded
+  owner and waits out a grace (`handoverGrace`); the lock is the only honest
+  liveness signal — a pidfile can be stale or hold a recycled pid, and the
+  kernel drops the lock on any death including `kill -9`. Grace expiry is a
+  hard failure ("could not take over the output directory"), never packing two
+  instances into one directory: that is what served a new cast the old cast's
+  playlist and then 404ed the TV when the old one swept it. `stop -token`
+  targets one cast, so a stop that lands after a newer cast took over does
+  nothing. A stopped instance seals its event stream (`Protocol.Seal`) and can
+  then emit only `stopped`/`error` — this is what keeps a superseded cast's
+  progress and `packaged` out of the next cast's log. Details in
+  `docs/distribution.md`, "The supervisor".
+- **Ready means the TV can fetch everything the playlist names.** The helper
+  announces `ready` only once its own playlist and every playlist that
+  playlist references are on disk and non-empty (`helper/readiness.go` follows
+  the master's variant line and `EXT-X-MEDIA` URIs, not fixed names) — a
+  subtitled master announced before `index_vtt.m3u8` exists 404s on the TV.
+  Ready is latched: nothing later re-evaluates it, so a cleanup or ffmpeg exit
+  cannot retract an announced stream. Every exit path (SIGTERM, parent gone,
+  packaging failure) sweeps the cast's segments while still holding the lock,
+  then releases it; the plugin sees the terminal event only after that, so an
+  immediate re-cast finds a directory it can take at once.
 
 ## The design is settled — all prototype tests passed (2026-08-29, user-confirmed)
 

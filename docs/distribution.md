@@ -137,15 +137,34 @@ Replaces `serve.sh` + python entirely. One process, stdlib only. Responsibilitie
   and Range requests (Go's `http.FileServer` provides both), bound to `0.0.0.0` on
   a **free port picked at start** (no more hardcoded 8919), LAN IP discovery.
 - **Watchdog:** exit when the parent IINA process dies (poll PPID/kill-0). This
-  structurally kills the orphan problem found during prototyping. On start, detect
-  and kill a stale instance (pidfile in the plugin data dir).
+  structurally kills the orphan problem found during prototyping.
+- **Handover, not "kill the stale one":** every serving instance holds an
+  exclusive `flock` on `.cast.lock` in the output directory for its whole life,
+  and releases it only after it has stopped ffmpeg and swept its own segments.
+  A new cast takes that lock before it touches the directory, asking the live
+  owner (named in the lock file) to stop with SIGTERM and giving it a grace
+  period. Acquiring the lock *is* the proof that the previous instance is gone
+  and no longer writing — the kernel drops it on any death, `kill -9` included,
+  where a pidfile can go stale or point at a recycled pid. If the grace expires
+  with the lock still held, the new instance fails with an error event instead
+  of packing into the same directory beside the old one (two ffmpegs writing
+  `seg_0000.m4s`, and the new cast served the old cast's playlist until the old
+  one swept it and the TV's fetch 404ed).
 - **Run ffmpeg jobs:** spawn the bundled ffmpeg, translate its `-progress` output
-  into the stdout protocol, kill on timeout or on a `stop` command.
+  into the stdout protocol, kill on timeout or on a `stop` command. ffmpeg's
+  process-group pid is recorded in `ffmpeg.pid` so a successor can reap a job an
+  abnormally-dead helper left running.
 - **Protocol:** JSON lines on stdout, consumed by the JS side through the
   `utils.exec` stdout callback — `{"event":"ready","url":…}`,
-  `{"event":"progress","pct":…}`, `{"event":"error","msg":…}`. Commands arrive as
-  argv (v0 needs only: source path, out dir, clip/full, stop). Remember the
-  prototype lesson: the JS side must not touch `sidebar.*` from these callbacks.
+  `{"event":"progress","pct":…}`, `{"event":"packaged"}`, `{"event":"stopped"}`,
+  `{"event":"error","msg":…}`. Each event carries the cast's `token`; once an
+  instance is told to stop it seals its stream, so a superseded cast can no
+  longer emit progress or `packaged` into the next cast's log — only its own
+  terminal `stopped`/`error`. Commands arrive as argv: `serve … -token <t>` and
+  `stop -out <dir> [-token <t>]`. A `stop` whose token names a cast that is no
+  longer serving does nothing; the newer cast and its segments are left alone.
+  Remember the prototype lesson: the JS side must not touch `sidebar.*` from
+  these callbacks.
 
 Why Go: the whole server is stdlib including Range support, `GOOS/GOARCH`
 cross-compilation plus `lipo` is a two-liner in CI, the artifact is a single
@@ -240,8 +259,8 @@ No signing beyond ad-hoc, and no secrets of any kind.
 - **Helper or ffmpeg missing/not executable** (hand-copied install, quarantined by
   a browser download): detect at cast time, show one clear sidebar message naming
   the fix ("reinstall through IINA's plugin installer"). Never attempt a download.
-- **Port in use / stale helper:** supervisor handles both itself (free-port pick,
-  pidfile takeover).
+- **Port in use / stale helper:** supervisor handles both itself (free-port pick;
+  directory-lock handover, not pidfile trust — see "The supervisor" above).
 - **First media load flake** (see `docs/prototype.md` findings): JS retries the
   media element once before surfacing an error.
 

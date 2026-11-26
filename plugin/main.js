@@ -199,6 +199,20 @@ function videoRangeHint(gamma) {
   return "";
 }
 
+// Every cast gets an opaque token, passed to the helper as `serve -token`,
+// echoed in each event it emits, and sent back as `stop -token`. Two failures
+// this closes: a stop issued for cast N can land after cast N+1 has taken over
+// the same output directory (the helper then refuses to touch it, rather than
+// killing the new cast and sweeping its segments); and a superseded helper's
+// late events, if the pipe delivered them out of order, are dropped by token
+// instead of mutating the new cast's state. Monotonic within the session.
+var castTokenCounter = 0;
+function nextCastToken(now) {
+  castTokenCounter += 1;
+  // now is Date.now() in the runtime; injected so the function stays pure.
+  return "cast-" + Math.floor(now).toString(36) + "-" + castTokenCounter;
+}
+
 // WebKit reports a stream it couldn't fetch at all (refused, unreachable,
 // 404) as media error 4 with an empty MediaError.message, which is all a user
 // or a bug report ever saw (issue #42). The plugin probes the URL with curl,
@@ -322,6 +336,7 @@ if (typeof module !== "undefined") {
     lanIPOverride: lanIPOverride,
     describeMediaFailure: describeMediaFailure,
     videoRangeHint: videoRangeHint,
+    nextCastToken: nextCastToken,
     newMirror: newMirror,
     mirrorOnMpvPause: mirrorOnMpvPause,
     mirrorOnMpvSeek: mirrorOnMpvSeek,
@@ -347,6 +362,11 @@ if (typeof iina !== "undefined") {
   // stops a superseded cast's stale callbacks from clobbering the state of
   // whatever cast (or idle state) came after it.
   var castGen = 0;
+  // The token of the cast currently in `starting`/`ready`/`packaged`, or null
+  // when idle. stopCast sends it with `stop` so the helper can refuse to tear
+  // down a cast that is not ours, and the state machine refuses late events
+  // that carry a different one.
+  var activeToken = null;
 
   // Active muted mirror (spec 2026-08-30), or null when not casting. Event
   // callbacks may ONLY swap this object via the pure mirrorOn* functions;
@@ -534,6 +554,8 @@ if (typeof iina !== "undefined") {
                  videoBitDepth(mpv.getString("video-params/pixelformat"));
     var outDir = utils.resolvePath("@tmp/hls");
     var gen = ++castGen;
+    var token = nextCastToken(Date.now());
+    activeToken = token;
     stdoutRest = "";
     state = { phase: "starting", url: null, pct: 0, msg: null };
     // Muted mirror: keep mpv playing, silenced, instead of pausing. The page
@@ -567,12 +589,18 @@ if (typeof iina !== "undefined") {
       }
       if (lanIP) serveArgs.push("-ip", lanIP);
       if (vrange) serveArgs.push("-vrange", vrange);
+      serveArgs.push("-token", token);
       utils.exec(helper, serveArgs, undefined, function (chunk) {
         if (gen !== castGen) return;
         var parsed = parseHelperEvents(stdoutRest, chunk);
         stdoutRest = parsed.rest;
         for (var i = 0; i < parsed.events.length; i++) {
           var ev = parsed.events[i];
+          // A superseded helper must not narrate into this cast's state. The
+          // generation check above already drops its whole stdout callback;
+          // the token catches an event that still slips through on a
+          // reordered pipe (and is what an older helper simply omits).
+          if (ev.token !== undefined && ev.token !== token) continue;
           if (ev.event === "ready") {
             state.phase = "ready"; state.url = ev.url;
             console.log("[cast] stream ready at " + ev.url);
@@ -606,12 +634,25 @@ if (typeof iina !== "undefined") {
 
   function stopCast() {
     endMirror();
+    var token = activeToken;
+    activeToken = null;
     castGen++; // invalidate any in-flight cast's callbacks
+    state = { phase: "idle", url: null, pct: 0, msg: null };
+    // Nothing was casting here, so there is nothing of ours to stop. Running a
+    // token-less `stop` anyway would be a "kill whatever holds the output dir"
+    // — and a second IINA window idle on the same @tmp/hls would then take
+    // down this one's live cast. Only an actual cast gets a stop.
+    if (!token) return;
     resolveBinDir(function (binDir, resolveErr) {
       if (resolveErr) { console.log("[stopCast] " + resolveErr); return; }
-      utils.exec(binDir + "/airplay-helper", ["stop", "-out", utils.resolvePath("@tmp/hls")]);
+      var stopArgs = ["stop", "-out", utils.resolvePath("@tmp/hls")];
+      // Carry the token of the cast being stopped: by the time this exec
+      // callback lands (resolveBinDir can await the bin-dir lookup) a new cast
+      // may already own the output directory, and the helper must leave that
+      // one alone rather than kill it and sweep its segments.
+      stopArgs.push("-token", token);
+      utils.exec(binDir + "/airplay-helper", stopArgs);
     });
-    state = { phase: "idle", url: null, pct: 0, msg: null };
   }
 
   // Info.json's sidebarTab makes IINA show an "AirPlay" tab in the sidebar's

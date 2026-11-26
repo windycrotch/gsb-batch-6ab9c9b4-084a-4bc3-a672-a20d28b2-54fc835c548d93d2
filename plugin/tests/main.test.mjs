@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
-const { selectTracks, videoBitDepth, subtitleLabel, parseHelperEvents, pluginsDirFromDataDir, identifierFromDataDir, identifierPattern, isValidPid, hasURLScheme, normalizeSource, lanIPOverride, describeMediaFailure, videoRangeHint } = require("../main.js");
+const { selectTracks, videoBitDepth, subtitleLabel, parseHelperEvents, pluginsDirFromDataDir, identifierFromDataDir, identifierPattern, isValidPid, hasURLScheme, normalizeSource, lanIPOverride, describeMediaFailure, videoRangeHint, nextCastToken } = require("../main.js");
 
 const mpvTracks = [
   { type: "video", id: 1, selected: true, codec: "hevc", "ff-index": 0 },
@@ -320,4 +320,14 @@ test("videoBitDepth reads mpv pixel-format names", () => {
   }
   assert.equal(videoBitDepth(null), 0);
   assert.equal(videoBitDepth(undefined), 0);
+});
+
+// ---- cast tokens (handover) ----
+
+test("nextCastToken is unique even within the same millisecond", () => {
+  const { nextCastToken } = require("../main.js");
+  const a = nextCastToken(1700000000000);
+  const b = nextCastToken(1700000000000);
+  assert.notEqual(a, b, "two casts in one millisecond must not share a token");
+  assert.match(a, /^cast-/);
 });
