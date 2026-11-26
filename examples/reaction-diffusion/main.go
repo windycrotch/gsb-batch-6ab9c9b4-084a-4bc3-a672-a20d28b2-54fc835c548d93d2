@@ -338,6 +338,35 @@ func (s *Simulation) UpdateTexture() {
 	}
 }
 
+// updateSimulation advances the simulation by one render frame (8 sub-steps)
+// unless it is paused, refreshes the render texture, and — only when the
+// simulation actually advanced — captures a recording frame. It reports
+// whether the simulation advanced, so a paused frame never adds a duplicate
+// frame to the recording.
+func updateSimulation(sim *Simulation, rec *Recorder) bool {
+	if sim.paused {
+		sim.UpdateTexture()
+		return false
+	}
+	for step := 0; step < 8; step++ {
+		sim.Step()
+	}
+	sim.UpdateTexture()
+	rec.Capture(sim.renderImg)
+	return true
+}
+
+// toggleRecording starts a new recording, or stops the current one and writes
+// the GIF to path. The outcome (saved path, empty recording, or write error)
+// is available via rec.Status() for display in the HUD.
+func toggleRecording(rec *Recorder, path string) {
+	if rec.Recording() {
+		_ = rec.Stop(path)
+	} else {
+		rec.Start()
+	}
+}
+
 func main() {
 	c := canvas.NewCanvas(&canvas.CanvasConfig{
 		Width:     winWidth,
@@ -347,6 +376,8 @@ func main() {
 	})
 
 	sim := NewSimulation(simWidth, simHeight)
+	recorder := NewRecorder(c.FrameRate)
+	const gifPath = "reaction_diffusion.gif"
 	showHelp := true
 
 	c.Setup(func(ctx *canvas.Context) {
@@ -381,6 +412,8 @@ func main() {
 			showHelp = !showHelp
 		case canvas.KeyS:
 			_ = ctx.SaveFrame("reaction_diffusion.png")
+		case canvas.KeyG:
+			toggleRecording(recorder, gifPath)
 		}
 	})
 
@@ -396,15 +429,11 @@ func main() {
 			sim.RemoveChemical(mx, my, 10)
 		}
 
-		// Run multiple simulation sub-steps per render frame for smooth real-time evolution
-		if !sim.paused {
-			for step := 0; step < 8; step++ {
-				sim.Step()
-			}
-		}
+		// Run multiple simulation sub-steps per render frame for smooth real-time
+		// evolution; a recording frame is captured only when the sim advanced.
+		updateSimulation(sim, recorder)
 
-		// Update pixel buffer and render to canvas
-		sim.UpdateTexture()
+		// Render the (already refreshed) pixel buffer to canvas
 		ctx.DrawImage(sim.renderImg, 0, 0)
 
 		// On-screen HUD / Controls overlay
@@ -412,7 +441,7 @@ func main() {
 			ctx.Push()
 			// Background panel for text legibility
 			ctx.SetRGBA(0.05, 0.05, 0.08, 0.8)
-			ctx.DrawRoundedRectangle(12, 12, 360, 115, 6)
+			ctx.DrawRoundedRectangle(12, 12, 400, 133, 6)
 			ctx.Fill()
 
 			ctx.FillColor(colornames.White)
@@ -424,7 +453,20 @@ func main() {
 			ctx.DrawString(fmt.Sprintf("F: %.4f | k: %.4f | Palette: %s", currentPreset.F, currentPreset.K, currentPalette.Name), 22, 50)
 			ctx.DrawString("Left Drag: Inject chemical V | Right Drag: Erase", 22, 70)
 			ctx.DrawString("1-7: Presets | C: Palette | Space: Seed | R: Clear", 22, 88)
-			ctx.DrawString("P: Pause | H: Toggle HUD | S: Save PNG", 22, 106)
+			ctx.DrawString("P: Pause | H: Toggle HUD | S: Save PNG | G: Record GIF", 22, 106)
+
+			// Recording indicator / last save status
+			if recorder.Recording() {
+				ctx.SetRGB(1.0, 0.25, 0.25)
+				ctx.DrawString(fmt.Sprintf("● REC  frames: %d", recorder.FrameCount()), 22, 126)
+			} else if recorder.Status() != "" {
+				if recorder.LastError() != nil {
+					ctx.SetRGB(1.0, 0.35, 0.3)
+				} else {
+					ctx.SetRGB(0.4, 0.9, 0.5)
+				}
+				ctx.DrawString(recorder.Status(), 22, 126)
+			}
 			ctx.Pop()
 		}
 	})
