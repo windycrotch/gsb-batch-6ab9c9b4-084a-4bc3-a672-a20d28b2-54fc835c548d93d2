@@ -254,23 +254,23 @@ func (mg *ManifestGenerator) isSavingMediaPacket() bool {
 	return ret
 }
 
-func (mg *ManifestGenerator) saveInitPacket(tableType packetTableTypes) bool {
+func (mg *ManifestGenerator) saveInitPacket(tableType packetTableTypes) (bool, error) {
 	if mg.options.chunkInitType == ChunkInit {
 		return mg.addPacketToInitChunk(tableType)
 	} else if mg.options.chunkInitType == ChunkInitStart {
 		if tableType == PatTable || tableType == PmtTable {
-			return mg.saveInitChunkPacket(tableType)
+			return mg.saveInitChunkPacket(tableType), nil
 		}
 
-		return false
+		return false, nil
 	}
 
-	return false
+	return false, nil
 }
 
-func (mg *ManifestGenerator) processPacket(forceChunk bool) bool {
+func (mg *ManifestGenerator) processPacket(forceChunk bool) (bool, error) {
 	if !mg.tsPacket.Parse(mg.detectedPMTID) {
-		return false
+		return false, nil
 	}
 
 	// Detect video & audio PIDs
@@ -280,7 +280,9 @@ func (mg *ManifestGenerator) processPacket(forceChunk bool) bool {
 			mg.detectedPMTID = pmtID
 
 			// Save PAT
-			mg.saveInitPacket(PatTable)
+			if _, err := mg.saveInitPacket(PatTable); err != nil {
+				return false, err
+			}
 
 			mg.options.log.Debug("Detected PAT. PMT ID: ", pmtID)
 		}
@@ -295,7 +297,9 @@ func (mg *ManifestGenerator) processPacket(forceChunk bool) bool {
 			}
 
 			// Save PMT
-			mg.saveInitPacket(PmtTable)
+			if _, err := mg.saveInitPacket(PmtTable); err != nil {
+				return false, err
+			}
 
 			mg.options.log.Debug("Detected PMT. VideoIDs: ", Videoh264, "AudiosIDs: ", AudioADTS, "Other: ", Other)
 		}
@@ -317,20 +321,28 @@ func (mg *ManifestGenerator) processPacket(forceChunk bool) bool {
 					}
 					durS := pcrS - mg.chunkStartTimeS
 					if (durS + ChunkLengthToleranceS) > mg.options.targetSegmentDurS {
-						_, nextInitialPCRS := mg.nextChunk(pcrS, mg.chunkStartTimeS, tspacket.MaxPCRSValue, false)
+						var err error
+						_, nextInitialPCRS, err := mg.nextChunk(pcrS, mg.chunkStartTimeS, tspacket.MaxPCRSValue, false)
+						if err != nil {
+							return false, err
+						}
 
 						mg.chunkStartTimeS = nextInitialPCRS
 					}
 				}
 			}
-			mg.addPacketToChunk()
+			if err := mg.addPacketToChunk(); err != nil {
+				return false, err
+			}
 
 		} else {
 			mg.options.log.Debug("SKIPPED VIDEO PACKET, not init: ", mg.tsPacket.String())
 		}
 	} else if pID == mg.options.audioPID {
 		if mg.isSavingMediaPacket() {
-			mg.addPacketToChunk()
+			if err := mg.addPacketToChunk(); err != nil {
+				return false, err
+			}
 			mg.options.log.Debug("AUDIO: ", mg.tsPacket.String())
 		} else {
 			mg.options.log.Debug("SKIPPED AUDIO PACKET, not init: ", mg.tsPacket.String())
@@ -339,16 +351,18 @@ func (mg *ManifestGenerator) processPacket(forceChunk bool) bool {
 		mg.options.log.Debug("OTHER: ", mg.tsPacket.String())
 	} else {
 		fmt.Println("OUT OF SYNC!!!")
-		return false
+		return false, nil
 	}
 
-	return true
+	return true, nil
 }
 
-func (mg *ManifestGenerator) addPacketToChunk() {
+func (mg *ManifestGenerator) addPacketToChunk() error {
 
 	if mg.currentChunks == nil {
-		mg.createChunk(false)
+		if err := mg.createChunk(false); err != nil {
+			return err
+		}
 	}
 
 	if len(mg.currentChunks) > 0 {
@@ -364,9 +378,11 @@ func (mg *ManifestGenerator) addPacketToChunk() {
 
 		err := mg.currentChunks[0].AddData(mg.tsPacket.GetBuffer())
 		if err != nil {
-			panic(err)
+			return err
 		}
 	}
+
+	return nil
 }
 
 func (mg *ManifestGenerator) saveInitChunkPacket(tableType packetTableTypes) bool {
@@ -391,7 +407,7 @@ func (mg *ManifestGenerator) saveInitChunkPacket(tableType packetTableTypes) boo
 	return ret
 }
 
-func (mg *ManifestGenerator) addPacketToInitChunk(tableType packetTableTypes) bool {
+func (mg *ManifestGenerator) addPacketToInitChunk(tableType packetTableTypes) (bool, error) {
 	ret := false
 	saveData := false
 
@@ -399,7 +415,9 @@ func (mg *ManifestGenerator) addPacketToInitChunk(tableType packetTableTypes) bo
 		if mg.initState == InitNotIni { // We only save the 1st PAT PMT appeareance, so no dynamic updates are allowed
 			if mg.initChunk == nil {
 				// Create init chunk
-				mg.createChunk(true)
+				if err := mg.createChunk(true); err != nil {
+					return false, err
+				}
 			}
 			saveData = true
 		}
@@ -412,7 +430,7 @@ func (mg *ManifestGenerator) addPacketToInitChunk(tableType packetTableTypes) bo
 	if saveData {
 		err := mg.initChunk.AddData(mg.tsPacket.GetBuffer())
 		if err != nil {
-			panic(err)
+			return false, err
 		}
 
 		if tableType == PatTable {
@@ -420,42 +438,54 @@ func (mg *ManifestGenerator) addPacketToInitChunk(tableType packetTableTypes) bo
 		} else if tableType == PmtTable {
 			mg.initState = InitsavedPMT
 
-			mg.closeChunk(true, -1, false)
+			if err := mg.closeChunk(true, -1, false); err != nil {
+				return false, err
+			}
 		}
 
 		ret = true
 	}
 
-	return ret
+	return ret, nil
 }
 
-func (mg *ManifestGenerator) hlsClose() {
-	mg.hlsChunklist.CloseManifest(true)
+func (mg *ManifestGenerator) hlsClose() error {
+	return mg.hlsChunklist.CloseManifest(true)
 }
 
-func (mg *ManifestGenerator) hlsAddChunk(isGrowing bool, fileName string, durationS float64, isDisco bool) {
-
+func (mg *ManifestGenerator) hlsAddChunk(isGrowing bool, fileName string, durationS float64, isDisco bool) error {
 	err := mg.hlsChunklist.AddChunk(hls.Chunk{IsGrowing: isGrowing, FileName: fileName, DurationS: durationS, IsDisco: isDisco}, true)
 	if err != nil {
 		mg.options.log.Error("Error generating / saving the chunklists. Err: ", err)
 	}
+	return err
 }
 
-func (mg *ManifestGenerator) closeChunk(isInit bool, chunkDurationS float64, isFinalChunk bool) {
+func (mg *ManifestGenerator) closeChunk(isInit bool, chunkDurationS float64, isFinalChunk bool) error {
 	// Close current
 
 	if isInit == false {
 		if mg.currentChunks != nil && len(mg.currentChunks) > 0 {
 			currentChunk := mg.currentChunks[0]
 
-			currentChunk.Close(chunkDurationS)
+			// Upload the chunk first. Only when the upload succeeds may the
+			// chunk be referenced by the manifest, otherwise the error is
+			// propagated and the chunk never enters the chunklist.
+			if err := currentChunk.Close(chunkDurationS); err != nil {
+				mg.options.log.Error("Error uploading chunk ", currentChunk.GetFilename(), ". Err: ", err)
+				return fmt.Errorf("error uploading chunk %s: %w", currentChunk.GetFilename(), err)
+			}
 
 			//NO LHLS
 			if mg.options.lhlsAdvancedChunks <= 0 {
-				mg.hlsAddChunk(false, currentChunk.GetFilename(), chunkDurationS, false)
+				if err := mg.hlsAddChunk(false, currentChunk.GetFilename(), chunkDurationS, false); err != nil {
+					return err
+				}
 				if mg.options.manifestType == hls.Vod {
 					if isFinalChunk {
-						mg.hlsClose()
+						if err := mg.hlsClose(); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -472,7 +502,10 @@ func (mg *ManifestGenerator) closeChunk(isInit bool, chunkDurationS float64, isF
 		}
 	} else {
 		if mg.initChunk != nil {
-			mg.initChunk.Close(-1)
+			if err := mg.initChunk.Close(-1); err != nil {
+				mg.options.log.Error("Error uploading init chunk ", mg.initChunk.GetFilename(), ". Err: ", err)
+				return fmt.Errorf("error uploading init chunk %s: %w", mg.initChunk.GetFilename(), err)
+			}
 
 			mg.hlsChunklist.SetInitChunk(mg.initChunk.GetFilename())
 
@@ -483,10 +516,10 @@ func (mg *ManifestGenerator) closeChunk(isInit bool, chunkDurationS float64, isF
 		}
 	}
 
-	return
+	return nil
 }
 
-func (mg *ManifestGenerator) createChunk(isInit bool) {
+func (mg *ManifestGenerator) createChunk(isInit bool) error {
 	// Close current
 	if isInit {
 		chunkInitOptions := mediachunk.Options{
@@ -506,58 +539,56 @@ func (mg *ManifestGenerator) createChunk(isInit bool) {
 		newChunk := mediachunk.New(0, chunkInitOptions)
 		mg.initChunk = &newChunk
 
-		err := mg.initChunk.InitializeChunk()
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		chunksToCreate := 1
-		if mg.fistChunkCreated == false && mg.options.lhlsAdvancedChunks > 0 {
-			chunksToCreate = mg.options.lhlsAdvancedChunks
-			mg.fistChunkCreated = true
-		}
-
-		n := 0
-		for n < chunksToCreate {
-			chunkOptions := mediachunk.Options{
-				Log:                mg.options.log,
-				OutputType:         mg.options.chunkOutputType,
-				LHLS:               false,
-				EstimatedDurationS: mg.options.targetSegmentDurS,
-				FileNumberLength:   ChunkFileNumberLength,
-				GhostPrefix:        GhostPrefixDefault,
-				FileExtension:      ChunkFileExtensionDefault,
-				BasePath:           mg.options.baseOutPath,
-				ChunkBaseFilename:  mg.options.chunkBaseFilename,
-				HTTPUploader:       mg.options.httpUploader,
-				S3Uploader:         mg.options.s3Uploader}
-
-			if mg.options.lhlsAdvancedChunks > 0 {
-				chunkOptions.LHLS = true
-			}
-
-			newChunk := mediachunk.New(mg.currentChunkIndex+uint64(len(mg.currentChunks)), chunkOptions)
-
-			err := newChunk.InitializeChunk()
-			if err != nil {
-				panic(err)
-			}
-
-			// Add the advanced chunk to the manifest with target dur
-			if mg.options.lhlsAdvancedChunks > 0 {
-				mg.hlsAddChunk(true, newChunk.GetFilename(), mg.options.targetSegmentDurS, false)
-			}
-
-			mg.currentChunks = append(mg.currentChunks, newChunk)
-
-			n++
-		}
+		return mg.initChunk.InitializeChunk()
 	}
-	return
+
+	chunksToCreate := 1
+	if mg.fistChunkCreated == false && mg.options.lhlsAdvancedChunks > 0 {
+		chunksToCreate = mg.options.lhlsAdvancedChunks
+		mg.fistChunkCreated = true
+	}
+
+	n := 0
+	for n < chunksToCreate {
+		chunkOptions := mediachunk.Options{
+			Log:                mg.options.log,
+			OutputType:         mg.options.chunkOutputType,
+			LHLS:               false,
+			EstimatedDurationS: mg.options.targetSegmentDurS,
+			FileNumberLength:   ChunkFileNumberLength,
+			GhostPrefix:        GhostPrefixDefault,
+			FileExtension:      ChunkFileExtensionDefault,
+			BasePath:           mg.options.baseOutPath,
+			ChunkBaseFilename:  mg.options.chunkBaseFilename,
+			HTTPUploader:       mg.options.httpUploader,
+			S3Uploader:         mg.options.s3Uploader}
+
+		if mg.options.lhlsAdvancedChunks > 0 {
+			chunkOptions.LHLS = true
+		}
+
+		newChunk := mediachunk.New(mg.currentChunkIndex+uint64(len(mg.currentChunks)), chunkOptions)
+
+		if err := newChunk.InitializeChunk(); err != nil {
+			return err
+		}
+
+		// Add the advanced chunk to the manifest with target dur
+		if mg.options.lhlsAdvancedChunks > 0 {
+			if err := mg.hlsAddChunk(true, newChunk.GetFilename(), mg.options.targetSegmentDurS, false); err != nil {
+				return err
+			}
+		}
+
+		mg.currentChunks = append(mg.currentChunks, newChunk)
+
+		n++
+	}
+	return nil
 }
 
 // Creates chunk and returns the initial time for the next chunk
-func (mg *ManifestGenerator) nextChunk(currentPCRS float64, lastInitialPCRS float64, maxPCRs float64, isFinalChunk bool) (chunkDurationS float64, nextInitialPCRS float64) {
+func (mg *ManifestGenerator) nextChunk(currentPCRS float64, lastInitialPCRS float64, maxPCRs float64, isFinalChunk bool) (chunkDurationS float64, nextInitialPCRS float64, err error) {
 	chunkDurationS = -1.0
 	nextInitialPCRS = currentPCRS
 
@@ -571,22 +602,26 @@ func (mg *ManifestGenerator) nextChunk(currentPCRS float64, lastInitialPCRS floa
 
 	mg.options.log.Info("CHUNK! At PCRs: ", currentPCRS, ". ChunkDurS: ", chunkDurationS)
 
-	mg.closeChunk(false, chunkDurationS, isFinalChunk)
+	if err = mg.closeChunk(false, chunkDurationS, isFinalChunk); err != nil {
+		return
+	}
 	if !isFinalChunk {
-		mg.createChunk(false)
+		err = mg.createChunk(false)
 	}
 
 	return
 }
 
-// Close Closes manigest processing saving last data and last chunk
-func (mg *ManifestGenerator) Close() {
+// Close Closes manigest processing saving last data and last chunk. It returns
+// an error if the final chunk or the final manifest could not be uploaded.
+func (mg *ManifestGenerator) Close() error {
 	//Generate last chunk
-	mg.nextChunk(mg.lastPCRS, mg.chunkStartTimeS, tspacket.MaxPCRSValue, true)
+	_, _, err := mg.nextChunk(mg.lastPCRS, mg.chunkStartTimeS, tspacket.MaxPCRSValue, true)
+	return err
 }
 
 // AddData current chunk
-func (mg *ManifestGenerator) AddData(buf []byte) {
+func (mg *ManifestGenerator) AddData(buf []byte) error {
 	if !mg.isInSync {
 		buf = mg.resync(buf)
 
@@ -606,7 +641,11 @@ func (mg *ManifestGenerator) AddData(buf []byte) {
 
 	if mg.bytesToNextSync <= 0 {
 		// Process packet
-		if mg.processPacket(false) == false {
+		ok, err := mg.processPacket(false)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			mg.isInSync = false
 		} else {
 			mg.bytesToNextSync = tspacket.TsDefaultPacketSize
@@ -617,10 +656,12 @@ func (mg *ManifestGenerator) AddData(buf []byte) {
 
 	if len(buf) > 0 {
 		// Still data to process
-		mg.AddData(buf[:])
+		if err := mg.AddData(buf[:]); err != nil {
+			return err
+		}
 	}
 
-	return
+	return nil
 }
 
 func (mg ManifestGenerator) getNumProcessedPackets() uint64 {

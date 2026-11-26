@@ -50,11 +50,11 @@ Usage of ./bin/go-ts-segmenter:
   -host string
         HTTP Host (default "localhost:9094")
   -httpMaxRetries int
-        Max retries for HTTP service unavailable (default 40)
+        Max retries (attempts after the first one) for retryable HTTP errors such as 503. 4xx errors fail immediately and are not retried. On exhaustion the error is propagated, the object is kept out of the HLS manifest and the process exits non-zero (default 40)
   -initType int
         Indicates where to put the init data PAT and PMT packets (0- No ini data, 1- Init segment, 2- At the beginning of each chunk (default 2)
   -initialHTTPRetryDelay int
-        Initial retry delay in MS for chunk HTTP (no chunk transfer) uploads. Value = intent * initialHttpRetryDelay (default 5)
+        Initial retry delay in MS for chunk HTTP (no chunk transfer) uploads. The delay grows per attempt: attempt N waits (N+1) * initialHttpRetryDelay MS (default 5)
   -inputType int
         Where gets the input data (1-stdin, 2-TCP socket) (default 1)
   -insecure

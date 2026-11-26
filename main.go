@@ -40,8 +40,8 @@ var (
 	httpScheme              = flag.String("protocol", "http", "HTTP Scheme (http, https)")
 	httpHost                = flag.String("host", "localhost:9094", "HTTP Host")
 	logPath                 = flag.String("logsPath", "", "Logs file path")
-	httpMaxRetries          = flag.Int("httpMaxRetries", 40, "Max retries for HTTP service unavailable")
-	initialHTTPRetryDelay   = flag.Int("initialHTTPRetryDelay", 5, "Initial retry delay in MS for chunk HTTP (no chunk transfer) uploads. Value = intent * initialHttpRetryDelay")
+	httpMaxRetries          = flag.Int("httpMaxRetries", 40, "Max retries (attempts after the first one) for retryable HTTP errors such as 503. 4xx errors fail immediately and are not retried. On exhaustion the error is propagated, the object is kept out of the HLS manifest and the process exits non-zero")
+	initialHTTPRetryDelay   = flag.Int("initialHTTPRetryDelay", 5, "Initial retry delay in MS for chunk HTTP (no chunk transfer) uploads. The delay grows per attempt: attempt N waits (N+1) * initialHttpRetryDelay MS")
 	httpsInsecure           = flag.Bool("insecure", false, "Skips CA verification for HTTPS out")
 	inputType               = flag.Int("inputType", 1, "Where gets the input data (1-stdin, 2-TCP socket)")
 	localPort               = flag.Int("localPort", 2002, "Local port to listen in case inputType = 2")
@@ -55,7 +55,14 @@ var (
 
 func main() {
 	flag.Parse()
+	os.Exit(execute(os.Stdin))
+}
 
+// execute runs the segmenter reading from inputReader. It returns the process
+// exit code: 0 on success, 1 on any fatal error. In particular an upload or
+// manifest failure is always propagated here so the process ends with a
+// non-zero status and the failed object never reaches the HLS manifest.
+func execute(inputReader io.Reader) int {
 	var log = configureLogger(*verbose, *logPath)
 
 	log.Info(manifestgenerator.Version, logPath)
@@ -63,7 +70,7 @@ func main() {
 
 	if *autoPID == false && manifestgenerator.ChunkInitTypes(*chunkInitType) != manifestgenerator.ChunkNoIni {
 		log.Error("Manual PID mode and Chunk No ini data are not compatible")
-		os.Exit(1)
+		return 1
 	}
 
 	chunkOutputType := mediachunk.OutputTypes(*mediaDestinationType)
@@ -114,15 +121,23 @@ func main() {
 
 		log.Info("Listening on port " + strconv.Itoa(*localPort))
 		// listen on all interfaces
-		ln, _ := net.Listen("tcp", ":"+strconv.Itoa(*localPort))
+		ln, errListen := net.Listen("tcp", ":"+strconv.Itoa(*localPort))
+		if errListen != nil {
+			log.Error("Error listening on TCP port ", *localPort, ". Err: ", errListen)
+			return 1
+		}
 		// accept connection on port
-		conn, _ := ln.Accept()
+		conn, errAccept := ln.Accept()
+		if errAccept != nil {
+			log.Error("Error accepting TCP connection. Err: ", errAccept)
+			return 1
+		}
 		log.Info("Connection TCP accepted")
 
 		r = bufio.NewReader(conn)
 	} else {
-		// Reader from std in
-		r = bufio.NewReader(os.Stdin)
+		// Reader from std in (or the reader passed in, useful for tests)
+		r = bufio.NewReader(inputReader)
 	}
 
 	// Buffer
@@ -134,25 +149,31 @@ func main() {
 			// Detected EOF
 			// Closing
 			log.Info("Closing process detected EOF")
-			mg.Close()
+			if errClose := mg.Close(); errClose != nil {
+				log.Error("Fatal error closing the manifest generator. Err: ", errClose)
+				return 1
+			}
 
 			break
 		}
 
 		if err != nil && err != io.EOF {
 			// Error reading pipe
-			log.Fatal(err, logPath)
-			os.Exit(1)
+			log.Error(err, logPath)
+			return 1
 		}
 
 		// process buf
 		log.Debug("Sent to process: ", n, " bytes")
-		mg.AddData(buf[:n])
+		if errAdd := mg.AddData(buf[:n]); errAdd != nil {
+			log.Error("Fatal error processing data, stopping so no manifest references an uploaded-failed chunk. Err: ", errAdd)
+			return 1
+		}
 	}
 
 	log.Info("Exit because detected EOF in the input reader")
 
-	os.Exit(0)
+	return 0
 }
 
 func isHTTPOut() bool {

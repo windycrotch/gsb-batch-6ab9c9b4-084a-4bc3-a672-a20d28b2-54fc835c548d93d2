@@ -142,7 +142,7 @@ func (c *Chunk) initializeChunkHTTPChunkedTransfer() error {
 	return nil
 }
 
-//InitializeChunk Initializes chunk
+// InitializeChunk Initializes chunk
 func (c *Chunk) InitializeChunk() error {
 	ret := error(nil)
 
@@ -169,18 +169,19 @@ func (c *Chunk) closeChunkFile() {
 	}
 }
 
-func (c *Chunk) closeChunkTmpFileExternal(outputType OutputTypes, durationS float64) {
+func (c *Chunk) closeChunkTmpFileExternal(outputType OutputTypes, durationS float64) error {
 	if c.fileWriter != nil {
 		c.fileDescriptor.Sync()
 		c.fileDescriptor.Close()
 	}
 
+	var uploadErr error
 	if c.tmpFilename != "" {
 		h := c.getChunkHeaders(durationS)
 		if outputType == ChunkOutputModeS3 {
-			c.options.S3Uploader.UploadLocalFile(c.tmpFilename, c.filename, h)
+			uploadErr = c.options.S3Uploader.UploadLocalFile(c.tmpFilename, c.filename, h)
 		} else {
-			c.options.HTTPUploader.UploadLocalFile(c.tmpFilename, c.filename, h)
+			uploadErr = c.options.HTTPUploader.UploadLocalFile(c.tmpFilename, c.filename, h)
 		}
 	}
 
@@ -189,6 +190,9 @@ func (c *Chunk) closeChunkTmpFileExternal(outputType OutputTypes, durationS floa
 	if exists {
 		os.Remove(c.tmpFilename)
 	}
+
+	// Surface the upload failure so the chunk is never added to the manifest.
+	return uploadErr
 }
 
 func (c *Chunk) closeChunkHTTPChunkedTransfer() {
@@ -197,16 +201,20 @@ func (c *Chunk) closeChunkHTTPChunkedTransfer() {
 	}
 }
 
-//Close Closes chunk
-func (c *Chunk) Close(durationS float64) {
+// Close Closes chunk. It returns an error when the external (HTTP/S3) upload
+// of the chunk failed, so callers can keep the chunk out of any manifest.
+func (c *Chunk) Close(durationS float64) error {
 	c.options.Log.Debug("Closing chunk ", c.filename)
 	if c.options.OutputType == ChunkOutputModeFile {
 		c.closeChunkFile()
+		return nil
 	} else if c.options.OutputType == ChunkOutputModeHTTPChunkedTransfer {
 		c.closeChunkHTTPChunkedTransfer()
+		return nil
 	} else if c.options.OutputType == ChunkOutputModeHTTPRegular || c.options.OutputType == ChunkOutputModeS3 {
-		c.closeChunkTmpFileExternal(c.options.OutputType, durationS)
+		return c.closeChunkTmpFileExternal(c.options.OutputType, durationS)
 	}
+	return nil
 }
 
 func (c *Chunk) getChunkHeaders(durationS float64) map[string]string {
@@ -253,7 +261,7 @@ func (c *Chunk) addDataChunkHTTP(buf []byte) error {
 	return nil
 }
 
-//AddData Add data to chunk and flush it
+// AddData Add data to chunk and flush it
 func (c *Chunk) AddData(buf []byte) error {
 	ret := error(nil)
 
@@ -269,7 +277,7 @@ func (c *Chunk) AddData(buf []byte) error {
 	return ret
 }
 
-//IsEmpty Indicates if there are any bytes already saved in this chunk
+// IsEmpty Indicates if there are any bytes already saved in this chunk
 func (c *Chunk) IsEmpty() bool {
 	ret := true
 	if c.totalBytes > 0 {
@@ -279,12 +287,12 @@ func (c *Chunk) IsEmpty() bool {
 	return ret
 }
 
-//GetFilename Returns the filename
+// GetFilename Returns the filename
 func (c *Chunk) GetFilename() string {
 	return c.filename
 }
 
-//GetIndex Returns the index
+// GetIndex Returns the index
 func (c *Chunk) GetIndex() uint64 {
 	return c.index
 }
