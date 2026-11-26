@@ -96,7 +96,7 @@ A Stream holds:
 - Subscriber counts by protocol and traffic statistics;
 - The publisher, lifecycle state, and idle/no-publisher timers.
 
-`SetPublisher()` rejects duplicate publishers; republishing cancels old timers and resets transcoding tracks. A publisher disconnect transitions the stream to `no_publisher`, with cleanup controlled by `no_publisher_timeout`; when there is neither a publisher nor a subscriber, cleanup is controlled by `idle_timeout`.
+`SetPublisher()` rejects duplicate publishers while a stream is already publishing; republishing after a disconnect cancels old timers and resets transcoding tracks. RTMP ingest additionally offers `ReplacePublisher()`, the generation-scoped takeover path: when a second RTMP publisher connects to an already-publishing stream, the incumbent generation is closed and a fresh publisher generation opens atomically under one stream lock, with no observable no-publisher window. The displaced publisher's connection is closed, and any media it still sends is rejected by the publisher-ownership gate (`WriteFrameForPublisher`) rather than advancing the new generation's ring cursor or overwriting the new codec information. A displaced connection's cleanup runs `RemovePublisherIf()`, so it can only detach its own publisher and never removes the replacement generation; publish start/stop lifecycle events stay paired per publisher generation, with each stop reported at most once. A publisher disconnect transitions the stream to `no_publisher`, with cleanup controlled by `no_publisher_timeout`; when there is neither a publisher nor a subscriber, cleanup is controlled by `idle_timeout`.
 
 ### 4.3 AVFrame
 

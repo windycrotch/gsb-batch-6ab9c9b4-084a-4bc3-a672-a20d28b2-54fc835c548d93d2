@@ -324,6 +324,91 @@ func (s *Stream) SetPublisher(pub Publisher) error {
 	}
 
 	s.closeGenerationLocked()
+	s.beginPublisherGenerationLocked(pub)
+
+	return nil
+}
+
+// RemovePublisher detaches the publisher and starts the no-publisher timeout.
+func (s *Stream) RemovePublisher() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removePublisherLocked()
+}
+
+// RemovePublisherIf detaches pub only when it is still the active publisher.
+// It prevents a delayed connection cleanup from removing a replacement.
+func (s *Stream) RemovePublisherIf(pub Publisher) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.publisherMatchesLocked(pub) {
+		return false
+	}
+	s.removePublisherLocked()
+	return true
+}
+
+// ReplacePublisher atomically detaches the incumbent publisher and installs
+// pub as a new publisher generation. It is the generation-safe takeover path
+// used when a second publisher connects to an already-publishing stream:
+// the old generation is closed and the new one starts under the same stream
+// lock, without exposing a no-publisher window in which timers, cleanup, or
+// subscriber admission could observe an unattached stream. The displaced
+// publisher (if any) is returned so the caller can close its connection.
+func (s *Stream) ReplacePublisher(pub Publisher) (Publisher, error) {
+	if isNilPublisher(pub) {
+		return nil, errors.New("publisher is nil")
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.state == StreamStateDestroying {
+		return nil, errors.New("stream is destroying")
+	}
+	publisherID := pub.ID()
+	if _, used := s.usedPublisherIDs[publisherID]; publisherID != "" && used {
+		return nil, fmt.Errorf("publisher ID %q was already used by an earlier generation", publisherID)
+	}
+
+	displaced := s.publisher
+	if displaced != nil {
+		// Close the previous generation but stay in Publishing state; the
+		// replacement immediately reopens a fresh generation below.
+		s.closeGenerationLocked()
+		s.publisher = nil
+	}
+	// Cancel lifecycle timers whether we replaced an active publisher or
+	// re-admitted while a no-publisher/idle countdown was pending.
+	if s.noPublisherTimer != nil {
+		s.noPublisherTimer.Stop()
+		s.noPublisherTimer = nil
+	}
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
+	if s.transcodeManager != nil {
+		s.transcodeManager.Reset()
+	}
+
+	s.beginPublisherGenerationLocked(pub)
+	return displaced, nil
+}
+
+// beginPublisherGenerationLocked opens a fresh publisher generation for pub
+// and resets every per-generation artifact (ring start cursor, GOP cache,
+// sequence headers, media info, startup readiness, generation boundary).
+// Callers must hold writeMu and mu, and must have already closed any
+// previous generation and detached the previous publisher.
+func (s *Stream) beginPublisherGenerationLocked(pub Publisher) {
+	publisherID := pub.ID()
 	s.publisherGeneration++
 	s.generationStartCursor = s.ringBuffer.WriteCursor()
 	s.gopCache = nil
@@ -362,31 +447,6 @@ func (s *Stream) SetPublisher(pub Publisher) error {
 	if publisherID != "" {
 		s.usedPublisherIDs[publisherID] = struct{}{}
 	}
-
-	return nil
-}
-
-// RemovePublisher detaches the publisher and starts the no-publisher timeout.
-func (s *Stream) RemovePublisher() {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.removePublisherLocked()
-}
-
-// RemovePublisherIf detaches pub only when it is still the active publisher.
-// It prevents a delayed connection cleanup from removing a replacement.
-func (s *Stream) RemovePublisherIf(pub Publisher) bool {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.publisherMatchesLocked(pub) {
-		return false
-	}
-	s.removePublisherLocked()
-	return true
 }
 
 func (s *Stream) removePublisherLocked() {

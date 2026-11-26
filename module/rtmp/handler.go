@@ -84,18 +84,21 @@ func (h *Handler) Handle() error {
 }
 
 // cleanup releases the publisher when the connection closes for any reason.
+//
+// Cleanup is generation-scoped: a handler that never completed admission, or
+// that was displaced by a newer publisher generation, must not touch the
+// stream's active publisher or emit a terminal lifecycle event for someone
+// else's generation. publishCleanupOnce additionally makes the whole routine
+// idempotent so repeated close paths report Publish.Stop at most once.
 func (h *Handler) cleanup() {
 	h.publishCleanupOnce.Do(func() {
-		if h.streamKey == "" || !h.isPublisher {
+		if h.streamKey == "" || !h.isPublisher || h.publisher == nil {
 			return
 		}
 		if stream, ok := h.hub.Find(h.streamKey); ok {
 			stream.RemovePublisherIf(h.publisher)
 		}
-		publisherID := ""
-		if h.publisher != nil {
-			publisherID = h.publisher.ID()
-		}
+		publisherID := h.publisher.ID()
 		if err := h.eventBus.EmitAsync(core.EventPublishStop, &core.EventContext{
 			StreamKey:           h.streamKey,
 			StreamInstanceID:    h.streamInstanceID,
@@ -262,7 +265,15 @@ func (h *Handler) onPublish(vals []any) error {
 		_ = h.sendOnStatus("error", "NetStream.Publish.Rejected", err.Error())
 		return fmt.Errorf("publish %s: %w", h.streamKey, err)
 	}
-	if err := stream.SetPublisher(pub); err != nil {
+
+	// Takeover: when another publisher already owns this stream, the new
+	// connection becomes the current generation atomically. The displaced
+	// publisher is detached inside the stream lock; its connection is closed
+	// only after every admission step below succeeds, so a failed replacement
+	// can roll back without orphaning the incumbent.
+	displaced, err := stream.ReplacePublisher(pub)
+	if err != nil {
+		_ = h.sendOnStatus("error", "NetStream.Publish.Rejected", err.Error())
 		return fmt.Errorf("publish %s: %w", h.streamKey, err)
 	}
 	startup := stream.StartupSnapshot()
@@ -277,6 +288,19 @@ func (h *Handler) onPublish(vals []any) error {
 	h.isPublisher = true
 	h.streamInstanceID = startup.StreamInstanceID
 	h.publisherGeneration = startup.Generation
+
+	if displaced != nil {
+		slog.Info("rtmp publisher takeover displaced previous publisher",
+			"module", "rtmp", "stream", h.streamKey,
+			"generation", startup.Generation, "publisher", pub.ID(),
+			"displaced", displaced.ID())
+		// Closing the displaced connection terminates its read loop. Its own
+		// deferred cleanup only removes the publisher it holds, which no longer
+		// matches, so the replacement generation stays attached.
+		if err := displaced.Close(); err != nil {
+			slog.Debug("displaced RTMP publisher close returned error", "module", "rtmp", "stream", h.streamKey, "error", err)
+		}
+	}
 
 	// Send onStatus(NetStream.Publish.Start)
 	return h.sendOnStatus("status", "NetStream.Publish.Start", "Publishing started")
@@ -394,31 +418,43 @@ func (h *Handler) handleMediaMessage(msg *Message) error {
 	}
 
 	if frame != nil {
+		// Generation gate: a publisher that no longer owns the stream (it was
+		// displaced by a newer publish, or detached by cleanup) must not mutate
+		// any codec state and must not advance the new generation's write
+		// cursor. Terminate the stale connection so its read loop exits.
+		if h.publisher == nil || stream.Publisher() != h.publisher {
+			return fmt.Errorf("RTMP publisher no longer owns stream %s", h.streamKey)
+		}
+
 		// Update publisher's MediaInfo when sequence headers arrive.
 		// Copy-on-write: build a new snapshot and publish it atomically so
 		// concurrent readers (RTSP/WebRTC/HTTP subscribers) never observe a
 		// partially updated struct.
 		if frame.FrameType == avframe.FrameTypeSequenceHeader {
-			if rp := h.publisher; rp != nil {
-				mi := *rp.MediaInfo()
-				if frame.MediaType.IsVideo() {
-					mi.VideoCodec = frame.Codec
-					mi.VideoSequenceHeader = append([]byte(nil), frame.Payload...)
-				} else if frame.MediaType.IsAudio() {
-					mi.AudioCodec = frame.Codec
-					mi.AudioSequenceHeader = append([]byte(nil), frame.Payload...)
-					if frame.Codec == avframe.CodecAAC && len(frame.Payload) >= 2 {
-						if ascInfo, err := aac.ParseAudioSpecificConfig(frame.Payload); err == nil {
-							mi.SampleRate = ascInfo.SampleRate
-							mi.Channels = ascInfo.Channels
-						}
+			mi := *h.publisher.MediaInfo()
+			if frame.MediaType.IsVideo() {
+				mi.VideoCodec = frame.Codec
+				mi.VideoSequenceHeader = append([]byte(nil), frame.Payload...)
+			} else if frame.MediaType.IsAudio() {
+				mi.AudioCodec = frame.Codec
+				mi.AudioSequenceHeader = append([]byte(nil), frame.Payload...)
+				if frame.Codec == avframe.CodecAAC && len(frame.Payload) >= 2 {
+					if ascInfo, err := aac.ParseAudioSpecificConfig(frame.Payload); err == nil {
+						mi.SampleRate = ascInfo.SampleRate
+						mi.Channels = ascInfo.Channels
 					}
 				}
-				rp.SetMediaInfo(&mi)
 			}
+			h.publisher.SetMediaInfo(&mi)
 		}
-		if !stream.WriteFrameForPublisher(h.publisher, frame) && stream.Publisher() != h.publisher {
-			return fmt.Errorf("RTMP publisher no longer owns stream %s", h.streamKey)
+		if !stream.WriteFrameForPublisher(h.publisher, frame) {
+			// The frame lost a race with detachment or replacement. Re-check
+			// ownership: a genuine loss of the generation terminates the
+			// connection, while a bitrate-limit rejection for the still-active
+			// publisher simply drops this frame.
+			if stream.Publisher() != h.publisher {
+				return fmt.Errorf("RTMP publisher no longer owns stream %s", h.streamKey)
+			}
 		}
 	}
 	return nil
