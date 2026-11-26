@@ -1,0 +1,264 @@
+package hls
+
+import (
+	"net/url"
+	"strings"
+)
+
+// Filter parses content as an HLS Master Playlist, applies opts, and returns
+// the filtered and transformed playlist serialized back to m3u8 format.
+//
+// Filters compose with AND logic: a variant must pass every active filter to
+// survive. Transformers are applied after filtering, only to surviving variants.
+//
+// Filter is safe for concurrent use.
+func Filter(content string, opts ...Option) (string, error) {
+	p, err := Parse(content)
+	if err != nil {
+		return "", err
+	}
+
+	cfg := &filterConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	// Deep-copy variants so the parsed struct is never mutated (thread safety).
+	variants := make([]Variant, len(p.Variants))
+	copy(variants, p.Variants)
+
+	// Apply filters (AND logic).
+	filtered := variants[:0]
+	for i := range variants {
+		if variantPasses(&variants[i], cfg) {
+			filtered = append(filtered, variants[i])
+		}
+	}
+	if len(filtered) == 0 {
+		return "", ErrNoVariantsRemain
+	}
+
+	// Apply transformers to surviving variants.
+	for i := range filtered {
+		applyTransformers(&filtered[i], cfg)
+		if cfg.subtitleGroupID != "" {
+			filtered[i].SubtitleGroupID = cfg.subtitleGroupID
+		}
+	}
+
+	// Filter I-frame streams with the same codec/resolution/bandwidth rules (F-14).
+	iframes := make([]IFrameStream, len(p.IFrames))
+	copy(iframes, p.IFrames)
+	filteredIFrames := iframes[:0]
+	for i := range iframes {
+		if iframePasses(&iframes[i], cfg) {
+			iframes[i].URI = rewriteURI(iframes[i].URI, cfg)
+			filteredIFrames = append(filteredIFrames, iframes[i])
+		}
+	}
+
+	// Filter audio tracks by language (F-08, F-13) and rewrite their URIs.
+	audioTracks := filterAudioTracks(p.AudioTracks, cfg)
+	for i := range audioTracks {
+		audioTracks[i].URI = rewriteURI(audioTracks[i].URI, cfg)
+	}
+
+	// Copy subtitles and rewrite their URIs (parity with audio tracks).
+	subtitles := make([]MediaTrack, len(p.Subtitles))
+	copy(subtitles, p.Subtitles)
+	for i := range subtitles {
+		subtitles[i].URI = rewriteURI(subtitles[i].URI, cfg)
+	}
+
+	// Inject additional variants, audio tracks, and subtitles. Injected URIs
+	// flow through rewriteURI so absolute-URI / signer transforms apply uniformly.
+	for _, vp := range cfg.injectVariants {
+		v := Variant(vp)
+		v.URI = rewriteURI(v.URI, cfg)
+		filtered = append(filtered, v)
+	}
+	for _, ap := range cfg.injectAudioTracks {
+		audioTracks = append(audioTracks, MediaTrack{
+			Type:       "AUDIO",
+			GroupID:    ap.GroupID,
+			Name:       ap.Name,
+			Language:   ap.Language,
+			URI:        rewriteURI(ap.URI, cfg),
+			Default:    ap.Default,
+			AutoSelect: ap.AutoSelect,
+			Forced:     ap.Forced,
+		})
+	}
+	for _, sp := range cfg.injectSubtitles {
+		subtitles = append(subtitles, MediaTrack{
+			Type:     "SUBTITLES",
+			GroupID:  sp.GroupID,
+			Name:     sp.Name,
+			Language: sp.Language,
+			URI:      rewriteURI(sp.URI, cfg),
+			Default:  sp.Default,
+			Forced:   sp.Forced,
+		})
+	}
+
+	out := &MasterPlaylist{
+		Version:     p.Version,
+		Variants:    filtered,
+		AudioTracks: audioTracks,
+		Subtitles:   subtitles,
+		IFrames:     filteredIFrames,
+		Raw:         p.Raw,
+	}
+	return Serialize(out)
+}
+
+// variantPasses reports whether v satisfies all active filters in cfg.
+func variantPasses(v *Variant, cfg *filterConfig) bool {
+	if cfg.codec != "" && !cfg.codec.MatchesCodec(v.Codecs) {
+		return false
+	}
+	if cfg.maxWidth > 0 && v.Width > cfg.maxWidth {
+		return false
+	}
+	if cfg.maxHeight > 0 && v.Height > cfg.maxHeight {
+		return false
+	}
+	if cfg.minWidth > 0 && v.Width < cfg.minWidth {
+		return false
+	}
+	if cfg.minHeight > 0 && v.Height < cfg.minHeight {
+		return false
+	}
+	if cfg.exactWidth > 0 && v.Width != cfg.exactWidth {
+		return false
+	}
+	if cfg.exactHeight > 0 && v.Height != cfg.exactHeight {
+		return false
+	}
+	if cfg.maxBandwidth > 0 && v.Bandwidth > cfg.maxBandwidth {
+		return false
+	}
+	if cfg.minBandwidth > 0 && v.Bandwidth < cfg.minBandwidth {
+		return false
+	}
+	if cfg.maxFrameRate > 0 && v.FrameRate > cfg.maxFrameRate {
+		return false
+	}
+	if cfg.customFilter != nil && !cfg.customFilter(v) {
+		return false
+	}
+	return true
+}
+
+// iframePasses applies codec, resolution, and bandwidth filters to an I-frame stream (F-14).
+func iframePasses(f *IFrameStream, cfg *filterConfig) bool {
+	if cfg.codec != "" && !cfg.codec.MatchesCodec(f.Codecs) {
+		return false
+	}
+	if cfg.maxWidth > 0 && f.Width > cfg.maxWidth {
+		return false
+	}
+	if cfg.maxHeight > 0 && f.Height > cfg.maxHeight {
+		return false
+	}
+	if cfg.minWidth > 0 && f.Width < cfg.minWidth {
+		return false
+	}
+	if cfg.minHeight > 0 && f.Height < cfg.minHeight {
+		return false
+	}
+	if cfg.exactWidth > 0 && f.Width != cfg.exactWidth {
+		return false
+	}
+	if cfg.exactHeight > 0 && f.Height != cfg.exactHeight {
+		return false
+	}
+	if cfg.maxBandwidth > 0 && f.Bandwidth > cfg.maxBandwidth {
+		return false
+	}
+	if cfg.minBandwidth > 0 && f.Bandwidth < cfg.minBandwidth {
+		return false
+	}
+	return true
+}
+
+// filterAudioTracks returns the audio tracks that pass the language filter.
+// If no language filter is set, all tracks are preserved (F-13).
+// After filtering, each surviving track's Name is overwritten according to
+// cfg.audioLabelByLang when its Language matches (case-insensitive).
+func filterAudioTracks(tracks []MediaTrack, cfg *filterConfig) []MediaTrack {
+	if cfg.clearAudio {
+		return nil
+	}
+	var out []MediaTrack
+	if cfg.audioLanguage == "" {
+		out = append(out, tracks...)
+	} else {
+		out = tracks[:0:0]
+		for _, t := range tracks {
+			if strings.EqualFold(t.Language, cfg.audioLanguage) {
+				out = append(out, t)
+			}
+		}
+	}
+	if len(cfg.audioLabelByLang) > 0 {
+		for i := range out {
+			if out[i].Language == "" {
+				continue
+			}
+			if name, ok := cfg.audioLabelByLang[strings.ToLower(out[i].Language)]; ok {
+				out[i].Name = name
+			}
+		}
+	}
+	return out
+}
+
+// applyTransformers rewrites the URI of a surviving variant according to cfg.
+// Order: absolute URIs → CDN rewrite → auth token (T-01 → T-02 → T-03).
+// Custom transformer runs last (T-04, T-06).
+func applyTransformers(v *Variant, cfg *filterConfig) {
+	v.URI = rewriteURI(v.URI, cfg)
+	if cfg.customTransform != nil {
+		cfg.customTransform(v)
+	}
+}
+
+// rewriteURI applies the active URI transformers to a single URI string.
+// It parses the URI only once for efficiency.
+func rewriteURI(uri string, cfg *filterConfig) string {
+	if cfg.absoluteOrigin == "" && cfg.cdnBaseURL == "" && cfg.authToken == "" && cfg.uriSigner == nil {
+		return uri
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	if cfg.absoluteOrigin != "" && !u.IsAbs() {
+		origin := cfg.absoluteOrigin
+		if !strings.HasSuffix(origin, "/") {
+			origin += "/"
+		}
+		base, err := url.Parse(origin)
+		if err == nil {
+			u = base.ResolveReference(u)
+		}
+	}
+	if cfg.cdnBaseURL != "" && u.IsAbs() {
+		c, err := url.Parse(cfg.cdnBaseURL)
+		if err == nil {
+			u.Scheme = c.Scheme
+			u.Host = c.Host
+		}
+	}
+	if cfg.authToken != "" {
+		q := u.Query()
+		q.Set("token", cfg.authToken)
+		u.RawQuery = q.Encode()
+	}
+	result := u.String()
+	if cfg.uriSigner != nil && u.IsAbs() {
+		result = cfg.uriSigner(result)
+	}
+	return result
+}
