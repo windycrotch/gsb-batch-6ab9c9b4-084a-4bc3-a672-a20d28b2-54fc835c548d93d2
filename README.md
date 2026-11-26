@@ -559,6 +559,7 @@ instead, so it can be asked for continuation frames at any point.
 
 ```go
 ext, _ := encode.NewPSkipExtenderFromDecConfRec(avcC) // or NewPSkipExtender(sps, pps)
+defer ext.Close()                                     // ends the session; idempotent
 
 for _, au := range accessUnits {                 // every real access unit
     _ = ext.ObserveAVCCSample(au)                // or ObserveAnnexB / ObserveNALU
@@ -571,15 +572,31 @@ The generated slices are reference pictures that freeze the last decoded
 picture, a few dozen bytes each, so holding an RTMP or SRT contribution
 open through a source outage costs on the order of 10 kbit/s.
 
+Numbering is self-consistent across calls: each batch continues frame\_num
+(over reference pictures only) and the picture order count (from the
+highest value seen) where the previous one ended, both wrapping at the
+SPS-defined width. `NextSlices` is all-or-nothing — if any frame cannot be
+generated, the session's numbering is restored.
+
+A session is a long-lived object. `Close` ends it: afterwards `NextSlice`,
+`NextSlices` and the `Observe*` methods return `ErrSessionClosed` and
+produce no bytes, while the read-only accessors keep working. `Close` may
+be called repeatedly. All methods take one lock, so an ingest goroutine
+and a send goroutine may share a session without a data race.
+
 Two things stay with the caller:
 
 - **Timing.** Place the first generated frame after the highest
   presentation time the source reached, not merely after its last decode
   time. With B frames those differ by the reorder delay, and a frame
   placed between them is displayed out of order.
-- **Resuming.** Real video must resume at an IDR. The generated frames
-  advance frame\_num and the picture order count past what the source
-  encoder will emit next, and only an IDR resets both.
+- **Resuming.** Real video must resume at an IDR. An observed IDR is a new
+  baseline: the numbering restarts from it, and filler generated after it
+  does not continue the discarded numbering. A non-IDR access unit that
+  reuses a frame\_num or pic\_order\_cnt\_lsb already spent on filler is
+  refused with an error wrapping `ErrNumberingConflict`, since a decoder
+  could not tell it apart from the filler; such a source has to be
+  restarted through a new session.
 
 `PSkipExtender` and `AppendPSkipFrames` share this logic, so both handle a
 source containing B frames. It matters when extending a stream that was

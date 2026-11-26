@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `encode.PSkipExtender.Close` ends a continuation session: afterwards `NextSlice`,
+  `NextSlices` and the `Observe*` methods return `ErrSessionClosed` and produce no bytes,
+  while the read-only accessors keep reporting the final state. `Close` is idempotent.
+- `encode.PSkipExtender` may be shared between concurrent goroutines; every method takes one
+  lock, and `NextSlices` is all-or-nothing so a failed batch consumes no numbering.
+- `encode.ErrNumberingConflict`: a non-IDR access unit that reuses a frame\_num or
+  pic\_order\_cnt\_lsb already spent on generated filler is refused with a readable error
+  rather than silently accepted. An observed IDR is always accepted as a new baseline, and
+  filler generated after it starts from that IDR's numbering.
+
 ## [0.12.3] - 2026-11-17
 
 ### Changed

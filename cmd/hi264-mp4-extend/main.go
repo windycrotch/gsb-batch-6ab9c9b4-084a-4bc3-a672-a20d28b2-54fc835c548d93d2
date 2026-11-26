@@ -110,6 +110,7 @@ func extendSegment(initPath, inSegPath, outSegPath string, count uint32, blackID
 	if err != nil {
 		return fmt.Errorf("prepare extension: %w", err)
 	}
+	defer ext.Close()
 	// Every parameter set in the init segment, so that slices referencing any of them parse.
 	for _, nalu := range parameterSets(trak) {
 		if err := ext.ObserveNALU(nalu); err != nil {
