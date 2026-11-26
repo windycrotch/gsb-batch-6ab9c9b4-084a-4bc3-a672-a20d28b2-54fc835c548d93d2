@@ -103,7 +103,7 @@ func ExampleT() {
 	tr.Inv(w)
 }
 
-func ExampleT_Spike() {
+func ExampleT_spike() {
 	var d = []complex128{
 		0i, 0i, 0i, 0i, 0i, 0i, 0i, (1 + 0i),
 		0i, 0i, 0i, 0i, 0i, 0i, 0i, 0i}

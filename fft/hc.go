@@ -84,9 +84,13 @@ func (h HalfComplex) SetImag(i int, v float64) {
 }
 
 // Len returns the number of complex numbers in h, which does not
-// include elements with symmetric pairs.
+// include elements with symmetric pairs.  An empty HalfComplex
+// has Len 0.
 func (h HalfComplex) Len() int {
 	n := len(h)
+	if n == 0 {
+		return 0
+	}
 	return n/2 + 1
 }
 

@@ -4,6 +4,7 @@
 package fft
 
 import (
+	"fmt"
 	"math"
 	"math/cmplx"
 )
@@ -50,12 +51,17 @@ func NewReal(n int) *Real {
 // Do performs a DFT on real data in d.
 //
 // d must be the size specified in the call to NewReal()
-// which created r, or Do will panic.
+// which created r, or Do will panic.  The length is checked
+// before any state is touched, so after such a panic both
+// d and r are left as they were before the call.
 //
 // Do operates in place, overwriting d.  Do returns
 // d overwritten as (i.e. cast to) a HalfComplex object.
 //
 func (r *Real) Do(d []float64) HalfComplex {
+	if len(d) != r.n {
+		panic(fmt.Sprintf("fft: Real.Do got length %d, expected %d", len(d), r.n))
+	}
 	if r.n&1 == 0 {
 		return r.evenDo(d)
 	}
@@ -88,9 +94,17 @@ func (r *Real) oddDo(d []float64) HalfComplex {
 // Inv computes the inverse transform of a real data
 // from a HalfComplex object.
 //
+// hc must be the size specified in the call to NewReal()
+// which created r, or Inv will panic.  The length is checked
+// before any state is touched, so after such a panic both
+// hc and r are left as they were before the call.
+//
 // Inv operates in place but returns the same data as hc, cast to
 // a []float64.
 func (r *Real) Inv(hc HalfComplex) []float64 {
+	if len(hc) != r.n {
+		panic(fmt.Sprintf("fft: Real.Inv got length %d, expected %d", len(hc), r.n))
+	}
 	if r.n&1 == 0 {
 		return r.evenInv(hc)
 	}
