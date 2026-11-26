@@ -158,17 +158,19 @@ func (s *Server) Join(c *Client) {
 		c.State = playerstate.Dead
 		s.Spawn(c)
 		s.GameMode.Join(&c.Player) // may set client's team
+		s.Clock.Join(&c.Player)    // a (re)joining player starts a new session for the game clock
 	}
 
 	s.SendWelcome(c) // tells client about her team
 	s.Clients.InformOthersOfJoin(c)
 
 	sessionID := c.SessionID
+	uniqueName := s.Clients.UniqueName(c)
+	ip := c.Peer.Address.IP
 	go func() {
-		uniqueName := s.Clients.UniqueName(c)
-		log.Println(cubecode.SanitizeString(fmt.Sprintf("%s (%s) connected", uniqueName, c.Peer.Address.IP)))
+		log.Println(cubecode.SanitizeString(fmt.Sprintf("%s (%s) connected", uniqueName, ip)))
 
-		country := geoip.Country(c.Peer.Address.IP) // slow!
+		country := geoip.Country(ip) // slow!
 		s.callbacks <- func() {
 			if c.SessionID != sessionID {
 				return
@@ -212,15 +214,28 @@ func (s *Server) ConfirmSpawn(client *Client, lifeSequence, _weapon int32) {
 }
 
 func (s *Server) Disconnect(client *Client, reason disconnectreason.ID) {
-	if client.State != playerstate.Spectator {
+	if client.Peer == nil {
+		// late or duplicate disconnect event for a client who is already gone
+		return
+	}
+
+	// only players who actually joined take part in the game; clients who
+	// never joined must not affect the game state when they leave
+	wasPlaying := client.Joined && client.State != playerstate.Spectator
+	if wasPlaying {
 		s.GameMode.Leave(&client.Player)
-		s.Clock.Leave(&client.Player)
 	}
 	s.relay.RemoveClient(client.CN)
 	s.Clients.Disconnect(client, reason)
 	// s.Clients.ForEach(func(c *Client) { log.Printf("%#v\n", c) })
 	s.host.Disconnect(client.Peer, reason)
 	client.Reset()
+	if wasPlaying {
+		// inform the game clock only after the client is completely gone, so
+		// the resulting (automatic) pause only applies to – and is only
+		// announced to – the players still in the game
+		s.Clock.Leave(&client.Player)
+	}
 	if len(s.Clients.PrivilegedUsers()) == 0 {
 		s.Unsupervised()
 	}
@@ -270,6 +285,12 @@ func (s *Server) Empty() {
 
 func (s *Server) Intermission() {
 	s.Clock.Stop()
+
+	// make sure there is at most one pending map change at any time
+	if s.PendingMapChange != nil {
+		s.PendingMapChange.Stop()
+		s.PendingMapChange = nil
+	}
 
 	nextMap := s.MapRotation.NextMap(s.GameMode, s.GameMode, s.Map)
 
