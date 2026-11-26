@@ -369,8 +369,29 @@ Fetches and filters an upstream manifest.
 | `cdn` | no | CDN base URL |
 | `token` | no | Auth token string |
 | `lang` | no | BCP-47 audio language |
+| `origin` | no | Base URL used to resolve relative URIs (defaults to the upstream manifest's directory) |
+| `inject_audio` | no | Base64-encoded JSON array of audio tracks to inject (see below) |
+| `inject_subtitle` | no | Base64-encoded JSON array of subtitle tracks to inject (see below) |
 
-**Responses:** `200 OK`, `400 Bad Request`, `422 Unprocessable Entity`, `502 Bad Gateway`
+**Responses:** `200 OK`, `400 Bad Request` (unknown/illegal parameters, including malformed or
+field-invalid `inject_*` payloads), `422 Unprocessable Entity` (no variants survive filtering —
+injected tracks never count as surviving variants), `502 Bad Gateway`
+
+Each inject entry carries HLS fields (`group_id`, `name`, `lang`/`language`, `uri`, …), DASH fields
+(`mime_type`, `content_type`, `representations` with `id` / `bandwidth` / `base_url`, optional
+`roles`), or both. Injected tracks go through the same absolute-URI resolution, CDN rewrite, and
+per-address signing pipeline as origin tracks, and every address is signed exactly once. When a
+`server.Config.URISigner` callback is supplied, it is applied to every absolute URI in the response
+— HLS variant/audio/subtitle/I-frame URIs and DASH `<BaseURL>` elements, origin and injected alike:
+
+```go
+srv := server.New(server.Config{
+    Addr: ":8080",
+    URISigner: func(absoluteURL string) string {
+        return signWithCloudFront(absoluteURL, keyPair)
+    },
+})
+```
 
 ### `POST /build`
 

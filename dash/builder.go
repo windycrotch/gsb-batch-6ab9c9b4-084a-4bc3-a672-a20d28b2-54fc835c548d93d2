@@ -138,6 +138,14 @@ func convertAdaptationSetParams(p AdaptationSetParams) AdaptationSet {
 	return as
 }
 
+// IsValidBCP47 reports whether lang looks like a BCP-47 language tag. It
+// accepts tags of the form "ll", "ll-RR", "ll-Ssss", "ll-Ssss-RR", etc.,
+// where subtags are 1–8 alphanumeric characters separated by hyphens.
+// An empty string is not a valid tag.
+func IsValidBCP47(lang string) bool {
+	return isValidBCP47(lang)
+}
+
 // isValidBCP47 performs a lightweight check that lang looks like a BCP-47 tag.
 // It accepts tags of the form "ll", "ll-RR", "ll-Ssss", "ll-Ssss-RR", etc.
 // where subtags are 2–8 alphanumeric characters separated by hyphens.

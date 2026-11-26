@@ -9,7 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- **DASH injected `AdaptationSet` transforms.** Injected representations now flow through the same `applyTransformers` pipeline as origin representations: relative `BaseURL`s are resolved to absolute URIs, CDN host rewrite and auth token are applied, and the URI signer runs exactly once per absolute `BaseURL`. Previously the inject block only called the signer on already-absolute URLs, so injected tracks with relative `BaseURL`s were emitted verbatim — never resolved, CDN-rewritten, tokenized, or signed. The bespoke inject-only signer path was removed, eliminating any possibility of an injected URL being signed through a different code path than an origin URL.
+- **HLS injected variants inherit the active subtitle group.** When `WithVariantSubtitleGroup` is set, injected variants now get the same `SUBTITLES` group as surviving variants, so an injected subtitle group cannot be orphaned by a variant injected in the same request.
+- **`/filter` inject parameter validation.** Malformed `inject_audio` / `inject_subtitle` payloads (non-array JSON, missing `group_id`/`name`/`uri`, missing or invalid DASH `representations` — empty `id`, non-positive `bandwidth`, missing `base_url` — or a malformed BCP-47 `lang`) now fail with an explicit `400 Bad Request` instead of being silently dropped into a `200` response or surfacing as a `502`.
+- **422 semantics preserved under injection.** Injected HLS media tracks and DASH `AdaptationSet`s never count as surviving variants; a filter that removes every origin variant/representation still returns `ErrNoVariantsRemain` (HTTP 422) even when injection parameters are present.
+
+### Added
+
+- **`server.Config.URISigner`.** The HTTP proxy now accepts an optional per-URI signing callback wired into every `/filter` response. It is applied to all HLS URIs (variants, audio, subtitles, I-frames) and DASH `BaseURL`s — origin and injected, on both formats — with each address signed exactly once.
+- **`dash.IsValidBCP47`** exported so callers (including the server's inject validation) can reuse the builder's BCP-47 language-tag check.
+- **`roles` field on the inject JSON schema**, mapping injected DASH subtitle/audio tracks to `<Role>` elements (`scheme_id_uri`, `value`).
+- Cross-state test coverage: injected-track transform/sign parity on HLS and DASH, sign-once guarantees with a counting signer, injected `AdaptationSet` present in every `Period`, 400 validation matrix, 422-under-injection, and concurrent same-upstream/different-injection isolation plus byte-identical determinism (run under `-race`).
 
 ---
 

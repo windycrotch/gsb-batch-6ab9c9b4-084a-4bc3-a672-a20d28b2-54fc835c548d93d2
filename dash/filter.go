@@ -53,21 +53,20 @@ func Filter(content string, opts ...Option) (string, error) {
 		return "", ErrNoVariantsRemain
 	}
 
-	// Inject additional AdaptationSets into every Period.
-	if len(cfg.injectSets) > 0 {
-		for pi := range periods {
-			for _, sp := range cfg.injectSets {
-				as := convertAdaptationSetParams(sp)
-				if cfg.uriSigner != nil {
-					for ri := range as.Representations {
-						bu := as.Representations[ri].BaseURL
-						if u, err := url.Parse(bu); err == nil && u.IsAbs() {
-							as.Representations[ri].BaseURL = cfg.uriSigner(bu)
-						}
-					}
-				}
-				periods[pi].AdaptationSets = append(periods[pi].AdaptationSets, as)
+	// Inject additional AdaptationSets into every Period. Each injected set is
+	// built fresh from its params (no aliasing of caller-owned slices) and its
+	// representations flow through applyTransformers, the exact same pipeline
+	// used for origin representations: absolute URI resolution, CDN rewrite,
+	// auth token, and a single signer invocation per absolute BaseURL.
+	// Injected AdaptationSets never count toward ErrNoVariantsRemain: the
+	// empty-result check runs before this block.
+	for pi := range periods {
+		for _, sp := range cfg.injectSets {
+			as := convertAdaptationSetParams(sp)
+			for ri := range as.Representations {
+				applyTransformers(&as.Representations[ri], cfg)
 			}
+			periods[pi].AdaptationSets = append(periods[pi].AdaptationSets, as)
 		}
 	}
 

@@ -71,10 +71,17 @@ func Filter(content string, opts ...Option) (string, error) {
 	}
 
 	// Inject additional variants, audio tracks, and subtitles. Injected URIs
-	// flow through rewriteURI so absolute-URI / signer transforms apply uniformly.
+	// flow through rewriteURI so absolute-URI / CDN / token / signer transforms
+	// apply uniformly, and every URI is rewritten exactly once.
 	for _, vp := range cfg.injectVariants {
 		v := Variant(vp)
 		v.URI = rewriteURI(v.URI, cfg)
+		// Wire injected variants to the same subtitle group as surviving ones,
+		// so an injected subtitle group is not orphaned when new variants are
+		// appended by the same request.
+		if cfg.subtitleGroupID != "" && v.SubtitleGroupID == "" {
+			v.SubtitleGroupID = cfg.subtitleGroupID
+		}
 		filtered = append(filtered, v)
 	}
 	for _, ap := range cfg.injectAudioTracks {

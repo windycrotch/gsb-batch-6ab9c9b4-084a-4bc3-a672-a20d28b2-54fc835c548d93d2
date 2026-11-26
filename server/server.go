@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,13 +26,19 @@ type Config struct {
 	// FetchTimeout is the timeout for fetching upstream manifests.
 	// Defaults to 10 seconds.
 	FetchTimeout time.Duration
+	// URISigner, when non-nil, is applied to every absolute URI emitted by
+	// /filter — origin and injected tracks alike, on both HLS and DASH.
+	// Each URI is signed exactly once; relative URIs are resolved against the
+	// origin (or the derived upstream origin) before the signer runs.
+	URISigner manifest.URISigner
 }
 
 // Server is the HTTP proxy server.
 type Server struct {
-	cfg    Config
-	mux    *http.ServeMux
-	client *http.Client
+	cfg       Config
+	mux       *http.ServeMux
+	client    *http.Client
+	uriSigner manifest.URISigner
 }
 
 // New creates a new Server with the given configuration.
@@ -40,9 +47,10 @@ func New(cfg Config) *Server {
 		cfg.FetchTimeout = 10 * time.Second
 	}
 	s := &Server{
-		cfg:    cfg,
-		mux:    http.NewServeMux(),
-		client: &http.Client{Timeout: cfg.FetchTimeout},
+		cfg:       cfg,
+		mux:       http.NewServeMux(),
+		client:    &http.Client{Timeout: cfg.FetchTimeout},
+		uriSigner: cfg.URISigner,
 	}
 	s.routes()
 	return s
@@ -139,6 +147,13 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The signer applies to every emitted absolute URI — origin and injected,
+	// HLS and DASH. The library guarantees each URI reaches the signer at most
+	// once, so a URL is never signed twice.
+	if s.uriSigner != nil {
+		opts = append(opts, manifest.WithURISigner(s.uriSigner))
+	}
+
 	if raw := q.Get("inject_audio"); raw != "" {
 		tracks, err := decodeInjectTracks(raw)
 		if err != nil {
@@ -146,6 +161,10 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, t := range tracks {
+			if err := validateInjectTrack(t, false); err != nil {
+				http.Error(w, "invalid inject_audio: "+err.Error(), http.StatusBadRequest)
+				return
+			}
 			opts = append(opts, injectTrackToOptions(t, false)...)
 		}
 	}
@@ -156,6 +175,10 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, t := range tracks {
+			if err := validateInjectTrack(t, true); err != nil {
+				http.Error(w, "invalid inject_subtitle: "+err.Error(), http.StatusBadRequest)
+				return
+			}
 			opts = append(opts, injectTrackToOptions(t, true)...)
 			// Wire the subtitle group to all surviving HLS variants.
 			if t.GroupID != "" {
@@ -477,7 +500,7 @@ func decodeInjectTracks(raw string) ([]injectTrackJSON, error) {
 }
 
 // injectTrackJSON is the unified schema for inject_audio / inject_subtitle query params.
-// DASH fields: mime_type, content_type, lang, name, representations.
+// DASH fields: mime_type, content_type, lang, name, representations, roles.
 // HLS fields:  group_id, language, name, uri, default, auto_select, forced.
 type injectTrackJSON struct {
 	// Shared
@@ -487,6 +510,7 @@ type injectTrackJSON struct {
 	MimeType        string               `json:"mime_type"`
 	ContentType     string               `json:"content_type"`
 	Representations []representationJSON `json:"representations"`
+	Roles           []roleJSON           `json:"roles"`
 	// HLS
 	GroupID    string `json:"group_id"`
 	Language   string `json:"language"` // alias for Lang in HLS context
@@ -494,6 +518,67 @@ type injectTrackJSON struct {
 	Default    bool   `json:"default"`
 	AutoSelect bool   `json:"auto_select"`
 	Forced     bool   `json:"forced"`
+}
+
+// roleJSON is the JSON schema for a DASH <Role> element on an injected
+// AdaptationSet (M-04).
+type roleJSON struct {
+	SchemeIDURI string `json:"scheme_id_uri"`
+	Value       string `json:"value"`
+}
+
+// validateInjectTrack verifies that an inject_audio / inject_subtitle entry
+// carries at least one well-formed HLS or DASH payload and that every field
+// referenced by that payload is legal. A returned error makes the handler
+// respond 400 instead of silently dropping the track or emitting a broken
+// manifest. isSubtitle distinguishes inject_subtitle from inject_audio.
+func validateInjectTrack(t injectTrackJSON, isSubtitle bool) error {
+	lang := t.Lang
+	if lang == "" {
+		lang = t.Language
+	}
+	if lang != "" && !dash.IsValidBCP47(lang) {
+		return fmt.Errorf("lang %q is not a valid BCP-47 language tag", lang)
+	}
+
+	hasHLS := t.URI != "" || t.GroupID != ""
+	hasDASH := t.MimeType != "" || len(t.Representations) > 0
+	if !hasHLS && !hasDASH {
+		return errors.New("track must carry HLS fields (uri/group_id) or DASH fields (mime_type/representations)")
+	}
+
+	if hasHLS {
+		if t.GroupID == "" {
+			return errors.New("HLS track is missing group_id")
+		}
+		if t.Name == "" {
+			return errors.New("HLS track is missing name")
+		}
+		if isSubtitle && t.URI == "" {
+			return errors.New("HLS subtitle track is missing uri")
+		}
+	}
+
+	if hasDASH {
+		if t.MimeType == "" {
+			return errors.New("DASH AdaptationSet is missing mime_type")
+		}
+		if len(t.Representations) == 0 {
+			return errors.New("DASH AdaptationSet requires at least one representation")
+		}
+		for _, r := range t.Representations {
+			if r.ID == "" {
+				return errors.New("DASH representation is missing id")
+			}
+			if r.Bandwidth <= 0 {
+				return fmt.Errorf("DASH representation %q has invalid bandwidth %d", r.ID, r.Bandwidth)
+			}
+			if r.BaseURL == "" {
+				return fmt.Errorf("DASH representation %q is missing base_url", r.ID)
+			}
+		}
+	}
+	return nil
 }
 
 // injectTrackToOptions converts an injectTrackJSON to the appropriate manifest options.
@@ -513,6 +598,12 @@ func injectTrackToOptions(t injectTrackJSON, isSubtitle bool) []manifest.Option 
 			ContentType: t.ContentType,
 			Lang:        lang,
 			Name:        t.Name,
+		}
+		for _, role := range t.Roles {
+			asp.Roles = append(asp.Roles, dash.Role{
+				SchemeIDURI: role.SchemeIDURI,
+				Value:       role.Value,
+			})
 		}
 		if isSubtitle && asp.ContentType == "" {
 			asp.ContentType = "text"
