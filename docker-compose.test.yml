@@ -1,0 +1,24 @@
+# Isolated real PostgreSQL for the upload-consistency automated tests.
+# The Go test suite applies database/migrations/*.up.sql itself and refuses to
+# reset a database whose name does not contain "test".
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   TEST_DATABASE_DSN="postgres://dekho:dekho@127.0.0.1:5433/dekho_test?sslmode=disable" \
+#     go test -race ./...
+services:
+  dekho-test-postgres:
+    image: postgres:17-alpine
+    container_name: dekho-test-postgres
+    environment:
+      POSTGRES_USER: dekho
+      POSTGRES_PASSWORD: dekho
+      POSTGRES_DB: dekho_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dekho -d dekho_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

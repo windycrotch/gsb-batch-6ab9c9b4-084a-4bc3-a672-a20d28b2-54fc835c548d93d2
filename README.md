@@ -64,6 +64,17 @@ Appwrite S3 object keys use `raw_files/<videoID><extension>`, `hls_chunks/<video
 
 ![Architecture Diagram](documentation/static/dekho-architecture.excalidraw.png)
 
+## Upload finalization consistency & tests
+
+The complete / abort / abandoned-cleanup entries share one per-video PostgreSQL advisory lock and reconcile object-storage state before any destructive action, so concurrent completion-vs-abort/cleanup and post-merge failures converge without orphaned objects, deleted merges, duplicate merges, or list flashback. Semantics, the A1–A8 scenario mapping, and how storage call sequences are verified without cloud credentials are documented in [`documentation/upload-finalization-consistency.md`](documentation/upload-finalization-consistency.md).
+
+Run the automated timing suite against a real, Dockerized PostgreSQL (object storage is an in-memory/S3-XML fake — no cloud credentials):
+
+```bash
+scripts/test-upload-consistency.sh
+# or: docker compose -f docker-compose.test.yml up -d --wait && go test -race ./...
+```
+
 ## Key Resources
 
 Our journey has been greatly enriched by the insights and guidance from various resources. A pivotal article that set us on the right path is "[Learning the basics of video streaming with Golang](https://www.rohitmundra.com/video-streaming-server)" by [Rohit Mundra](https://twitter.com/brohit3).

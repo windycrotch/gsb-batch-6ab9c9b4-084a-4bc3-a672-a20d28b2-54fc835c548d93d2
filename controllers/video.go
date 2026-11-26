@@ -64,7 +64,7 @@ func GetVideos(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	for rows.Next() {
 		var id string
 		var title string
-		var description string
+		var description sql.NullString
 		var thumbnail sql.NullString
 		var status VideoStatus
 
@@ -84,7 +84,7 @@ func GetVideos(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		record := VideoResponseType{
 			ID:          id,
 			Title:       title,
-			Description: description,
+			Description: description.String,
 			Thumbnail:   thumbValue,
 			Status:      status,
 		}
