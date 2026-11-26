@@ -61,6 +61,21 @@ type FfmpegTranscoderEngine struct {
 	_finalOutputVideoFiles      *[]data.File
 }
 
+// _resetTaskState clear per-task pointers before a newly dequeued item is
+// processed so a failed early preparation of the current task cannot observe
+// or remove another task's handles. The worker struct itself is long lived.
+func (fte *FfmpegTranscoderEngine) _resetTaskState() {
+	fte._taskPayload = nil
+	fte._inputVideoInformation = nil
+	fte._temporaryWorkingPath = ""
+	fte._temporaryInputVideoFile = nil
+	fte._temporaryProcessingLogFile = nil
+	fte._temporaryOutputVideoFiles = nil
+	fte._sourceInputVideoFile = nil
+	fte._finalProcessingLogFile = nil
+	fte._finalOutputVideoFiles = nil
+}
+
 //go:embed handlers/*
 var handlersFS embed.FS
 
@@ -100,6 +115,10 @@ func (fte *FfmpegTranscoderEngine) StarTranscoderEngine(ctx context.Context) {
 				)
 				continue
 			}
+
+			// Drop any state left from the previous task before processing.
+			fte._resetTaskState()
+			fte._queueable = &queueableItem
 
 			fte.Logger.Success(
 				"ffmpeg_transcoder_engine",
@@ -284,7 +303,10 @@ func (fte *FfmpegTranscoderEngine) _prepareTemporaryWorkingPath() error {
 
 	fte._temporaryWorkingPath = fte.Config.GetString("Filesystem.LocalStorage.Folders.TemporaryWorkingPath")
 
-	if err := os.MkdirAll(filepath.Dir(fte._temporaryWorkingPath), os.ModePerm); err != nil {
+	// Create the working directory itself (MkdirAll also accepts an already
+	// existing path). Creating the path rather than only its parent keeps this
+	// correct regardless of a trailing path separator.
+	if err := os.MkdirAll(fte._temporaryWorkingPath, os.ModePerm); err != nil {
 		return err
 	}
 
@@ -635,6 +657,14 @@ func (fte *FfmpegTranscoderEngine) _readInputVideoInformation() error {
 // or this func should re-write to take new file system without change source code.
 func (fte *FfmpegTranscoderEngine) _moveTranscoderOutputVideos() error {
 
+	if fte._temporaryOutputVideoFiles == nil {
+		return errors.New("temporary output video files are not prepared")
+	}
+
+	if fte.FileSystem == nil {
+		return errors.New("file system is not configured")
+	}
+
 	fte.Logger.Info(
 		"ffmpeg_transcoder_engine.move_transcoder_output_videos",
 		"moving temporary output videos to main file system",
@@ -726,6 +756,15 @@ func (fte *FfmpegTranscoderEngine) _moveTranscoderOutputVideos() error {
 // [IMPORTANT] If there is new file system add this method should be modified
 // or this func should re-write to take new file system without change source code.
 func (fte *FfmpegTranscoderEngine) _moveTranscoderProcessingLog() error {
+
+	if fte._temporaryProcessingLogFile == nil {
+		return errors.New("temporary processing log file is not prepared")
+	}
+
+	if fte.FileSystem == nil {
+		return errors.New("file system is not configured")
+	}
+
 	fte.Logger.Info(
 		"ffmpeg_transcoder_engine.move_transcoder_processing_log",
 		"move video transcoder processing logs main file system",
@@ -770,9 +809,16 @@ func (fte *FfmpegTranscoderEngine) _moveTranscoderProcessingLog() error {
 		)
 	}
 
+	taskID := ""
+	if fte._taskPayload != nil {
+		taskID = fte._taskPayload.ID
+	} else if fte._queueable != nil {
+		taskID = fte._queueable.ID
+	}
+
 	fte._finalProcessingLogFile = &data.File{
 		FileMeta: map[string]interface{}{
-			"task_id": fte._taskPayload.ID,
+			"task_id": taskID,
 		},
 		FileName: fte._temporaryProcessingLogFile.FileName,
 		FilePath: transcoderProcessingLogsPath,
@@ -795,68 +841,94 @@ func (fte *FfmpegTranscoderEngine) _moveTranscoderProcessingLog() error {
 	)
 }
 
-// _cleanAndPrepareForNextTask clean up after finish transcoding
+// _cleanAndPrepareForNextTask clean up after finish transcoding.
+//
+// It is safe to call at any point of a task's lifecycle (including after an
+// early preparation failure or more than once): every handle is nil checked
+// and removing a missing path is a no-op. Besides the individual temporary
+// input/log/output files it removes the whole temporary working directory, so
+// no task artifacts survive a success or terminal failure.
 func (fte *FfmpegTranscoderEngine) _cleanAndPrepareForNextTask() {
 
-	// remove temporary input video file
-	_ = os.RemoveAll(fte._temporaryInputVideoFile.FullPath())
-
-	fte.Logger.Debug(
-		"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
-		"remove temporary input video file",
-		map[string]interface{}{
-			"task_id":                    fte._queueable.ID,
-			"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
-			"temporary_input_video_file": fte._temporaryInputVideoFile.FullPath(),
-		},
-	)
-
-	// remove temporary video transcoder processing log file
-	_ = os.RemoveAll(fte._temporaryProcessingLogFile.FullPath())
-
-	fte.Logger.Debug(
-		"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
-		"remove temporary input video file",
-		map[string]interface{}{
-			"task_id":                       fte._queueable.ID,
-			"video_transcoder_worker_id":    fte._videoTranscoderWorkerID,
-			"temporary_processing_log_file": fte._temporaryProcessingLogFile.FullPath(),
-		},
-	)
-
-	// remove temporary video output files
-	for _, temporaryOutputVideoFile := range *fte._temporaryOutputVideoFiles {
-		_ = os.RemoveAll(temporaryOutputVideoFile.FullPath())
+	if fte == nil {
+		return
 	}
 
-	fte.Logger.Debug(
-		"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
-		"remove temporary video output files",
-		map[string]interface{}{
-			"task_id":                      fte._queueable.ID,
-			"video_transcoder_worker_id":   fte._videoTranscoderWorkerID,
-			"temporary_video_output_files": fte._temporaryOutputVideoFiles,
-		},
-	)
+	taskID := ""
+	if fte._queueable != nil {
+		taskID = fte._queueable.ID
+	}
 
-	// remove temporary transcoding working space
-	_ = os.RemoveAll(fte._temporaryWorkingPath)
+	// remove temporary input video file
+	if fte._temporaryInputVideoFile != nil {
+		inputPath := fte._temporaryInputVideoFile.FullPath()
+		_ = os.RemoveAll(inputPath)
 
-	fte.Logger.Debug(
-		"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
-		"remove temporary transcoding working space",
-		map[string]interface{}{
-			"task_id":                      fte._queueable.ID,
-			"video_transcoder_worker_id":   fte._videoTranscoderWorkerID,
-			"temporary_video_output_files": fte._temporaryWorkingPath,
-		},
-	)
+		fte.Logger.Debug(
+			"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
+			"remove temporary input video file",
+			map[string]interface{}{
+				"task_id":                    taskID,
+				"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
+				"temporary_input_video_file": inputPath,
+			},
+		)
+	}
+
+	// remove temporary video transcoder processing log file
+	if fte._temporaryProcessingLogFile != nil {
+		logPath := fte._temporaryProcessingLogFile.FullPath()
+		_ = os.RemoveAll(logPath)
+
+		fte.Logger.Debug(
+			"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
+			"remove temporary processing log file",
+			map[string]interface{}{
+				"task_id":                       taskID,
+				"video_transcoder_worker_id":    fte._videoTranscoderWorkerID,
+				"temporary_processing_log_file": logPath,
+			},
+		)
+	}
+
+	// remove temporary video output files
+	if fte._temporaryOutputVideoFiles != nil {
+		for _, temporaryOutputVideoFile := range *fte._temporaryOutputVideoFiles {
+			_ = os.RemoveAll(temporaryOutputVideoFile.FullPath())
+		}
+
+		fte.Logger.Debug(
+			"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
+			"remove temporary video output files",
+			map[string]interface{}{
+				"task_id":                      taskID,
+				"video_transcoder_worker_id":   fte._videoTranscoderWorkerID,
+				"temporary_video_output_files": fte._temporaryOutputVideoFiles,
+			},
+		)
+	}
+
+	// remove temporary transcoding working space (which also contains every
+	// artifact above). An empty path must never be passed to RemoveAll.
+	if fte._temporaryWorkingPath != "" {
+		_ = os.RemoveAll(fte._temporaryWorkingPath)
+
+		fte.Logger.Debug(
+			"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
+			"remove temporary transcoding working space",
+			map[string]interface{}{
+				"task_id":                    taskID,
+				"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
+				"temporary_working_path":     fte._temporaryWorkingPath,
+			},
+		)
+	}
 
 	fte.Logger.Info(
 		"ffmpeg_transcoder_engine.clean_and_prepare_next_task",
 		"clean up working space is done",
 		map[string]interface{}{
-			"task_id":                    fte._queueable.ID,
+			"task_id":                    taskID,
 			"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 		},
 	)
@@ -868,28 +940,44 @@ func (fte *FfmpegTranscoderEngine) _createNewCallback(err error) {
 	var queueable = new(data.Queueable)
 	var callback = new(data.Callback)
 
-	callback.TaskId = fte._taskPayload.ID
-	callback.Priority = fte._taskPayload.Priority
-	callback.URL = fte._taskPayload.Callback.URL
-	callback.Data = fte._taskPayload.Callback.Data
+	// The payload can be nil when the task body could not be parsed; fall back
+	// to the queue item identity so the failure callback is still produced
+	// without a nil-pointer panic.
+	taskID := ""
+	if fte._queueable != nil {
+		taskID = fte._queueable.ID
+		queueable.ID = fte._queueable.ID
+		queueable.Priority = fte._queueable.Priority
+	}
+
+	if fte._taskPayload != nil {
+		taskID = fte._taskPayload.ID
+		callback.Priority = fte._taskPayload.Priority
+		callback.URL = fte._taskPayload.Callback.URL
+		callback.Data = fte._taskPayload.Callback.Data
+
+		callback.TaskTimeline.Add = fte._taskPayload.CreatedAt
+		callback.TaskTimeline.Failed = fte._taskPayload.FailedAt
+		callback.TaskTimeline.Finished = fte._taskPayload.FinishedAt
+		callback.TaskTimeline.Started = fte._taskPayload.StartedAt
+	}
+
+	callback.TaskId = taskID
 
 	if err == nil {
 		callback.Error = false
 		callback.Message = "video transcended without any problems"
-		callback.VideoOutputFiles = *fte._finalOutputVideoFiles
-		callback.ProcessingLogFile = *fte._finalProcessingLogFile
+		if fte._finalOutputVideoFiles != nil {
+			callback.VideoOutputFiles = *fte._finalOutputVideoFiles
+		}
+		if fte._finalProcessingLogFile != nil {
+			callback.ProcessingLogFile = *fte._finalProcessingLogFile
+		}
 	} else {
 		callback.Error = true
 		callback.Message = err.Error()
 	}
 
-	callback.TaskTimeline.Add = fte._taskPayload.CreatedAt
-	callback.TaskTimeline.Failed = fte._taskPayload.FailedAt
-	callback.TaskTimeline.Finished = fte._taskPayload.FinishedAt
-	callback.TaskTimeline.Started = fte._taskPayload.StartedAt
-
-	queueable.ID = fte._queueable.ID
-	queueable.Payload = fte._queueable.Priority
 	queueable.Payload = callback
 
 	_ = fte.Database.Enqueue(fte._callbackManagerQueue, *queueable)
@@ -898,7 +986,7 @@ func (fte *FfmpegTranscoderEngine) _createNewCallback(err error) {
 		"ffmpeg_transcoder_engine.create_new_callback",
 		"create new callback and send it to waiting queue",
 		map[string]interface{}{
-			"task_id":                    fte._queueable.ID,
+			"task_id":                    queueable.ID,
 			"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 		},
 	)
@@ -907,7 +995,7 @@ func (fte *FfmpegTranscoderEngine) _createNewCallback(err error) {
 		"ffmpeg_transcoder_engine.create_new_callback",
 		"callback data",
 		map[string]interface{}{
-			"task_id":                    fte._queueable.ID,
+			"task_id":                    queueable.ID,
 			"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 			"callback":                   callback,
 		},
@@ -916,7 +1004,15 @@ func (fte *FfmpegTranscoderEngine) _createNewCallback(err error) {
 }
 
 // _failedTask inform queue about failed task
-func (fte *FfmpegTranscoderEngine) _failedTask(err error) {
+func (fte *FfmpegTranscoderEngine) _failedTask(taskErr error) {
+
+	// Always remove temporary artifacts on the way out, even if any step
+	// below panics or this is a re-entrant call from the panic recovery.
+	defer fte._cleanAndPrepareForNextTask()
+
+	if taskErr == nil {
+		taskErr = errors.New("unknown transcoder failure")
+	}
 
 	// move video transcoder processing logs to main filesystem.
 	if err := fte._moveTranscoderProcessingLog(); err != nil {
@@ -924,7 +1020,7 @@ func (fte *FfmpegTranscoderEngine) _failedTask(err error) {
 			"ffmpeg_transcoder_engine.failed_task",
 			fmt.Sprintf("error when move video transcoder processing logs to main filesystem: %v", err),
 			map[string]interface{}{
-				"task_id":                    fte._queueable.ID,
+				"task_id":                    fte._safeTaskID(),
 				"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 			},
 		)
@@ -934,21 +1030,37 @@ func (fte *FfmpegTranscoderEngine) _failedTask(err error) {
 		"ffmpeg_transcoder_engine.failed_task",
 		"informing queue about failed task",
 		map[string]interface{}{
-			"task_id":                    fte._queueable.ID,
+			"task_id":                    fte._safeTaskID(),
 			"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 		},
 	)
 
 	customError := map[string]interface{}{
-		"msg":   err.Error(),
+		"msg":   taskErr.Error(),
 		"debug": debug.Stack(),
 	}
 
 	jsonError, _ := json.Marshal(customError)
 
-	fte._taskPayload.FailedAt = time.Now().UnixMilli()
+	if fte._taskPayload != nil {
+		fte._taskPayload.FailedAt = time.Now().UnixMilli()
+		if fte._queueable != nil {
+			fte._queueable.Payload = fte._taskPayload
+		}
+	}
 
-	fte._queueable.Payload = fte._taskPayload
+	if fte._queueable == nil || fte.Database == nil {
+		return
+	}
+
+	// Record this failed attempt exactly once. Failed advances the retry
+	// counter by one and releases worker ownership. The retry re-enqueue below
+	// preserves that count (Enqueue never increments it).
+	_ = fte.Database.Failed(
+		fte._videoTranscoderQueue,
+		*fte._queueable,
+		errors.New(string(jsonError)),
+	)
 
 	//get retry config for video video transcoder
 	retryCount := fte.Database.TotalRetry(fte._videoTranscoderQueue, *fte._queueable)
@@ -966,9 +1078,9 @@ func (fte *FfmpegTranscoderEngine) _failedTask(err error) {
 				"transcoder_max_retry":       retryLimit,
 			},
 		)
-		fte._createNewCallback(err)
-		_ = fte.Database.Failed(fte._videoTranscoderQueue, *fte._queueable, errors.New(string(jsonError)))
-		fte._cleanAndPrepareForNextTask()
+		fte._createNewCallback(taskErr)
+		// The task is already in the terminal "failed" state from Failed(...);
+		// do not enqueue it again so it is never redelivered.
 		return
 	}
 
@@ -984,7 +1096,18 @@ func (fte *FfmpegTranscoderEngine) _failedTask(err error) {
 	)
 
 	_ = fte.Database.Enqueue(fte._videoTranscoderQueue, *fte._queueable)
-	fte._cleanAndPrepareForNextTask()
+}
+
+// _safeTaskID return the current task/queue id without assuming which pointers
+// were initialised after an early failure.
+func (fte *FfmpegTranscoderEngine) _safeTaskID() string {
+	if fte._queueable != nil && fte._queueable.ID != "" {
+		return fte._queueable.ID
+	}
+	if fte._taskPayload != nil {
+		return fte._taskPayload.ID
+	}
+	return ""
 }
 
 // _successTask inform queue about success task
@@ -996,7 +1119,7 @@ func (fte *FfmpegTranscoderEngine) _successTask() {
 			"ffmpeg_transcoder_engine.success_task",
 			fmt.Sprintf("error when move video transcoder processing logs to main filesystem: %v", err),
 			map[string]interface{}{
-				"task_id":                    fte._queueable.ID,
+				"task_id":                    fte._safeTaskID(),
 				"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 			},
 		)
@@ -1007,7 +1130,7 @@ func (fte *FfmpegTranscoderEngine) _successTask() {
 		fte.Logger.Error("ffmpeg_transcoder_engine.success_task",
 			fmt.Sprintf("error when move output files to main filesystem: %v", err.Error()),
 			map[string]interface{}{
-				"task_id":                    fte._queueable.ID,
+				"task_id":                    fte._safeTaskID(),
 				"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 			},
 		)
@@ -1019,14 +1142,23 @@ func (fte *FfmpegTranscoderEngine) _successTask() {
 		"ffmpeg_transcoder_engine.success_task",
 		"inform queue about success task",
 		map[string]interface{}{
-			"task_id":                    fte._queueable.ID,
+			"task_id":                    fte._safeTaskID(),
 			"video_transcoder_worker_id": fte._videoTranscoderWorkerID,
 		},
 	)
 
-	fte._taskPayload.FinishedAt = time.Now().UnixMilli()
+	if fte._taskPayload != nil {
+		fte._taskPayload.FinishedAt = time.Now().UnixMilli()
+	}
 
-	fte._queueable.Payload = fte._taskPayload
+	if fte._queueable != nil && fte._taskPayload != nil {
+		fte._queueable.Payload = fte._taskPayload
+	}
+
+	if fte._queueable == nil || fte.Database == nil {
+		fte._cleanAndPrepareForNextTask()
+		return
+	}
 
 	_ = fte.Database.Finished(fte._videoTranscoderQueue, *fte._queueable)
 

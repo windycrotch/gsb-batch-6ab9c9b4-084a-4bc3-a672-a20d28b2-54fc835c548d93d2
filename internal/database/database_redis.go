@@ -77,16 +77,34 @@ func (rdm *RedisDatabaseManager) SendHeartbeat(workerId, workerType string) erro
 }
 
 // Enqueue add item to waiting queue.
+//
+// Enqueue is idempotent for a given item.ID: repeated submissions or
+// redeliveries never create more than one live entry in the waiting sorted set
+// and never reset or inflate the retry counter. The retry hash field is
+// initialised to zero on first sight and is only advanced by Failed (one
+// increment per recorded failure). Re-enqueueing a failed/retriable item
+// therefore preserves its retry count instead of clearing or doubling it.
 func (rdm *RedisDatabaseManager) Enqueue(queueName string, item data.Queueable) error {
 	scoreWithID := fmt.Sprintf("%d:%s", time.Now().UnixMilli(), item.ID)
 	waiting, status, worker, _, retry, items, _ := rdm._queueStructures(queueName)
 
+	// Remove any waiting members that already refer to the same item ID so a
+	// duplicate enqueue cannot leave parallel entries for one task/callback.
+	oldMembers := rdm._waitingMembersForID(waiting, item.ID)
+
 	tx := rdm.Redis.TxPipeline()
+	for _, member := range oldMembers {
+		tx.ZRem(ctx, waiting, member)
+	}
 	tx.ZAdd(ctx, waiting, redis.Z{Score: item.Priority, Member: scoreWithID})
 	tx.HSet(ctx, items, item.ID, item)
 	tx.HSet(ctx, status, item.ID, "waiting")
-	tx.HSet(ctx, worker, item.ID, nil)
-	tx.HIncrBy(ctx, retry, item.ID, 1)
+	// Clear any previous worker ownership. HDel (instead of HSet with a nil
+	// value) avoids leaving an empty owner field in the worker hash.
+	tx.HDel(ctx, worker, item.ID)
+	// Initialise the retry counter exactly once. Pre-existing values are left
+	// untouched so re-enqueue after a failure neither resets nor doubles them.
+	tx.HSetNX(ctx, retry, item.ID, 0)
 
 	if _, err := tx.Exec(ctx); err != nil {
 		return err
@@ -96,32 +114,18 @@ func (rdm *RedisDatabaseManager) Enqueue(queueName string, item data.Queueable) 
 }
 
 // Dequeue fetch item from waiting queue.
+//
+// Before blocking on the waiting set it recovers items that were left in the
+// "working" state with a worker owner. A worker processes one item at a time
+// and only calls Dequeue while idle, so every ownership field still present at
+// this point belongs to a crashed/restarted/redelivered execution (including
+// tasks left under an old worker ID). Those items are returned to the waiting
+// queue with their retry count preserved and are redistributed instead of
+// being permanently stuck in "working".
 func (rdm *RedisDatabaseManager) Dequeue(queueName string, workerId string) (item data.Queueable, err error) {
 	waiting, status, worker, _, _, items, _ := rdm._queueStructures(queueName)
 
-	// find stopped tasks and make them as failed
-	if workerList, err := rdm.Redis.HGetAll(ctx, worker).Result(); err == nil {
-		for tID, wID := range workerList {
-			if wID == workerId {
-				var item data.Queueable
-				itemAsJsonString, hGetError := rdm.Redis.HGet(ctx, items, tID).Result()
-				if hGetError != nil {
-					continue
-				}
-				jsonParserError := json.Unmarshal([]byte(itemAsJsonString), &item)
-				if jsonParserError != nil {
-					continue
-				}
-				if err := rdm.Failed(
-					queueName,
-					item,
-					errors.New("previous worker encountered issues, task returned to waiting queue for redistribution"),
-				); err != nil {
-					continue
-				}
-			}
-		}
-	}
+	rdm._recoverInterruptedItems(queueName)
 
 	ids, zPopMinError := rdm.Redis.ZPopMin(ctx, waiting, 1).Result()
 	if zPopMinError != nil {
@@ -132,7 +136,7 @@ func (rdm *RedisDatabaseManager) Dequeue(queueName string, workerId string) (ite
 		return item, errors.New("there is no items in waiting queue")
 	}
 
-	var itemID = strings.Split(ids[0].Member.(string), ":")[1]
+	var itemID = queueMemberItemID(ids[0].Member)
 	itemAsJsonString, hGetError := rdm.Redis.HGet(ctx, items, itemID).Result()
 	if hGetError != nil {
 		return item, hGetError
@@ -149,17 +153,124 @@ func (rdm *RedisDatabaseManager) Dequeue(queueName string, workerId string) (ite
 	return item, nil
 }
 
+// _recoverInterruptedItems return "working" items still owned by a worker back
+// to the waiting queue. Terminal items with a stale owner field only get their
+// ownership cleared. Retry counters are intentionally not touched: a restart
+// or redelivery is not a processing failure.
+func (rdm *RedisDatabaseManager) _recoverInterruptedItems(queueName string) {
+	waiting, statusName, worker, _, _, items, _ := rdm._queueStructures(queueName)
+
+	workerList, err := rdm.Redis.HGetAll(ctx, worker).Result()
+	if err != nil {
+		return
+	}
+
+	for itemID := range workerList {
+		currentStatus, _ := rdm.Redis.HGet(ctx, statusName, itemID).Result()
+
+		if currentStatus == "failed" || currentStatus == "finished" {
+			// Terminal state with a leftover owner: drop the ownership field.
+			_, _ = rdm.Redis.HDel(ctx, worker, itemID).Result()
+			continue
+		}
+
+		if currentStatus != "working" {
+			// A waiting/missing item should not carry an owner. Clear the stale
+			// field (this also removes legacy empty-string owners) without
+			// creating a duplicate waiting entry.
+			_, _ = rdm.Redis.HDel(ctx, worker, itemID).Result()
+			continue
+		}
+
+		itemAsJsonString, hGetError := rdm.Redis.HGet(ctx, items, itemID).Result()
+		if hGetError != nil {
+			// Only drop ownership when the item record is genuinely gone. For
+			// transient Redis errors keep the field so the entry is not lost.
+			if errors.Is(hGetError, redis.Nil) {
+				_, _ = rdm.Redis.HDel(ctx, worker, itemID).Result()
+			}
+			continue
+		}
+
+		var item data.Queueable
+		if jsonParserError := json.Unmarshal([]byte(itemAsJsonString), &item); jsonParserError != nil {
+			continue
+		}
+
+		// Requeue the interrupted item exactly once. Removing prior same-ID
+		// members first keeps the waiting set idempotent.
+		oldMembers := rdm._waitingMembersForID(waiting, itemID)
+		scoreWithID := fmt.Sprintf("%d:%s", time.Now().UnixMilli(), itemID)
+
+		tx := rdm.Redis.TxPipeline()
+		for _, member := range oldMembers {
+			tx.ZRem(ctx, waiting, member)
+		}
+		tx.ZAdd(ctx, waiting, redis.Z{Score: item.Priority, Member: scoreWithID})
+		tx.HSet(ctx, statusName, itemID, "waiting")
+		tx.HDel(ctx, worker, itemID)
+		if _, err := tx.Exec(ctx); err != nil {
+			continue
+		}
+	}
+}
+
+// _waitingMembersForID return all members of the waiting sorted set that refer
+// to the given queue item ID.
+func (rdm *RedisDatabaseManager) _waitingMembersForID(waiting, itemID string) []string {
+	members, err := rdm.Redis.ZRange(ctx, waiting, 0, -1).Result()
+	if err != nil {
+		return nil
+	}
+
+	var result []string
+	for _, member := range members {
+		if queueMemberItemID(member) == itemID {
+			result = append(result, member)
+		}
+	}
+
+	return result
+}
+
+// queueMemberItemID extract the item ID from a waiting set member. Members use
+// the "unix-milli:item-id" convention; everything after the first colon is the
+// ID (IDs without a colon are returned unchanged).
+func queueMemberItemID(member interface{}) string {
+	memberAsString, ok := member.(string)
+	if !ok {
+		return fmt.Sprintf("%v", member)
+	}
+
+	if separator := strings.Index(memberAsString, ":"); separator >= 0 && separator+1 < len(memberAsString) {
+		return memberAsString[separator+1:]
+	}
+
+	return memberAsString
+}
+
 // Failed change item status to failed.
+//
+// Recording a failure advances the per-item retry counter exactly once. The
+// counter lives in the existing retry hash and is preserved by Enqueue, so a
+// retriable item goes through Failed (+1) then Enqueue (no change) and never
+// jumps by more than one per real failed attempt.
 func (rdm *RedisDatabaseManager) Failed(queueName string, item data.Queueable, err error) error {
-	_, status, worker, processing, _, items, logs := rdm._queueStructures(queueName)
+	_, status, worker, processing, retry, items, logs := rdm._queueStructures(queueName)
+
+	errorMessage := ""
+	if err != nil {
+		errorMessage = err.Error()
+	}
 
 	tx := rdm.Redis.TxPipeline()
 
 	tx.Del(ctx, fmt.Sprintf("%v:%v", processing, item.ID))
 	tx.HSet(ctx, items, item.ID, item)
 	tx.HSet(ctx, status, item.ID, "failed")
-	tx.HSet(ctx, logs, item.ID, err.Error())
+	tx.HSet(ctx, logs, item.ID, errorMessage)
 	tx.HDel(ctx, worker, item.ID)
+	tx.HIncrBy(ctx, retry, item.ID, 1)
 
 	if _, err := tx.Exec(ctx); err != nil {
 		return err
@@ -170,10 +281,13 @@ func (rdm *RedisDatabaseManager) Failed(queueName string, item data.Queueable, e
 
 // Finished change item status to finished.
 func (rdm *RedisDatabaseManager) Finished(queueName string, item data.Queueable) error {
-	_, status, worker, _, _, items, _ := rdm._queueStructures(queueName)
+	_, status, worker, processing, _, items, _ := rdm._queueStructures(queueName)
 
 	tx := rdm.Redis.TxPipeline()
 
+	// Remove the per-task processing stream as well so no processing flow is
+	// left behind after a successful completion.
+	tx.Del(ctx, fmt.Sprintf("%v:%v", processing, item.ID))
 	tx.HSet(ctx, items, item.ID, item)
 	tx.HSet(ctx, status, item.ID, "finished")
 	tx.HDel(ctx, worker, item.ID)
@@ -242,4 +356,47 @@ func (rdm *RedisDatabaseManager) _queueStructures(queueName string) (waiting, st
 	items = strings.Replace(rdm.Config.GetString("Database.Redis.Structure.Queue.Items"), "{{name}}", queueName, 1)
 	logs = strings.Replace(rdm.Config.GetString("Database.Redis.Structure.Queue.Logs"), "{{name}}", queueName, 1)
 	return
+}
+
+// _outcomeDeliveredKey returns the hash key used to durably record that an
+// external outcome (an HTTP callback) has already been delivered for an item.
+// It is derived from the existing status key so no new configuration or key
+// convention is required.
+func (rdm *RedisDatabaseManager) _outcomeDeliveredKey(queueName string) string {
+	_, status, _, _, _, _, _ := rdm._queueStructures(queueName)
+	return status + ":delivered"
+}
+
+// MarkOutcomeDelivered durably record that the item's external outcome has
+// been delivered successfully. This is the idempotency guard that makes every
+// duplicate delivery after the first success a no-op.
+func (rdm *RedisDatabaseManager) MarkOutcomeDelivered(queueName string, itemID string) error {
+	return rdm.Redis.HSet(ctx, rdm._outcomeDeliveredKey(queueName), itemID, time.Now().UnixMilli()).Err()
+}
+
+// IsOutcomeDelivered report whether the item's external outcome was already
+// delivered successfully.
+func (rdm *RedisDatabaseManager) IsOutcomeDelivered(queueName string, itemID string) (bool, error) {
+	return rdm.Redis.HExists(ctx, rdm._outcomeDeliveredKey(queueName), itemID).Result()
+}
+
+// _deliveryLockKey returns the short-lived lease key used to serialise
+// delivery attempts for one item across competing workers.
+func (rdm *RedisDatabaseManager) _deliveryLockKey(queueName, itemID string) string {
+	_, status, _, _, _, _, _ := rdm._queueStructures(queueName)
+	return status + ":lock:" + itemID
+}
+
+// AcquireDeliveryLock try to obtain the per-item delivery lease. It returns
+// the opaque token that must be presented to ReleaseDeliveryLock. The lease
+// auto-expires after ttl so a crashed worker can never block redelivery.
+func (rdm *RedisDatabaseManager) AcquireDeliveryLock(queueName, itemID, token string, ttl time.Duration) (bool, error) {
+	return rdm.Redis.SetNX(ctx, rdm._deliveryLockKey(queueName, itemID), token, ttl).Result()
+}
+
+// ReleaseDeliveryLock release the lease only when it still belongs to token.
+// The compare-and-delete avoids removing another worker's renewed lease.
+func (rdm *RedisDatabaseManager) ReleaseDeliveryLock(queueName, itemID, token string) error {
+	script := redis.NewScript(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`)
+	return script.Run(ctx, rdm.Redis, []string{rdm._deliveryLockKey(queueName, itemID)}, token).Err()
 }

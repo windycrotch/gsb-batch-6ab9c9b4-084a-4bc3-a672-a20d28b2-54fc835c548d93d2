@@ -18,6 +18,8 @@
 package database
 
 import (
+	"time"
+
 	"openseawave.com/rasbora/internal/data"
 )
 
@@ -79,6 +81,57 @@ func (d *Database) Processing(queueName string, data map[string]interface{}) err
 // TotalRetry get total failed retry.
 func (d *Database) TotalRetry(queueName string, item data.Queueable) int {
 	return d.databaseManager.TotalRetry(queueName, item)
+}
+
+// outcomeDeliverer is an optional capability of a database manager. The Redis
+// manager implements it to provide a durable idempotency marker for externally
+// delivered outcomes (callbacks). Other implementations may omit it.
+type outcomeDeliverer interface {
+	MarkOutcomeDelivered(queueName string, itemID string) error
+	IsOutcomeDelivered(queueName string, itemID string) (bool, error)
+}
+
+// MarkOutcomeDelivered durably record that an item's external outcome was
+// delivered once. It is a no-op for database managers without the capability.
+func (d *Database) MarkOutcomeDelivered(queueName string, itemID string) error {
+	if deliverer, ok := d.databaseManager.(outcomeDeliverer); ok {
+		return deliverer.MarkOutcomeDelivered(queueName, itemID)
+	}
+	return nil
+}
+
+// IsOutcomeDelivered report whether an item's external outcome was already
+// delivered. Managers without the capability always report false.
+func (d *Database) IsOutcomeDelivered(queueName string, itemID string) (bool, error) {
+	if deliverer, ok := d.databaseManager.(outcomeDeliverer); ok {
+		return deliverer.IsOutcomeDelivered(queueName, itemID)
+	}
+	return false, nil
+}
+
+// deliveryLockManager is an optional capability for short-lived per-item
+// delivery leases. The Redis manager implements it.
+type deliveryLockManager interface {
+	AcquireDeliveryLock(queueName, itemID, token string, ttl time.Duration) (bool, error)
+	ReleaseDeliveryLock(queueName, itemID, token string) error
+}
+
+// AcquireDeliveryLock attempt to obtain a per-item delivery lease. Managers
+// without locking capability always grant the lease.
+func (d *Database) AcquireDeliveryLock(queueName, itemID, token string, ttl time.Duration) (bool, error) {
+	if locker, ok := d.databaseManager.(deliveryLockManager); ok {
+		return locker.AcquireDeliveryLock(queueName, itemID, token, ttl)
+	}
+	return true, nil
+}
+
+// ReleaseDeliveryLock release a lease previously obtained with
+// AcquireDeliveryLock. It is a no-op for managers without locking capability.
+func (d *Database) ReleaseDeliveryLock(queueName, itemID, token string) error {
+	if locker, ok := d.databaseManager.(deliveryLockManager); ok {
+		return locker.ReleaseDeliveryLock(queueName, itemID, token)
+	}
+	return nil
 }
 
 // SendSystemRadarScannerData send system radar scanning data content full information about running node.

@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
 	"openseawave.com/rasbora/internal/config"
 	"openseawave.com/rasbora/internal/data"
 	"openseawave.com/rasbora/internal/database"
@@ -118,6 +120,62 @@ func (hcm *HttpCallbackManager) _send(item data.Queueable) {
 		}
 	}()
 
+	// Idempotency guard: no matter how many times the same callback ID is
+	// dequeued (duplicate enqueue, restart or redelivery), once its outcome
+	// has been delivered successfully it must never be POSTed again. Reconcile
+	// the queue state to finished and acknowledge the duplicate entry.
+	if alreadyDelivered, errD := hcm.Database.IsOutcomeDelivered(hcm._queueName, item.ID); errD == nil && alreadyDelivered {
+		hcm.Logger.Success(
+			"http_callback_manager.send",
+			"callback already delivered, acknowledging duplicate without sending",
+			map[string]interface{}{
+				"callback_id":        hcm._queueable.ID,
+				"callback_worker_id": hcm.workerId,
+			},
+		)
+		hcm._success()
+		return
+	}
+
+	// Acquire a short-lived per-callback lease so that competing workers which
+	// received the same id (restart reclaim / duplicate delivery) cannot POST
+	// concurrently. A failure to talk to Redis must not drop the callback, so
+	// on lock errors we fall through and deliver best effort.
+	lockToken := uuid.NewString()
+	lockTTL := 30 * time.Second
+	acquired, lockErr := hcm.Database.AcquireDeliveryLock(hcm._queueName, item.ID, lockToken, lockTTL)
+	if lockErr != nil {
+		hcm.Logger.Error(
+			"http_callback_manager.send",
+			fmt.Sprintf("cannot acquire callback delivery lock, delivering without it: %v", lockErr),
+			map[string]interface{}{
+				"callback_id":        hcm._queueable.ID,
+				"callback_worker_id": hcm.workerId,
+			},
+		)
+	} else if !acquired {
+		hcm.Logger.Debug(
+			"http_callback_manager.send",
+			"another worker is already delivering this callback, acknowledging duplicate",
+			map[string]interface{}{
+				"callback_id":        hcm._queueable.ID,
+				"callback_worker_id": hcm.workerId,
+			},
+		)
+		return
+	} else {
+		defer func() {
+			_ = hcm.Database.ReleaseDeliveryLock(hcm._queueName, item.ID, lockToken)
+		}()
+
+		// Re-check after acquiring: the previous holder may have completed
+		// delivery in the gap between the first check and the lock.
+		if alreadyDelivered, errD := hcm.Database.IsOutcomeDelivered(hcm._queueName, item.ID); errD == nil && alreadyDelivered {
+			hcm._success()
+			return
+		}
+	}
+
 	// get callback payload from queue item.
 	callbackAsJsonBytes, errJ := json.Marshal(item.Payload)
 	if errJ != nil {
@@ -133,7 +191,9 @@ func (hcm *HttpCallbackManager) _send(item data.Queueable) {
 		return
 	}
 
-	// set callback payload
+	// set callback payload. Reset the cached pointer first so a previous
+	// callback's fields can never bleed into a different message.
+	hcm._callbackPayload = nil
 	errU := json.Unmarshal(callbackAsJsonBytes, &hcm._callbackPayload)
 	if errU != nil {
 		hcm.Logger.Error(
@@ -169,7 +229,7 @@ func (hcm *HttpCallbackManager) _send(item data.Queueable) {
 				"callback_worker_id": hcm.workerId,
 			},
 		)
-		hcm._failed(errU)
+		hcm._failed(err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -224,6 +284,10 @@ func (hcm *HttpCallbackManager) _send(item data.Queueable) {
 
 	//receiver handle the callback without issues
 	if response.StatusCode == 200 {
+		// Durably record delivery before finishing so any later duplicate is
+		// suppressed even if the process crashes between the two writes.
+		_ = hcm.Database.MarkOutcomeDelivered(hcm._queueName, hcm._queueable.ID)
+
 		hcm.Logger.Success(
 			"http_callback_manager.send",
 			"callback successfully sent",
@@ -255,6 +319,20 @@ func (hcm *HttpCallbackManager) _send(item data.Queueable) {
 // _failed handle failed callback
 func (hcm *HttpCallbackManager) _failed(err error) {
 
+	if hcm._queueable == nil {
+		return
+	}
+
+	if err == nil {
+		err = errors.New("unknown callback delivery failure")
+	}
+
+	// Record this failed attempt exactly once. Failed advances the retry
+	// counter by one, marks the item failed and releases its worker ownership.
+	// Re-enqueue below preserves that counter (Enqueue never increments it),
+	// so retries accumulate strictly one per real failed delivery attempt.
+	_ = hcm.Database.Failed(hcm._queueName, *hcm._queueable, err)
+
 	//get retry config for callback manager
 	retryCount := hcm.Database.TotalRetry(hcm._queueName, *hcm._queueable)
 	retryLimit := hcm.Config.GetInt("Components.CallbackManager.MakeAsFailedAfterRetry")
@@ -271,7 +349,8 @@ func (hcm *HttpCallbackManager) _failed(err error) {
 				"callback_max_retry":   retryLimit,
 			},
 		)
-		_ = hcm.Database.Failed(hcm._queueName, *hcm._queueable, err)
+		// Failed(...) above already put the callback into its terminal failed
+		// state; do not enqueue it again so it is never redelivered.
 		return
 	}
 
