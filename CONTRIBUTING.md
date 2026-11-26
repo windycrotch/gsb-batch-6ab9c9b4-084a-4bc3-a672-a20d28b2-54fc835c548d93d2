@@ -1,0 +1,217 @@
+# Contributing
+
+Thanks for taking an interest. This is a small, opinionated repo: an IINA plugin
+(JavaScript), a Go helper that drives `ffmpeg`, and the packaging that turns the
+two into an `.iinaplgz` a stranger can install. Everything below is what you'd
+otherwise have to reverse-engineer.
+
+Start with [`README.md`](README.md) for what the plugin does and
+[`docs/feasibility.md`](docs/feasibility.md) for why it does it that way. If
+you're proposing an architecture change, read the feasibility doc *first* — most
+"why don't you just mirror the screen?" ideas are closed off by the platform,
+and the doc says which and why.
+
+## Prerequisites
+
+macOS, [IINA](https://iina.io) (everything here is verified against
+1.4.4 — the repo declares no minimum, but that's the version the behaviour
+notes below were checked on), and:
+
+```bash
+brew install go node ffmpeg
+```
+
+`nasm`, `meson`, `ninja` and `pkgconf` are needed **only** if you build the
+shipped package (`make pack` / `make ffmpeg`): nasm assembles the x86_64
+slice's hand-written assembly, and the other three build the static dav1d that
+gives the bundled ffmpeg its AV1 decoder. The everyday dev loop never builds
+ffmpeg from source.
+
+## Dev loop
+
+```bash
+make dev
+```
+
+That builds the Go helper, symlinks Homebrew's `ffmpeg` into `plugin/bin/`,
+writes `plugin/Info.json` from the root `Info.json`, and links the plugin
+directory into IINA.
+
+The linked plugin loads as **AirPlay (dev)**, under its own identifier
+(`dev.faruk.iina-airplay.dev`), so it sits next to an installed copy of the
+plugin instead of clashing with it. It has its own enabled switch, settings and
+data, and IINA never offers it an update. With both enabled you get two
+AirPlay tabs in the sidebar; disable whichever one you aren't testing.
+
+Then **restart IINA**. The first time, enable **AirPlay (dev)** under Settings →
+Plugins; IINA remembers that for later runs. Restarting is not optional: the
+sidebar and standalone window are `WKWebView`s and don't hot-reload their JS.
+
+`make dev` is safe to re-run, including from another checkout or worktree: it
+re-points IINA's link at the one you ran it in. `make undev` removes the link
+again (restart IINA after it).
+
+Plugin logs (`console.log` in `main.js`) go to IINA's log, which is off by
+default: turn on **Enable advanced settings** and **Enable logging to file**
+under Settings → Advanced, then restart IINA — the switch is read at launch.
+Open **Window → Log Viewer** (⌃⌘L) and pick the subsystem ending in
+`- AirPlay (dev)` (`- AirPlay` for the installed copy); the files are under
+`~/Library/Logs/com.colliderli.iina/`. Safari's Web Inspector can also attach
+to the plugin's webviews (`isInspectable` is on) for the sidebar page's own
+console.
+
+## Tests
+
+```bash
+make test
+```
+
+That runs `go test ./...` in `helper/`, `node --test` over `plugin/tests/`, and
+the packaging shell tests. CI runs exactly this on `macos-15`, plus a full
+package build verified natively on both Apple Silicon and Intel.
+
+**Homebrew's `ffmpeg` is load-bearing for the test suite, not a convenience.**
+The helper's real-media end-to-end tests *skip themselves* when no system
+`ffmpeg` is found and `IINA_AIRPLAY_FFMPEG` is unset — so without it the suite
+goes green having never driven the pipeline through `ffmpeg` at all. If you're
+touching the transcode path, confirm those tests actually ran.
+
+### What you cannot test without hardware
+
+Casting itself needs a real Apple TV on the same LAN. Everything up to the
+handoff — probing the file, choosing remux vs. transcode, the HLS segments the
+helper serves, subtitle conversion, the packaged binaries — is covered by the
+automated suite and by pointing a browser or `ffprobe` at the helper's stream
+URL. Only the final "the TV picked it up and played it" step needs the device.
+
+Say so in your PR if you couldn't test that last step. It's an expected gap, not
+a problem — it just tells the maintainer what to check before merging.
+
+The Mac's own AVFoundation is the nearest stand-in for the TV: Safari, or any
+`AVPlayer`, plays the helper's URL through the same HLS stack. When it rejects
+a master playlist, the error code alone says little, but CoreMedia logs the
+reason. Run this while the URL loads:
+
+```bash
+/usr/bin/log stream --style compact --predicate 'subsystem == "com.apple.coremedia" AND eventMessage CONTAINS "StreamPlaylist"'
+```
+
+That is how issue #45 was found: `HDR alternate is missing FRAME-RATE`. Call
+`/usr/bin/log` by its full path, because zsh has a `log` builtin that shadows
+it.
+
+## Layout
+
+| Path | What lives there |
+| --- | --- |
+| `plugin/` | The IINA plugin: `main.js` (JSContext), `sidebar.html` (the cast UI webview) and `preferences.html` (the settings page IINA shows under Plugins → Preferences) |
+| `helper/` | The Go supervisor — spawns `ffmpeg`, serves HLS, watchdog, playlist |
+| `packaging/` | `build-ffmpeg.sh`, `pack.sh`, `verify.sh`, the release gates, and `dev-manifest.mjs` (the manifest `make dev` writes) |
+| `docs/` | Design reasoning, the prototype record, the distribution design, the release runbook |
+| `Info.json` | The plugin manifest — **at the repo root**, see below |
+
+## Constraints that bite newcomers
+
+These are established facts, not guesses. Fuller detail in
+[`CLAUDE.md`](CLAUDE.md) and [`docs/prototype.md`](docs/prototype.md).
+
+- **The plugin API is JavaScript only.** No native code, no access to IINA's
+  render pipeline. This is why the design is a handoff rather than a mirror.
+- **`utils.exec` replaces the process environment** and sets only `LC_ALL`, so
+  `PATH` is empty in anything you spawn. The symptom is "command not found" for
+  a binary that is obviously installed. Always pass an absolute or `@data/` path.
+- **`sidebar.show()` crashes IINA when called from a `utils.exec` callback** —
+  those callbacks run off-main and trip an AutoLayout assertion. Call `sidebar.*`
+  only from menu/`onMessage` callbacks; let the page poll for background results.
+- **The first media load in a plugin webview flakes** (`error code=4`, fine on
+  reload). Retry once, automatically.
+- **`plugin/Info.json` is generated by `make dev`** and gitignored. It carries
+  the dev identifier and no `ghRepo`/`ghVersion`. Edit the root `Info.json`
+  instead: the next `make dev` overwrites `plugin/Info.json`, and the package
+  never includes it.
+- **Prefer remuxing over re-encoding, always.** A remux of an HEVC file takes
+  seconds; a re-encode of a UHD remux is not something anyone will wait for.
+
+### `master` and `main` are both load-bearing — rename neither, commit only to `master`
+
+IINA's update check fetches
+`raw.githubusercontent.com/<repo>/<branch>/Info.json` — the repository root of a
+branch whose name is hardcoded in IINA, never the release. IINA 1.4 reads
+**`master`**; IINA 1.5 reads **`main`**. Both are in use, so both must exist and
+carry the same manifest.
+
+`master` is the trunk. `main` is a mirror of it:
+`.github/workflows/mirror-main.yml` fast-forwards it on every push to `master`.
+Never push to `main` or open a PR against it — a commit there makes the mirror
+diverge, and its next run fails rather than overwrite it.
+
+Renaming or deleting either branch cuts one generation of IINA off from updates.
+1.4 reports that as a bland "No update found."; 1.5 reports "Error checking for
+updates." for every plugin the user has installed, not just this one. Details in
+[`docs/releasing.md`](docs/releasing.md).
+
+## Branch and PR workflow
+
+Trunk-based. `master` is the single long-lived branch you work against, and it
+stays green. (`main` exists too, but only as the machine-kept mirror described
+above.)
+
+- Branch off `master`, named `<your-gh-name>/<short-description>`.
+- Conventional-commit messages (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
+- Run `make test` before pushing — it's the same gate CI applies. CI runs on
+  pull requests and on `master`, not on every branch push, so a work-in-progress
+  push with no PR open deliberately produces no run.
+- Open the PR into `master`. Reference the issue in the body (`Part of #N`, or
+  `Closes #N` when the merge fully finishes it).
+- PRs are **squash-merged**, so the PR title and body become the commit on
+  `master`. Write them as the changelog entry you'd want to read later.
+- CI's `test` job must pass, branches must be up to date, and review
+  conversations must be resolved before merge.
+
+## Issues
+
+Title every issue with a lowercase `[area]` prefix so a glance down the list
+finds everything touching one surface:
+
+| Prefix | Surface |
+| --- | --- |
+| `[plugin]` | `plugin/` — the JS entry point and the sidebar webview |
+| `[helper]` | `helper/` — the Go supervisor, ffmpeg pipeline, HLS server |
+| `[packaging]` | `packaging/` — the ffmpeg build, packing, verification, releases |
+| `[repo]` | Governance: CI, branch protection, tooling |
+| `[docs]` | Docs, design, README |
+
+Label a new issue when you open it: a **type** (`bug` / `enhancement` /
+`documentation`), a **priority** (`P1` / `P2` / `P3`), and a **size**
+(`size/XS` … `size/XL`), plus the area label it lands in. Priority and size are
+orthogonal — a change can be small but `P1`.
+
+New here? [`good first issue`](https://github.com/ozykhan/iina-airplay/labels/good%20first%20issue).
+
+### Reporting a cast bug
+
+Casting failures depend on the file, the Mac and the TV, so a report without
+those is rarely actionable. Include:
+
+- macOS version, Mac model, IINA version, plugin version
+- Apple TV model and tvOS version
+- `ffprobe` output for the file (or at least container, video codec, audio
+  codec, subtitle tracks)
+- The plugin console log from the failed attempt
+
+The bug report template asks for all of this.
+
+## Scope
+
+Reasonable additions: format coverage, subtitle handling (PGS burn-in is the
+open one), playlist behaviour, packaging robustness, tests. Things that are out
+of scope by design: native code in the plugin, mirroring IINA's actual video
+output, and anything that makes the common path re-encode when it could remux.
+
+If you're planning something large, open an issue first — a `[repo]` or design
+issue costs you nothing and saves a rewrite.
+
+## License
+
+By contributing you agree that your contributions are licensed under the
+repository's [MIT license](LICENSE).

@@ -1,0 +1,698 @@
+// plugin/main.js — orchestration. HARD RULE (docs/prototype.md): never call
+// sidebar.* from utils.exec callbacks/promises; IINA runs those off the main
+// thread and sidebar.show() SIGABRTs the app. Sidebar calls live only in
+// main-thread contexts: plugin load, the iina.window-loaded event, the menu
+// callback and onMessage handlers; the page polls "getState".
+
+// ---- pure functions (node-testable) ----
+
+// Sub codecs ffmpeg can convert to WebVTT. Image codecs (hdmv_pgs_subtitle,
+// dvd_subtitle) and anything unknown can't pass through to the TV without a
+// burn-in re-encode — out of scope, see docs/superpowers/specs/.
+var TEXT_SUB_CODECS = { subrip: 1, srt: 1, ass: 1, ssa: 1, mov_text: 1, webvtt: 1, text: 1 };
+
+function selectTracks(trackList) {
+  var video = null, audio = null, firstAudio = null, sub = null;
+  for (var i = 0; i < trackList.length; i++) {
+    var t = trackList[i];
+    if (t.type === "video" && (!video || t.selected)) video = t;
+    if (t.type === "audio") {
+      if (firstAudio === null) firstAudio = t;
+      if (t.selected) audio = t;
+    }
+    if (t.type === "sub" && t.selected) sub = t;
+  }
+  if (!video) return null;
+  if (!audio) audio = firstAudio;
+  if (!audio) return null;
+  var r = {
+    vcodec: video.codec,
+    vheight: video["demux-h"] || 0,
+    acodec: audio.codec,
+    achannels: audio["demux-channel-count"] || 2,
+    vmap: video["ff-index"],
+    amap: audio["ff-index"],
+    sub: null,
+    subDropped: false,
+  };
+  if (sub) {
+    var path = sub.external ? (sub["external-filename"] || null) : null;
+    if (!TEXT_SUB_CODECS[sub.codec] || (sub.external && !path)) {
+      r.subDropped = true;
+    } else {
+      r.sub = { path: path, smap: sub["ff-index"], lang: sub.lang || "", title: sub.title || "" };
+    }
+  }
+  return r;
+}
+
+// Bit depth from an mpv pixel-format name, for the helper's re-encode branch
+// (10-bit AV1/HDR must stay 10-bit). mpv names the depth after the last "p":
+// yuv420p10, yuv420p10le, p010 (NV12's 10-bit twin), p210, gbrp12. Names with
+// no depth there (yuv420p, nv12, bgra) are 8-bit. 0 means "unknown" — nothing
+// to go on, or a hardware surface name like "videotoolbox" — and the helper
+// treats unknown as 8-bit, the pre-existing behaviour.
+function videoBitDepth(fmt) {
+  if (!fmt || typeof fmt !== "string") return 0;
+  if (fmt === "videotoolbox" || fmt.indexOf("vaapi") === 0) return 0;
+  var m = /p[0-4]?(\d{2})(?:le|be)?$/.exec(fmt);
+  return m ? parseInt(m[1], 10) : 8;
+}
+
+// selectTracks already decided what happens to subtitles; this just names the
+// decision for the sidebar. Before the redesign that answer existed only as a
+// one-shot OSD flash, which vanished before it could be read.
+function subtitleLabel(tracks) {
+  if (!tracks) return { label: "", warn: false };
+  if (tracks.subDropped) return { label: "Subtitles not supported", warn: true };
+  if (!tracks.sub) return { label: "No subtitles", warn: false };
+  return { label: "Subtitles: " + (tracks.sub.lang || tracks.sub.title || "On"),
+           warn: false };
+}
+
+function parseHelperEvents(buffer, chunk) {
+  var data = buffer + chunk;
+  var lines = data.split("\n");
+  var rest = lines.pop(); // trailing partial line (or "")
+  var events = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    try {
+      var obj = JSON.parse(line);
+      if (obj && obj.event) events.push(obj);
+    } catch (e) { /* stray non-JSON output; ignore */ }
+  }
+  return { events: events, rest: rest };
+}
+
+// utils.resolvePath("@data/") resolves to an absolute path of the form
+// <...>/plugins/.data/<identifier> (verified on-disk against a running IINA
+// 1.4.4 install — there is no "plugins-data" directory). The plugins
+// directory (where the plugin bundle — and thus bin/ — actually lives) is
+// the parent of the ".data" component. Returns null if the path doesn't
+// have the expected shape.
+function pluginsDirFromDataDir(dataPath) {
+  if (!dataPath) return null;
+  var normalized = dataPath.replace(/\/+$/, ""); // strip trailing slash(es)
+  var idx = normalized.lastIndexOf("/.data/");
+  if (idx === -1) return null;
+  return normalized.slice(0, idx);
+}
+
+// The plugin's own identifier: the last component of that same data dir.
+// Read at runtime rather than hardcoded, because the installed plugin and a
+// `make dev` build carry different identifiers (packaging/dev-manifest.mjs)
+// and sit in the same plugins folder. Each has to find its own bin/. Returns
+// null if the path doesn't have the expected shape.
+function identifierFromDataDir(dataPath) {
+  if (!dataPath) return null;
+  var normalized = dataPath.replace(/\/+$/, "");
+  var idx = normalized.lastIndexOf("/.data/");
+  if (idx === -1) return null;
+  var id = normalized.slice(idx + "/.data/".length);
+  return id && id.indexOf("/") === -1 ? id : null;
+}
+
+// A grep basic regex for the identifier line of a plugin's Info.json, with any
+// spacing after the colon. The identifier is escaped because its dots would
+// otherwise match any character (IINA only allows word characters, "-" and
+// "." in one, but the rest of BRE's specials are escaped too). The closing
+// quote is what keeps "dev.faruk.iina-airplay" from matching
+// "dev.faruk.iina-airplay.dev".
+function identifierPattern(id) {
+  return '"identifier": *"' + id.replace(/[.*[^$\\]/g, "\\$&") + '"';
+}
+
+// Finds the bin/ of the plugin whose Info.json matches the pattern in $2,
+// among the plugin folders in $1 (IINA's plugins directory). The glob follows
+// the symlink `iina-plugin link` leaves there, so a dev build resolves to the
+// checkout's plugin/bin. Prints the bin dir and exits 0; exits 3 when the
+// plugin is found but its binaries won't run; exits 1 when it isn't found.
+//
+// com.apple.quarantine does NOT clear the executable bit (verified: a
+// quarantined file still passes `[ -x ]`), so the `-x` test alone cannot
+// catch the browser-download case docs/distribution.md and README.md promise
+// is detected. Worse, exec'ing a quarantined binary blocks on a Gatekeeper
+// dialog instead of failing fast, so check for the xattr with
+// `/usr/bin/xattr -p` (absolute path: /bin/sh via utils.exec runs with an
+// empty PATH) BEFORE anything ever execs the binary. `xattr -p` succeeding
+// (exit 0) means the attribute is present, i.e. quarantined.
+//
+// The pattern is an argument rather than spliced into the script, so nothing
+// in an identifier is ever parsed as shell.
+var BIN_DIR_LOOKUP_SCRIPT =
+  'for d in "$1"/*/; do' +
+  '  if /usr/bin/grep -qs -e "$2" "$d/Info.json"; then' +
+  '    h="$d"bin/airplay-helper; f="$d"bin/ffmpeg;' +
+  '    if [ -x "$h" ] && [ -x "$f" ] ' +
+  '        && ! /usr/bin/xattr -p com.apple.quarantine "$h" >/dev/null 2>&1 ' +
+  '        && ! /usr/bin/xattr -p com.apple.quarantine "$f" >/dev/null 2>&1; then' +
+  '      printf %s "$d"bin; exit 0;' +
+  '    fi;' +
+  '    exit 3;' +
+  '  fi;' +
+  'done; exit 1';
+
+function isValidPid(pid) {
+  return typeof pid === "number" && isFinite(pid) && pid > 0;
+}
+
+// mpv's "path" is a URL whenever IINA is playing a network stream. The bundled
+// ffmpeg is built --disable-network and has no protocol handler for those, so
+// the plugin declines up front instead of letting ffmpeg fail obscurely.
+function hasURLScheme(p) {
+  return !!p && /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p);
+}
+
+// mpv usually reports a bare filesystem path, but can hand back a file:// URI.
+// That names a local file we can cast, so strip the scheme and percent-decode
+// rather than declining it — and do this before the URL-scheme test, which
+// would otherwise call it a network stream.
+function normalizeSource(p) {
+  if (!p || p.indexOf("file://") !== 0) return p;
+  var rest = p.slice("file://".length);
+  if (rest.indexOf("localhost/") === 0) rest = rest.slice("localhost".length);
+  try { return decodeURIComponent(rest); } catch (e) { return rest; }
+}
+
+// The "LAN address" preference (Info.json preferenceDefaults.lanIP, edited in
+// Settings → Plugins → AirPlay → Preferences) is handed to the helper as
+// `serve -ip <addr>` when non-empty. The helper validates it (IPv4, assigned
+// to this Mac, interface up) and reports a bad value as an `error` event the
+// sidebar already shows, so the plugin only trims. Anything that isn't a
+// string — unset, or a stale non-string in the preferences store — means
+// automatic.
+function lanIPOverride(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+// mpv's video-params/gamma names the transfer function of the decoded
+// stream ("pq", "hlg", "bt.1886", ...). The helper takes VIDEO-RANGE from the
+// colr box ffmpeg writes into init.mp4, but ffmpeg writes none when the
+// source tags its HDR transfer only in the bitstream, and a variant without
+// VIDEO-RANGE is SDR, which AVFoundation fails for an HDR10 stream (issue
+// #45). This is the fallback for that case; "" means SDR or unknown.
+function videoRangeHint(gamma) {
+  if (gamma === "pq") return "PQ";
+  if (gamma === "hlg") return "HLG";
+  return "";
+}
+
+// WebKit reports a stream it couldn't fetch at all (refused, unreachable,
+// 404) as media error 4 with an empty MediaError.message, which is all a user
+// or a bug report ever saw (issue #42). The plugin probes the URL with curl,
+// spawned by IINA so the Mac's firewall, VPN and network filters treat it as
+// they treat IINA's webview, and names what it found. `probe` is utils.exec's
+// {status, stdout, stderr} for `curl -w %{http_code}`, or null if curl
+// couldn't run.
+function describeMediaFailure(url, code, probe) {
+  var err = "media error " + (code === undefined || code === null ? "?" : code);
+  var hostPort = String(url).replace(/^[a-z]+:\/\//i, "").split("/")[0];
+  if (!probe) return "Stream failed to load (" + err + ") from " + hostPort + ".";
+  if (probe.status !== 0) {
+    var reason = String(probe.stderr || "").trim().replace(/^curl: \(\d+\) /, "") ||
+                 "curl exit " + probe.status;
+    return "This Mac can't reach its own stream at " + hostPort + ": " + reason +
+           ". A firewall, VPN or network filter may be blocking it, or the " +
+           "address is wrong — set LAN address in the plugin's preferences.";
+  }
+  var http = String(probe.stdout || "").trim();
+  if (http !== "200") return "The stream server answered HTTP " + http + " (" + err + ").";
+  return "This Mac reaches the stream at " + url + ", but WebKit wouldn't play it (" + err + ").";
+}
+
+// ---- muted-mirror sync core (spec: docs/superpowers/specs/2026-08-30-native-controls-mirror-design.md) ----
+// The TV is the clock; mpv is the mirror. AirPlay HLS runs seconds behind any
+// local clock, so mpv's position is never authoritative during a cast. These
+// functions are pure — they take the mirror bookkeeping object plus
+// observations and return new state/actions without touching IINA APIs — so
+// node tests can drive every branch.
+
+var DRIFT_TOLERANCE = 1.5; // seconds of mpv/TV divergence tolerated before correcting
+var ECHO_WINDOW_MS = 2000; // how long our own time-pos set may echo back as an mpv seek event
+
+function newMirror(startPos, savedMute, paused) {
+  return {
+    seq: 0,               // last issued command sequence number
+    paused: paused,       // desired TV pause state (follows mpv)
+    seekTo: null,         // pending user seek {seq, pos}; cleared when the page acks it
+    startPos: startPos,   // where IINA was at cast start; the page best-effort seeks the TV here
+    savedMute: savedMute, // mpv mute flag to restore on teardown
+    expectMpvPause: null, // swallow the next pause.changed that echoes our own mpv.set
+    lastSetPos: null,     // {pos, at} of our last programmatic time-pos set (echo suppression)
+  };
+}
+
+// mpv's pause flag changed. Bumps seq only for user-initiated changes; an
+// expected echo of our own mpv.set(pause) must not become a command back to
+// the TV, or TV-remote pauses would ping-pong.
+function mirrorOnMpvPause(m, mpvPaused) {
+  var n = Object.assign({}, m);
+  if (m.expectMpvPause !== null && mpvPaused === m.expectMpvPause) {
+    n.expectMpvPause = null;
+    return n;
+  }
+  n.expectMpvPause = null;
+  if (mpvPaused !== m.paused) {
+    n.paused = mpvPaused;
+    n.seq = m.seq + 1;
+  }
+  return n;
+}
+
+// mpv seeked. A seek near our own recent time-pos set is drift correction
+// echoing back, not the user; anything else becomes a TV seek command.
+// seekTo carries its own seq so the page never re-applies a seek it has
+// already performed when a later pause command bumps the outer seq.
+function mirrorOnMpvSeek(m, mpvPos, now) {
+  var n = Object.assign({}, m);
+  if (m.lastSetPos !== null &&
+      now - m.lastSetPos.at < ECHO_WINDOW_MS &&
+      Math.abs(mpvPos - m.lastSetPos.pos) <= DRIFT_TOLERANCE) {
+    n.lastSetPos = null;
+    return n;
+  }
+  n.seq = m.seq + 1;
+  n.seekTo = { seq: n.seq, pos: mpvPos };
+  return n;
+}
+
+// The page reported TV state. Decides what (if anything) to push into mpv.
+// While commands are in flight (appliedSeq < seq) the TV state is stale, so
+// nothing is reconciled against it — not even drift. ended only tears the
+// cast down once the TV is actually the one playing: a short file's LOCAL
+// (muted, hidden) playback ending before the user ever picks a TV must not
+// kill the cast. An acked seekTo is cleared as soon as it's acked, even
+// before wireless playback starts, so a pre-wireless user seek doesn't leave
+// a stale command sitting in the sync block.
+function mirrorOnTvState(m, tvState, mpvPos, mpvPaused, now) {
+  var out = { m: m, setMpvPos: null, setMpvPaused: null, teardown: false };
+  if (tvState.ended && tvState.wireless) { out.teardown = true; return out; }
+  var n = Object.assign({}, m);
+  var acked = tvState.appliedSeq >= m.seq;
+  if (acked) n.seekTo = null;
+  out.m = n;
+  if (!tvState.wireless || !acked) return out; // nothing on the TV yet, or a command is in flight: no clock to follow
+  if (tvState.paused !== n.paused) {      // TV-remote initiated: mirror into mpv
+    n.paused = tvState.paused;
+    n.expectMpvPause = tvState.paused;
+    out.setMpvPaused = tvState.paused;
+  }
+  if (Math.abs(mpvPos - tvState.pos) > DRIFT_TOLERANCE) {
+    out.setMpvPos = tvState.pos;
+    n.lastSetPos = { pos: tvState.pos, at: now };
+  }
+  return out;
+}
+
+if (typeof module !== "undefined") {
+  module.exports = {
+    selectTracks: selectTracks,
+    videoBitDepth: videoBitDepth,
+    subtitleLabel: subtitleLabel,
+    parseHelperEvents: parseHelperEvents,
+    pluginsDirFromDataDir: pluginsDirFromDataDir,
+    identifierFromDataDir: identifierFromDataDir,
+    identifierPattern: identifierPattern,
+    BIN_DIR_LOOKUP_SCRIPT: BIN_DIR_LOOKUP_SCRIPT,
+    isValidPid: isValidPid,
+    hasURLScheme: hasURLScheme,
+    normalizeSource: normalizeSource,
+    lanIPOverride: lanIPOverride,
+    describeMediaFailure: describeMediaFailure,
+    videoRangeHint: videoRangeHint,
+    newMirror: newMirror,
+    mirrorOnMpvPause: mirrorOnMpvPause,
+    mirrorOnMpvSeek: mirrorOnMpvSeek,
+    mirrorOnTvState: mirrorOnTvState,
+    DRIFT_TOLERANCE: DRIFT_TOLERANCE,
+    ECHO_WINDOW_MS: ECHO_WINDOW_MS,
+  };
+}
+
+// ---- IINA runtime ----
+
+if (typeof iina !== "undefined") {
+  var core = iina.core, mpv = iina.mpv, menu = iina.menu, sidebar = iina.sidebar,
+      utils = iina.utils, file = iina.file, console = iina.console, event = iina.event,
+      preferences = iina.preferences;
+
+  var state = { phase: "idle", url: null, pct: 0, msg: null };
+  var stdoutRest = "";
+
+  // Bumped every time a new cast starts or the cast is stopped. Async
+  // callbacks (bin-dir resolution, helper stdout, exec .then/.catch) capture
+  // the generation they belong to and no-op if it no longer matches — this
+  // stops a superseded cast's stale callbacks from clobbering the state of
+  // whatever cast (or idle state) came after it.
+  var castGen = 0;
+
+  // Active muted mirror (spec 2026-08-30), or null when not casting. Event
+  // callbacks may ONLY swap this object via the pure mirrorOn* functions;
+  // everything that touches mpv runs in onMessage/menu context.
+  var mirror = null;
+
+  // IINA destroys the mpv core while quitting and leaves the plugin API's
+  // handle nil, but the sidebar page keeps polling "getState" through the
+  // quit. mpv.* on that nil handle segfaults inside IINA (mpv_get_property
+  // reading address 0x48) — a native crash, not a JS exception, so try/catch
+  // cannot help. IINA closes every window before it shuts players down, so
+  // window-will-close is the last point where mpv is certainly alive.
+  //
+  // window-will-close also fires on an ordinary close (Cmd-W), after which
+  // IINA keeps running and the next file reuses this same player, plugin
+  // instance and window — and window-loaded never fires again. So the flag
+  // clears on iina.file-loaded: a file can only load into a live mpv core.
+  // Until then, answer from the last snapshot and leave mpv alone; a mute
+  // restore that came due meanwhile is deferred to that point.
+  var playerGone = false;
+  var pendingMute = null; // savedMute owed to mpv once it is live again
+  var lastSeen = { duration: 0, subs: subtitleLabel(null) };
+  event.on("iina.window-will-close", function () { playerGone = true; });
+
+  // Every post to the page goes through this so the page always sees the live
+  // sync block alongside the pipeline state.
+  function stateForPage() {
+    // duration and subs are derived here, not stored on `state`: selectTracks
+    // otherwise runs only at cast start, so a stored label would be empty
+    // before the first cast — exactly when the user is deciding whether to
+    // cast — and would go stale if the subtitle track changed mid-session.
+    // Safe to read mpv here: every caller is a sidebar.onMessage handler,
+    // which IINA runs on the main thread — unless the player is going away.
+    if (!playerGone) {
+      lastSeen = {
+        duration: mpv.getNumber("duration") || 0,
+        subs: subtitleLabel(selectTracks(mpv.getNative("track-list") || [])),
+      };
+    }
+    return {
+      phase: state.phase, url: state.url, pct: state.pct, msg: state.msg,
+      diag: state.diag || null,
+      duration: lastSeen.duration,
+      subs: lastSeen.subs,
+      sync: mirror === null ? null : {
+        seq: mirror.seq, paused: mirror.paused,
+        seekTo: mirror.seekTo, startPos: mirror.startPos,
+      },
+    };
+  }
+
+  function endMirror() {
+    if (mirror === null) return;
+    if (playerGone) pendingMute = mirror.savedMute; // restored on file-loaded
+    else mpv.set("mute", mirror.savedMute);
+    mirror = null;
+  }
+
+  // Helper-initiated teardowns (stopped/error events, exec settling) happen in
+  // exec callbacks, which must not touch mpv from off-main. They only mutate
+  // `state`; the page's next poll lands here (onMessage: safe) and sweeps up.
+  function reapMirror() {
+    if (mirror !== null && (state.phase === "idle" || state.phase === "error")) endMirror();
+  }
+
+  event.on("mpv.pause.changed", function () {
+    if (mirror === null || playerGone) return;
+    mirror = mirrorOnMpvPause(mirror, !!mpv.getFlag("pause"));
+  });
+  event.on("mpv.seek", function () {
+    if (mirror === null || playerGone) return;
+    mirror = mirrorOnMpvSeek(mirror, mpv.getNumber("time-pos") || 0, Date.now());
+  });
+  // A new file invalidates the whole cast: the stream on the TV is the old
+  // file. file-loaded is an app event (main thread), so stopCast is safe here.
+  event.on("iina.file-loaded", function () {
+    playerGone = false; // a file only loads into a live mpv core
+    if (pendingMute !== null) {
+      mpv.set("mute", pendingMute); // a cast ended while the window was closed
+      pendingMute = null;
+    }
+    if (mirror === null) return;
+    stopCast();
+  });
+
+  // Resolve our own install dir: @data is <plugins>/.data/<identifier>; the
+  // plugin itself lives directly under that <.../plugins> directory, in the
+  // folder whose Info.json carries <identifier>. Find it with
+  // BIN_DIR_LOOKUP_SCRIPT once, then cache it in @data so later launches skip
+  // the lookup.
+  // utils.exec wipes the environment (only LC_ALL survives — no HOME), so the
+  // plugins dir is derived in JS via utils.resolvePath and passed to the
+  // shell as an argument rather than relied on via $HOME.
+  function resolveBinDir(cb) {
+    var cached = null;
+    try { cached = file.read("@data/bindir.txt"); } catch (e) {}
+    if (cached && cached.trim()) { cb(cached.trim(), null); return; }
+    var dataDir = utils.resolvePath("@data/");
+    var pluginsDir = pluginsDirFromDataDir(dataDir);
+    var identifier = identifierFromDataDir(dataDir);
+    if (!pluginsDir || !identifier) { cb(null, "cannot resolve plugins directory"); return; }
+    utils.exec("/bin/sh", ["-c", BIN_DIR_LOOKUP_SCRIPT, "sh", pluginsDir, identifierPattern(identifier)]).then(function (r) {
+      if (r.status === 0 && r.stdout) {
+        file.write("@data/bindir.txt", r.stdout);
+        cb(r.stdout, null);
+      } else if (r.status === 3) {
+        // Never offer to download anything — docs/distribution.md non-goals.
+        cb(null, "the bundled helper or ffmpeg is missing, not executable, or quarantined; " +
+                 "reinstall the plugin through IINA (Settings → Plugins → Install)");
+      } else {
+        cb(null, "cannot locate plugin bin directory");
+      }
+    }).catch(function (e) {
+      cb(null, "cannot locate plugin bin directory: " + String(e));
+    });
+  }
+
+  // Drop the cached bin dir so the next resolveBinDir call re-derives it
+  // instead of reusing a directory that just failed to produce a runnable
+  // helper (e.g. the plugin was reinstalled to a new path).
+  function invalidateBinDirCache() {
+    try { file.write("@data/bindir.txt", ""); } catch (e) {}
+  }
+
+  function startCast() {
+    if (playerGone) return; // every line below reads mpv
+    reapMirror(); // a helper-initiated teardown may have left a stale mirror
+                  // un-reaped (only the getState poll normally does that); a
+                  // restart must not let newMirror() capture that stale
+                  // savedMute instead of the user's real pre-cast value.
+    if (state.phase === "starting" || state.phase === "ready" || state.phase === "packaged") return;
+    var src = normalizeSource(mpv.getString("path"));
+    if (!src) {
+      var nothingMsg = "nothing is playing";
+      core.osd("AirPlay: " + nothingMsg);
+      state = { phase: "error", url: null, pct: 0, msg: nothingMsg };
+      return;
+    }
+    if (hasURLScheme(src)) {
+      // The bundled ffmpeg is built --disable-network and has no protocol
+      // handler for these at all, so say so plainly rather than letting
+      // ffmpeg fail obscurely.
+      var streamMsg = "can only cast local files, not network streams";
+      core.osd("AirPlay: " + streamMsg);
+      state = { phase: "error", url: null, pct: 0, msg: streamMsg };
+      return;
+    }
+    if (src.charAt(0) !== "/") {
+      // A relative path: the pipeline hands src straight to ffmpeg as -i,
+      // which wants a plain absolute path. (file:// URIs no longer reach
+      // this branch — normalizeSource above turns them into absolute paths
+      // before either guard runs.)
+      var pathMsg = "needs a local file path";
+      core.osd("AirPlay: " + pathMsg);
+      state = { phase: "error", url: null, pct: 0, msg: pathMsg };
+      return;
+    }
+    var tracks = selectTracks(mpv.getNative("track-list") || []);
+    if (!tracks) {
+      var tracksMsg = "no castable video/audio tracks";
+      core.osd("AirPlay: " + tracksMsg);
+      state = { phase: "error", url: null, pct: 0, msg: tracksMsg };
+      return;
+    }
+    if (tracks.subDropped) {
+      core.osd("AirPlay: selected subtitles can't be cast (image-based, unsupported, or file not found); casting without them");
+    }
+    var pid = getIINAPid();
+    if (!isValidPid(pid)) {
+      core.osd("AirPlay: cannot determine IINA process id");
+      state = { phase: "error", url: null, pct: 0, msg: "cannot determine IINA process id" };
+      return;
+    }
+    // Read here, in the menu/onMessage (main-thread) context, and capture it:
+    // the serve args are built inside resolveBinDir's callback, which runs
+    // from a utils.exec promise, and nothing IINA-facing is called from there.
+    var lanIP = lanIPOverride(preferences.get("lanIP"));
+    var vrange = videoRangeHint(mpv.getString("video-params/gamma"));
+    var duration = mpv.getNumber("duration") || 0;
+    // With hardware decoding pixelformat is the surface type ("videotoolbox")
+    // and the real layout is in hw-pixelformat; with software decoding (all
+    // AV1 on pre-M3 Macs) hw-pixelformat is absent. Both return null, not
+    // throw, when unavailable.
+    var vdepth = videoBitDepth(mpv.getString("video-params/hw-pixelformat")) ||
+                 videoBitDepth(mpv.getString("video-params/pixelformat"));
+    var outDir = utils.resolvePath("@tmp/hls");
+    var gen = ++castGen;
+    stdoutRest = "";
+    state = { phase: "starting", url: null, pct: 0, msg: null };
+    // Muted mirror: keep mpv playing, silenced, instead of pausing. The page
+    // will best-effort seek the TV to startPos once wireless playback begins.
+    mirror = newMirror(mpv.getNumber("time-pos") || 0, !!mpv.getFlag("mute"), !!mpv.getFlag("pause"));
+    mpv.set("mute", true);
+
+    resolveBinDir(function (binDir, resolveErr) {
+      if (gen !== castGen) return; // superseded by a newer cast or a stop
+      if (resolveErr) {
+        state = { phase: "error", url: null, pct: 0, msg: resolveErr };
+        return;
+      }
+      var helper = binDir + "/airplay-helper";
+      var ffmpeg = binDir + "/ffmpeg";
+      var serveArgs = [
+        "serve",
+        "-source", src, "-out", outDir,
+        "-ffmpeg", ffmpeg,
+        "-parent", String(pid),
+        "-duration", String(duration),
+        "-vcodec", tracks.vcodec, "-acodec", tracks.acodec,
+        "-vdepth", String(vdepth), "-vheight", String(tracks.vheight),
+        "-achannels", String(tracks.achannels),
+        "-vmap", String(tracks.vmap), "-amap", String(tracks.amap),
+      ];
+      if (tracks.sub) {
+        if (tracks.sub.path) serveArgs.push("-subpath", tracks.sub.path);
+        else serveArgs.push("-smap", String(tracks.sub.smap));
+        serveArgs.push("-sublang", tracks.sub.lang, "-subname", tracks.sub.title);
+      }
+      if (lanIP) serveArgs.push("-ip", lanIP);
+      if (vrange) serveArgs.push("-vrange", vrange);
+      utils.exec(helper, serveArgs, undefined, function (chunk) {
+        if (gen !== castGen) return;
+        var parsed = parseHelperEvents(stdoutRest, chunk);
+        stdoutRest = parsed.rest;
+        for (var i = 0; i < parsed.events.length; i++) {
+          var ev = parsed.events[i];
+          if (ev.event === "ready") {
+            state.phase = "ready"; state.url = ev.url;
+            console.log("[cast] stream ready at " + ev.url);
+          }
+          else if (ev.event === "progress") { state.pct = ev.pct; }
+          else if (ev.event === "packaged") { state.phase = state.phase === "ready" ? "packaged" : state.phase; state.pct = 100; }
+          else if (ev.event === "error") { state = { phase: "error", url: null, pct: 0, msg: ev.msg }; }
+          else if (ev.event === "stopped") { state = { phase: "idle", url: null, pct: 0, msg: null }; }
+        }
+      }, function (errChunk) {
+        // IINA's stderr handler keeps firing with "" after EOF until the
+        // process exits (issue #38); don't log those.
+        var line = errChunk.trim();
+        if (line) console.log("[helper:stderr] " + line);
+      }).then(function () {
+        if (gen !== castGen) return;
+        if (state.phase !== "error") state = { phase: "idle", url: null, pct: 0, msg: null };
+      }).catch(function (e) {
+        invalidateBinDirCache(); // helper failed to start; don't trust the cached dir next time
+        if (gen !== castGen) return;
+        state = { phase: "error", url: null, pct: 0, msg: String(e) };
+      });
+    });
+  }
+
+  function getIINAPid() {
+    // mpv exposes the process pid of IINA's mpv core, which lives inside IINA
+    // itself (libmpv), so it IS IINA's pid.
+    return mpv.getNumber("pid");
+  }
+
+  function stopCast() {
+    endMirror();
+    castGen++; // invalidate any in-flight cast's callbacks
+    resolveBinDir(function (binDir, resolveErr) {
+      if (resolveErr) { console.log("[stopCast] " + resolveErr); return; }
+      utils.exec(binDir + "/airplay-helper", ["stop", "-out", utils.resolvePath("@tmp/hls")]);
+    });
+    state = { phase: "idle", url: null, pct: 0, msg: null };
+  }
+
+  // Info.json's sidebarTab makes IINA show an "AirPlay" tab in the sidebar's
+  // Plugins section, which the user can open without ever touching the
+  // Plugins menu. That tab is an empty WKWebView until the plugin calls
+  // sidebar.loadFile (IINA never loads anything into it itself), so the page
+  // must be loaded as soon as the window exists — not only from the menu
+  // item, or the tab is blank and there is no Start casting button (#20).
+  // loadFile throws before iina.window-loaded; a plugin loaded at launch runs
+  // before that, one enabled from Settings runs after, so both paths are
+  // covered: try now, and again when the window reports in.
+  var sidebarLoaded = false;
+  function loadSidebar(force) {
+    if (sidebarLoaded && !force) return;
+    try {
+      sidebar.loadFile("sidebar.html"); // clears message listeners — register after
+    } catch (e) {
+      return; // no window yet; iina.window-loaded will retry
+    }
+    sidebar.onMessage("getState", function () {
+      reapMirror();
+      sidebar.postMessage("state", stateForPage()); // onMessage handlers are main-thread safe
+    });
+    // The page owns starting too, not just stopping: stopCast() tears the whole
+    // pipeline down, so without this the sidebar would be a dead end and the
+    // only way back to a cast would be re-running the menu item.
+    sidebar.onMessage("start", function () {
+      startCast();
+      sidebar.postMessage("state", stateForPage());
+    });
+    sidebar.onMessage("stop", function () {
+      stopCast();
+      sidebar.postMessage("state", stateForPage());
+    });
+    // The page's <video> failed to load the stream twice (issue #42). Probe
+    // the URL and leave the result on state.diag for the page's next poll.
+    // Only the current stream counts: a late report about a stream that has
+    // since been replaced or stopped would describe the wrong thing.
+    sidebar.onMessage("mediaError", function (d) {
+      if (!d || !state.url || d.url !== state.url) return;
+      var gen = castGen, url = state.url;
+      console.log("[cast] the page couldn't load " + url + " (media error " + (d.code == null ? "?" : d.code) + "); probing it");
+      state.diag = null;
+      function report(probe) {
+        if (gen !== castGen || state.url !== url) return;
+        var msg = describeMediaFailure(url, d.code, probe);
+        state.diag = { url: url, msg: msg };
+        console.log("[cast] " + msg);
+      }
+      // Absolute path: utils.exec runs with an empty PATH.
+      utils.exec("/usr/bin/curl", ["-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                                   "--max-time", "5", url])
+        .then(report, function () { report(null); });
+    });
+    sidebar.onMessage("tvState", function (tv) {
+      reapMirror(); // a helper-initiated teardown may have left a stale mirror
+                    // un-reaped; don't mpv.set against a dead stream.
+      if (mirror === null || !tv || playerGone) return;
+      var r = mirrorOnTvState(mirror, tv, mpv.getNumber("time-pos") || 0,
+                              !!mpv.getFlag("pause"), Date.now());
+      mirror = r.m;
+      if (r.teardown) { stopCast(); return; }
+      if (r.setMpvPaused !== null) mpv.set("pause", r.setMpvPaused);
+      if (r.setMpvPos !== null) mpv.set("time-pos", r.setMpvPos);
+    });
+    sidebarLoaded = true;
+  }
+  // Force on window-loaded: nothing can be casting before the window exists,
+  // so a reload here is harmless, and it guards against a pre-window loadFile
+  // that failed without throwing.
+  event.on("iina.window-loaded", function () { loadSidebar(true); });
+  loadSidebar(false);
+
+  function openSidebar() {
+    loadSidebar(false); // already loaded in the normal case; don't reload a
+                        // live page, that would tear down its <video> mid-cast
+    sidebar.show();
+  }
+
+  menu.addItem(menu.item("Cast to TV", function () {
+    openSidebar();  // main-thread menu callback: safe
+    startCast();    // helper events only mutate `state`; the page polls
+  }));
+}

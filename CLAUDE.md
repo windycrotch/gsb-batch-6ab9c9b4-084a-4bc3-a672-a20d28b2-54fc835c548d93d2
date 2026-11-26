@@ -1,0 +1,186 @@
+# IINA AirPlay plugin
+
+A plugin that gets the file IINA is playing onto an Apple TV. Shipping: the
+plugin (`plugin/`), the Go helper (`helper/`) and the packaging chain are all
+built, and releases are published and install through IINA — from its built-in
+plugin store on IINA 1.5.0 and later, where the plugin is listed under
+Community Plugins (`plugins.json` on `iina/iina`'s `develop`), or by repo slug
+on 1.4. The throwaway prototype under `prototype/` is kept as the record of
+what de-risked the design, not as live code.
+
+## The shape of the thing
+
+IINA cannot AirPlay its own video output and never will be able to from a plugin:
+it renders through mpv into a Metal/OpenGL layer, and macOS only exposes AirPlay
+video sending through AVFoundation's external-playback path. So this plugin does a
+**handoff**, not a mirror: package the file into something an Apple TV accepts,
+serve it on the LAN, hand the URL to the TV, and leave IINA as the remote control.
+
+Read `docs/feasibility.md` before proposing architecture changes. It has the full
+reasoning and the source citations.
+
+## Facts already established — do not re-research these
+
+From reading the IINA source (`github.com/iina/iina`) and Apple's docs:
+
+- **The plugin API is JavaScript in a JSContext.** No native code loading, no
+  render pipeline access. Modules: `core`, `mpv`, `event`, `menu`, `overlay`,
+  `sidebar`, `standaloneWindow`, `playlist`, `input`, `http` (client only),
+  `ws` (a WebSocket *server*, not HTTP), `file`, `utils`, `preferences`.
+- **`utils.exec` runs arbitrary binaries** — absolute paths, or paths under
+  `@data/` and `@tmp/`. IINA `chmod 755`s anything it runs out of its own data
+  directory. Gated on the `file-system` permission in `Info.json`.
+- **`utils.exec` replaces the process environment.** It sets only `LC_ALL`, so
+  `PATH` is empty in anything you spawn. Every helper must rebuild `PATH` itself.
+  This bites silently — the symptom is "command not found" for a binary that is
+  obviously installed.
+- **A binary without `/` in its name is only looked up in IINA's own bundled
+  binaries directory**, not your `PATH`. Always pass an absolute or `@data/` path.
+- **IINA is not App Sandboxed.** `IINA.entitlements` carries only
+  `allow-unsigned-executable-memory` and `disable-library-validation`. A spawned
+  helper can bind a port and talk to the LAN.
+- **`NSAllowsArbitraryLoadsInWebContent` is set** in IINA's `Info.plist`, so plain
+  HTTP loads fine inside plugin WebViews. The whole WKWebView approach depends on
+  this.
+- **`standaloneWindow` is a `WKWebView`** built with a default
+  `WKWebViewConfiguration`, where `allowsAirPlayForMediaPlayback` defaults to
+  `true`. `loadFile(path)` is relative to the plugin root and **clears message
+  listeners**, so register `onMessage` handlers *after* calling it. Inside the page
+  the bridge is `iina.postMessage(name, data)` / `iina.onMessage(name, cb)`.
+- **The Apple TV pulls the stream itself.** Serve on `0.0.0.0` and advertise the
+  Mac's LAN IP; `127.0.0.1` will not work.
+- **Apple TV 4K accepts** H.264 and HEVC (Main / Main 10) in MP4/M4V/MOV/HLS,
+  Dolby Vision Profile 5, HDR10 / HDR10+ / HLG; audio AAC, AC-3, E-AC-3, Atmos,
+  ALAC, FLAC. Not MKV, not DTS/DTS-HD, not TrueHD, not PGS subtitles.
+- **ffmpeg's HLS master playlist is not enough for HDR.** hlsenc writes
+  `CODECS` only for H.264 and never `VIDEO-RANGE` or `FRAME-RATE`. A variant
+  without `VIDEO-RANGE` is SDR, and AVFoundation fails an HDR10 stream in one
+  (-12927). It also rejects an HDR variant without `FRAME-RATE` (-12642,
+  `HDR alternate is missing FRAME-RATE`). Subtitled casts are the ones handed
+  the master, so those were the HDR casts that failed (issue #45). The helper
+  now adds all three when serving `master.m3u8`, from `init.mp4` and the first
+  segment. ffmpeg writes a `colr` box into `init.mp4` only when the source
+  container tags the transfer, so the plugin passes mpv's `video-params/gamma`
+  as a fallback. Verified on macOS AVFoundation, which also played HLG in an
+  SDR variant; tvOS itself is untested. CoreMedia logs why it rejects a
+  master (CONTRIBUTING.md, "What you cannot test without hardware").
+- **IINA does not bundle an `ffmpeg` CLI**, only the `libav*` dylibs.
+- **ffmpeg's native `av1` decoder is hardware-only.** Without a hwaccel it
+  fails every frame ("Your platform doesn't support hardware accelerated AV1
+  decoding"), yet it is listed in `ffmpeg -decoders` of every build. AV1 needs
+  `libdav1d`, statically linked by `packaging/build-ffmpeg.sh`; `helper/job.go`
+  names it explicitly for AV1 sources.
+- **Never call `mpv.*` after `iina.window-will-close`.** On quit IINA closes
+  every window, then destroys the mpv core and leaves the plugin API's handle
+  nil; any `mpv.*` call after that segfaults IINA natively (try/catch cannot
+  help), and the sidebar page keeps polling `getState` through the quit.
+  window-will-close also fires on a plain Cmd-W, after which IINA keeps
+  running and reuses the same player, plugin instance and window for the next
+  file without firing `iina.window-loaded` again. So `plugin/main.js` answers
+  from a snapshot, and defers any mute restore, until `iina.file-loaded`: a
+  file only loads into a live mpv core.
+- **Install and update are two different mechanisms**, and satisfying one does
+  not satisfy the other. Installing — by slug, or from the 1.5 store, which
+  resolves to the same call — reads
+  `api.github.com/repos/<ghRepo>/releases/latest` and takes the first asset
+  ending `.iinaplgz`. The update check reads
+  `raw.githubusercontent.com/<ghRepo>/<branch>/Info.json` — the **repository
+  root of a branch IINA hardcodes**, never the release — and compares its
+  `ghVersion` against **the installed package's own**; only then does it fetch
+  the asset. So the shipped `.iinaplgz` and `master` must carry the same number,
+  and the bump is merged to `master` **last**, after the release is published —
+  otherwise the beacon advertises a version whose asset is not up yet and the
+  update hands out the previous release. This is why `Info.json` lives at the
+  repo root and `packaging/pack.sh` copies it into the package. IINA 1.4.4 folds
+  a failed fetch and "no newer version" into one branch
+  (`JavascriptPlugin.swift`, `checkForUpdates`), so a 404 there surfaces as
+  **"No update found."** with no error — `v0.2.0` shipped perfectly and still
+  reached nobody. Bumping `ghVersion` is necessary but not sufficient. The
+  beacon is *branch state*, so a manifest fix reaches existing users on a plain
+  push to `master`, with no new tag or rebuild.
+- **The beacon branch depends on the IINA: 1.4.x reads `master`, 1.5.0 and
+  later read `main`** (`JavascriptPlugin.swift`, `checkNewVersion`). Both are
+  installed, so `master` is the trunk and **`main` is a mirror of it**, which
+  `.github/workflows/mirror-main.yml` fast-forwards on every push to `master`.
+  Never commit to `main`, never open a PR against it, never rename either
+  branch. 1.5.0 also throws on a failed fetch, and its Settings page checks all
+  plugins in one loop that the first throw aborts — so a missing `main` shows
+  every 1.5 user who has this plugin **"Error checking for updates."** for
+  their *whole* plugin list, which is what happened for a day after 1.5.0
+  shipped. `packaging/check-published.sh` reads both branches for that reason.
+  Do not "fix" this by renaming `master` to `main`: `raw.githubusercontent.com`
+  serves a `master` URL from the default branch when no `master` exists, so it
+  would appear to work, but that fallback is undocumented and one-way (a `main`
+  URL never falls back to `master`).
+  Full reasoning for both of these in `docs/releasing.md`.
+- **`plugin/Info.json` is generated by `make dev`** and gitignored. It is the
+  root manifest with its own identifier (`dev.faruk.iina-airplay.dev`), name
+  ("AirPlay (dev)") and no `ghRepo`/`ghVersion`, so the dev build loads next
+  to an installed copy. IINA allows one plugin per identifier: it renames a
+  duplicate with a random UUID on every launch, which resets its settings and
+  disables it (`JavascriptPlugin.swift`, `loadPlugins`). Edit the root
+  `Info.json`; nothing ships from `plugin/Info.json`. `main.js` finds its own
+  `bin/` by the identifier in its `@data` path, so never hardcode the
+  identifier there. Reasoning in `packaging/dev-manifest.mjs`.
+
+## The design is settled — all prototype tests passed (2026-08-29, user-confirmed)
+
+WebKit's AirPlay picker works in the plugin's `standaloneWindow` **and** in the
+plugin's sidebar webview, and the packaged stream played on the user's TV both
+ways. So the real plugin is **JS + ffmpeg + a small HTTP server, no native code,
+and no extra window**: the cast UI lives in a sidebar tab (Info.json
+`"sidebarTab"`) with a hidden 1×1 px `<video>` and a button calling
+`webkitShowPlaybackTargetPicker()` — the picker requires a user gesture inside
+web content, so a native menu item cannot summon it directly.
+
+Hard-won constraints from the prototype runs (details in `docs/prototype.md`):
+
+- **`sidebar.show()` SIGABRTs IINA when called from a `utils.exec` callback**
+  (AutoLayout thread assertion; exec callbacks run off-main). `standaloneWindow.*`
+  is safe from anywhere. Only call `sidebar.*` from menu/onMessage callbacks; let
+  the page poll for background results.
+- **The spawned helper outlives IINA** (quit *and* crash). The real plugin needs
+  explicit helper kill and stale-port detection on start.
+- **First media load flakes** (`error code=4`, then plays on reload) in both
+  webviews. Retry once automatically.
+- `fetch()` from the plugin page cannot reach the stream (CORS, `file://` origin);
+  `<video>` loads are exempt.
+
+## Dev loop
+
+```sh
+# build the helper and link plugin/ into IINA as "AirPlay (dev)"; re-runnable,
+# and edits are picked up on IINA restart
+make dev
+# take the dev build out of IINA again
+make undev
+# ...and to scaffold a fresh plugin with the official TS template:
+/Applications/IINA.app/Contents/MacOS/iina-plugin create <name>
+```
+
+The dev build has its own identifier, so it runs alongside the installed
+plugin: no need to move the installed copy out. Disable one of the two in
+Settings → Plugins to keep a single AirPlay tab.
+
+Plugin logs: there is **no console in IINA's plugin settings** (1.4.4). Plugin
+`console.log` goes to IINA's own log at debug level, and IINA logs nothing at all
+unless Settings → Advanced has both **Enable advanced settings** and **Enable
+logging to file** on — read once at launch, so restart IINA after flipping them
+(`Logger.swift`, `Logger.enabled`). Then **Window → Log Viewer** (⌃⌘L), subsystem
+`player<N> - AirPlay` (`- AirPlay (dev)` for the `make dev` build); files under
+`~/Library/Logs/com.colliderli.iina/`. There is also a JS dev tool
+(`isInspectable` is on for macOS 13.3+, so Safari's Web Inspector can attach to
+plugin WebViews).
+
+Requires a local `ffmpeg` (`brew install ffmpeg`). No Local Network permission is
+needed: the helper only accepts inbound TCP and AirPlay goes through WebKit, neither
+of which macOS gates (Apple TN3179). IINA never prompts and never appears in that list.
+
+## Working notes
+
+- Prefer remuxing over re-encoding, always. A remux of an HEVC file is seconds; a
+  re-encode of a UHD remux is not something anyone will wait for.
+- Subtitles are the ugly part. PGS cannot pass through; burning in forces a full
+  video re-encode. Text subtitles convert to WebVTT.
+- The prototype is deliberately crude (one video track, one audio track, no subs,
+  no seeking, helper only dies with IINA). Do not treat its shortcuts as decisions.

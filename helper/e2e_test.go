@@ -1,0 +1,542 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// findFFmpeg returns the ffmpeg under test — the pipeline's ffmpeg. Set
+// IINA_AIRPLAY_FFMPEG to point the suite at the bundled build produced by
+// packaging/build-ffmpeg.sh; a bad path fails loudly rather than falling back,
+// so a typo can never be mistaken for a passing bundled build.
+func findFFmpeg(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("IINA_AIRPLAY_FFMPEG"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("IINA_AIRPLAY_FFMPEG=%q is not usable: %v", p, err)
+		}
+		return p
+	}
+	return findSystemFFmpeg(t)
+}
+
+// systemFFmpegCandidates is the search list for findSystemFFmpeg, factored
+// out so the fallback-vs-fatal decision in locateSystemFFmpeg can be unit
+// tested with fake paths instead of the real filesystem.
+var systemFFmpegCandidates = []string{"/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"}
+
+// locateSystemFFmpeg is the pure decision logic behind findSystemFFmpeg: given
+// a list of candidate paths, a stat function, and whether a bundled-ffmpeg
+// gate run was requested (IINA_AIRPLAY_FFMPEG set), it decides whether to
+// return a found binary, skip the test, or fail it outright. It takes no
+// *testing.T so table-driven tests can exercise the decision directly.
+func locateSystemFFmpeg(candidates []string, stat func(string) error, gateRequested bool) (path string, skip bool, fatal string) {
+	for _, p := range candidates {
+		if err := stat(p); err == nil {
+			return p, false, ""
+		}
+	}
+	if gateRequested {
+		return "", false, "IINA_AIRPLAY_FFMPEG requested a bundled-ffmpeg gate run, but no full-featured system ffmpeg was found to author test fixtures (checked: " +
+			strings.Join(candidates, ", ") +
+			"). Fixtures need libx264, libx265, flac, srt and the matroska muxer, which the bundled build deliberately excludes — install Homebrew's ffmpeg (`brew install ffmpeg`) to run the gate."
+	}
+	return "", true, ""
+}
+
+// findSystemFFmpeg returns a full-featured ffmpeg for authoring test fixtures
+// — never the binary under test, findFFmpeg's job. Fixtures need libx264,
+// libx265, flac, srt and the matroska muxer — exactly what the bundled LGPL
+// build excludes — so this deliberately stays on Homebrew's ffmpeg regardless of
+// IINA_AIRPLAY_FFMPEG. When that variable is set, a gate run against the
+// bundled build was explicitly requested, so a missing system ffmpeg here is
+// a hard failure rather than a skip: skipping would let `go test` exit 0
+// without the bundled ffmpeg ever having been driven through the pipeline.
+func findSystemFFmpeg(t *testing.T) string {
+	t.Helper()
+	gateRequested := os.Getenv("IINA_AIRPLAY_FFMPEG") != ""
+	path, skip, fatal := locateSystemFFmpeg(systemFFmpegCandidates, func(p string) error {
+		_, err := os.Stat(p)
+		return err
+	}, gateRequested)
+	if fatal != "" {
+		t.Fatal(fatal)
+	}
+	if skip {
+		t.Skip("no local ffmpeg; skipping real-media e2e")
+	}
+	return path
+}
+
+// Synthesizes a small H.264 + stereo FLAC MKV — exercises video copy plus the
+// lossless-audio re-encode branch.
+func makeFixture(t *testing.T, ffmpeg string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fixture.mkv")
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=duration=8:size=640x360:rate=25",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+		"-c:v", "libx264", "-preset", "ultrafast", "-c:a", "flac", p)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v\n%s", err, out)
+	}
+	return p
+}
+
+// makeAV1Fixture synthesizes a short 10-bit AV1 MKV — the shape of most AV1
+// releases. Needs an AV1 encoder in the system ffmpeg (Homebrew's has both).
+func makeAV1Fixture(t *testing.T, ffmpeg string) string {
+	t.Helper()
+	enc, _ := exec.Command(ffmpeg, "-hide_banner", "-encoders").Output()
+	var codec []string
+	switch {
+	case strings.Contains(string(enc), "libsvtav1"):
+		codec = []string{"-c:v", "libsvtav1", "-preset", "12"}
+	case strings.Contains(string(enc), "libaom-av1"):
+		codec = []string{"-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1"}
+	default:
+		if os.Getenv("IINA_AIRPLAY_FFMPEG") != "" {
+			t.Fatal("system ffmpeg has no AV1 encoder (libsvtav1 or libaom-av1) to author the AV1 fixture; install Homebrew's ffmpeg")
+		}
+		t.Skip("system ffmpeg has no AV1 encoder; skipping AV1 decode check")
+	}
+	p := filepath.Join(t.TempDir(), "av1.mkv")
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=duration=2:size=640x360:rate=25",
+		"-pix_fmt", "yuv420p10le"}
+	args = append(args, codec...)
+	if out, err := exec.Command(ffmpeg, append(args, p)...).CombinedOutput(); err != nil {
+		t.Fatalf("AV1 fixture: %v\n%s", err, out)
+	}
+	return p
+}
+
+// AV1 is where "the decoder is listed" and "the decoder works" part ways.
+// ffmpeg's native av1 decoder is hardware-only and fails every frame without
+// a hwaccel, yet it satisfies verify.sh's `-decoders | grep av1` on its own.
+// Run BuildArgs' real input and video options through the ffmpeg under test
+// on a 10-bit AV1 file and check what comes out is HEVC Main 10 at 10 bits.
+// The bundled build has no null muxer and no software video encoder, so the
+// output is a short mp4 from hevc_videotoolbox itself.
+func TestRealFFmpegDecodesAV1TenBit(t *testing.T) {
+	ffmpeg := findFFmpeg(t)
+	fixture := makeAV1Fixture(t, findSystemFFmpeg(t))
+	c := JobConfig{Source: fixture, OutDir: t.TempDir(), VCodec: "av1", VDepth: 10}
+	args := BuildArgs(c)
+	src := slices.Index(args, fixture)
+	enc := slices.Index(args, "hevc_videotoolbox")
+	aud := slices.Index(args, "-c:a")
+	if src < 0 || enc < 1 || aud < enc {
+		t.Fatalf("unexpected BuildArgs shape: %q", args)
+	}
+	out := filepath.Join(t.TempDir(), "av1-to-hevc.mp4")
+	run := append(slices.Clone(args[:src+1]), "-map", "0:0")
+	run = append(run, args[enc-1:aud]...) // -c:v hevc_videotoolbox ... -pix_fmt p010le
+	run = append(run, "-frames:v", "20", "-f", "mp4", out)
+	res, err := exec.Command(ffmpeg, run...).CombinedOutput()
+	log := string(res)
+	if err != nil {
+		for _, bad := range []string{"Unknown decoder", "hardware accelerated AV1", "Missing Sequence Header", "Error submitting packet to decoder"} {
+			if strings.Contains(log, bad) {
+				t.Fatalf("ffmpeg under test cannot decode 10-bit AV1 with the pipeline's input options: %v\n%s", err, log)
+			}
+		}
+		if strings.Contains(log, "Unknown encoder") {
+			// Not macOS: ffmpeg rejects the output before decoding anything.
+			t.Skipf("hevc_videotoolbox does not exist in this ffmpeg (not macOS); AV1 path not exercised:\n%s", log)
+		}
+		if strings.Contains(log, "compression session") || strings.Contains(log, "Error while opening encoder") {
+			// The encoder only opens after the first frame decodes, so AV1
+			// decoding is proven; VideoToolbox itself is unavailable here
+			// (non-macOS, or a VM without the hardware encoder).
+			t.Skipf("AV1 decoded, but hevc_videotoolbox is unavailable here; output check skipped:\n%s", log)
+		}
+		t.Fatalf("AV1 re-encode failed: %v\n%s", err, log)
+	}
+	probe, _ := exec.Command(ffmpeg, "-hide_banner", "-i", out).CombinedOutput()
+	for _, want := range []string{"hevc (Main 10)", "hvc1", "yuv420p10le"} {
+		if !strings.Contains(string(probe), want) {
+			t.Fatalf("re-encoded AV1 output lacks %q — not a 10-bit HEVC Main 10 stream:\n%s", want, probe)
+		}
+	}
+}
+
+func TestRealFFmpegEndToEnd(t *testing.T) {
+	ffmpeg := findFFmpeg(t)
+	fixture := makeFixture(t, findSystemFFmpeg(t))
+	bin := buildHelper(t)
+	out := t.TempDir()
+
+	cmd := exec.Command(bin, "serve",
+		"-source", fixture, "-out", out, "-ffmpeg", ffmpeg,
+		"-parent", fmt.Sprint(os.Getpid()), "-duration", "8",
+		"-vcodec", "h264", "-acodec", "flac", "-achannels", "2", "-vmap", "0", "-amap", "1")
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cmd.Process.Kill(); cmd.Wait() }()
+
+	var url string
+	sawPackaged := false
+	sc := bufio.NewScanner(stdout)
+	timeout := time.After(60 * time.Second)
+	for url == "" || !sawPackaged {
+		lineCh := make(chan string, 1)
+		go func() {
+			if sc.Scan() {
+				lineCh <- sc.Text()
+			} else {
+				lineCh <- ""
+			}
+		}()
+		select {
+		case line := <-lineCh:
+			if line == "" {
+				t.Fatal("stdout closed early")
+			}
+			var ev map[string]any
+			json.Unmarshal([]byte(line), &ev)
+			switch ev["event"] {
+			case "ready":
+				url, _ = ev["url"].(string)
+			case "packaged":
+				sawPackaged = true
+			case "error":
+				t.Fatalf("helper error: %v", ev)
+			}
+		case <-timeout:
+			t.Fatalf("timeout; url=%q packaged=%v", url, sawPackaged)
+		}
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	playlist := string(body)
+	if !strings.Contains(playlist, "#EXTM3U") || !strings.Contains(playlist, "seg_0000.m4s") {
+		t.Fatalf("implausible playlist:\n%s", playlist)
+	}
+	// AAC expected: stereo FLAC goes down the ≤2ch branch
+	segURL := strings.Replace(url, "index.m3u8", "init.mp4", 1)
+	resp2, err := http.Get(segURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("init.mp4 fetch: %d", resp2.StatusCode)
+	}
+}
+
+// Synthesizes H.264 + AAC + an embedded SRT track (streams 0/1/2).
+func makeSubbedFixture(t *testing.T, ffmpeg string) string {
+	t.Helper()
+	dir := t.TempDir()
+	srt := filepath.Join(dir, "subs.srt")
+	os.WriteFile(srt, []byte("1\n00:00:01,000 --> 00:00:03,000\nhello from iina-airplay\n"), 0o644)
+	p := filepath.Join(dir, "fixture-subs.mkv")
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=duration=8:size=640x360:rate=25",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+		"-i", srt,
+		"-map", "0:v", "-map", "1:a", "-map", "2:s",
+		"-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "srt", p)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("subbed fixture: %v\n%s", err, out)
+	}
+	return p
+}
+
+// mediaURI pulls the URI="..." value out of an EXT-X-MEDIA line.
+func mediaURI(line string) string {
+	const k = `URI="`
+	i := strings.Index(line, k)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(k):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+func TestRealFFmpegSubtitledEndToEnd(t *testing.T) {
+	ffmpeg := findFFmpeg(t)
+	fixture := makeSubbedFixture(t, findSystemFFmpeg(t))
+	bin := buildHelper(t)
+	out := t.TempDir()
+
+	cmd := exec.Command(bin, "serve",
+		"-source", fixture, "-out", out, "-ffmpeg", ffmpeg,
+		"-parent", fmt.Sprint(os.Getpid()), "-duration", "8",
+		"-vcodec", "h264", "-acodec", "aac", "-achannels", "2", "-vmap", "0", "-amap", "1",
+		"-smap", "2", "-sublang", "en", "-subname", "English")
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cmd.Process.Kill(); cmd.Wait() }()
+
+	url := waitReady(t, stdout, 60*time.Second)
+	if !strings.HasSuffix(url, "/master.m3u8") {
+		t.Fatalf("subtitled cast must advertise master.m3u8, got %q", url)
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	master := string(body)
+	var subLine string
+	for _, line := range strings.Split(master, "\n") {
+		if strings.HasPrefix(line, "#EXT-X-MEDIA:") && strings.Contains(line, "TYPE=SUBTITLES") {
+			subLine = line
+		}
+	}
+	if subLine == "" {
+		t.Fatalf("no subtitle rendition in master:\n%s", master)
+	}
+	for _, want := range []string{"DEFAULT=YES", `NAME="English"`, `LANGUAGE="en"`} {
+		if !strings.Contains(subLine, want) {
+			t.Fatalf("subtitle line missing %s:\n%s", want, subLine)
+		}
+	}
+
+	// The rendition playlist and its first segment must be fetchable, and the
+	// cue text must have survived the WebVTT conversion.
+	vttPlaylistURL := strings.Replace(url, "master.m3u8", mediaURI(subLine), 1)
+	resp2, err := http.Get(vttPlaylistURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 || !strings.Contains(string(body2), "#EXTM3U") {
+		t.Fatalf("vtt playlist fetch: %d\n%s", resp2.StatusCode, body2)
+	}
+	var seg string
+	for _, line := range strings.Split(string(body2), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			seg = line
+			break
+		}
+	}
+	if seg == "" {
+		t.Fatalf("no segment in vtt playlist:\n%s", body2)
+	}
+	resp3, err := http.Get(strings.Replace(url, "master.m3u8", seg, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	if !strings.Contains(string(body3), "hello from iina-airplay") {
+		t.Fatalf("cue text missing from first vtt segment:\n%s", body3)
+	}
+}
+
+// Synthesizes HEVC Main 10 tagged BT.2020 with the given transfer (HDR10's
+// smpte2084, or arib-std-b67 for HLG) + E-AC-3 + an embedded SRT track
+// (streams 0/1/2). setparams tags the frames, so the transfer reaches both
+// the bitstream and the container, as in a real HDR release; -color_trc
+// alone no longer does on ffmpeg 9.
+func makeHDRFixture(t *testing.T, ffmpeg, trc string, rate int) string {
+	t.Helper()
+	dir := t.TempDir()
+	srt := filepath.Join(dir, "subs.srt")
+	os.WriteFile(srt, []byte("1\n00:00:01,000 --> 00:00:03,000\nhello from iina-airplay\n"), 0o644)
+	p := filepath.Join(dir, "fixture-hdr.mkv")
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=duration=8:size=640x360:rate=%d", rate),
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+		"-i", srt,
+		"-map", "0:v", "-map", "1:a", "-map", "2:s",
+		"-vf", "setparams=color_primaries=bt2020:color_trc="+trc+":colorspace=bt2020nc,format=yuv420p10le",
+		"-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error",
+		"-c:a", "eac3", "-c:s", "srt", p)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hdr fixture: %v\n%s", err, out)
+	}
+	return p
+}
+
+func streamInf(master string) string {
+	for _, line := range strings.Split(master, "\n") {
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") {
+			return line
+		}
+	}
+	return ""
+}
+
+// Issue #45: an HDR file cast with subtitles is handed to the TV as
+// master.m3u8, and ffmpeg's master announces neither codecs, video range nor
+// frame rate, so AVFoundation fails the variant. The served master must
+// carry all three. This 8 s fixture finishes packaging before the fetch, so
+// it checks ffmpeg's end-of-job variant line; the mid-packaging line is
+// TestServerAddsCodecsAndVideoRangeFromInitSegment's. 25 fps in a 16000
+// timescale gives equal frame durations; 24 fps the uneven 666/667 ones.
+func TestRealFFmpegHDRSubtitledEndToEnd(t *testing.T) {
+	for _, c := range []struct {
+		name, trc, videoRange string
+		rate                  int
+	}{
+		{"HDR10 25fps", "smpte2084", "PQ", 25},
+		{"HLG 24fps", "arib-std-b67", "HLG", 24},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ffmpeg := findFFmpeg(t)
+			fixture := makeHDRFixture(t, findSystemFFmpeg(t), c.trc, c.rate)
+			bin := buildHelper(t)
+			out := t.TempDir()
+
+			cmd := exec.Command(bin, "serve",
+				"-source", fixture, "-out", out, "-ffmpeg", ffmpeg,
+				"-parent", fmt.Sprint(os.Getpid()), "-duration", "8",
+				"-vcodec", "hevc", "-acodec", "eac3", "-achannels", "1", "-vmap", "0", "-amap", "1",
+				"-smap", "2", "-sublang", "en", "-subname", "English")
+			stdout, _ := cmd.StdoutPipe()
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { cmd.Process.Kill(); cmd.Wait() }()
+
+			url := waitReady(t, stdout, 60*time.Second)
+			inf := streamInf(getBody(t, url))
+			if !strings.Contains(inf, "VIDEO-RANGE="+c.videoRange) {
+				t.Fatalf("variant not announced as %s: %q", c.videoRange, inf)
+			}
+			m := regexp.MustCompile(`FRAME-RATE=(\d+\.\d{3})(,|$)`).FindStringSubmatch(inf)
+			if m == nil {
+				t.Fatalf("variant has no FRAME-RATE: %q", inf)
+			}
+			// An average over millisecond-rounded timestamps: close, not exact.
+			if fps, _ := strconv.ParseFloat(m[1], 64); math.Abs(fps-float64(c.rate)) > 0.05 {
+				t.Fatalf("FRAME-RATE %s for a %d fps source: %q", m[1], c.rate, inf)
+			}
+			t.Logf("served variant: %s", inf)
+			if !regexp.MustCompile(`CODECS="hvc1\.2\.4\.L\d+(\.[0-9A-F]+)*,ec-3"`).MatchString(inf) {
+				t.Fatalf("variant CODECS wrong for HEVC Main 10 + E-AC-3: %q", inf)
+			}
+		})
+	}
+}
+
+// The plugin's -vrange hint reaches the served master when init.mp4 has no
+// colr box to say otherwise (this fixture's source carries no colour tags).
+func TestRealFFmpegRangeHintReachesMaster(t *testing.T) {
+	ffmpeg := findFFmpeg(t)
+	fixture := makeSubbedFixture(t, findSystemFFmpeg(t))
+	bin := buildHelper(t)
+	out := t.TempDir()
+
+	cmd := exec.Command(bin, "serve",
+		"-source", fixture, "-out", out, "-ffmpeg", ffmpeg,
+		"-parent", fmt.Sprint(os.Getpid()), "-duration", "8",
+		"-vcodec", "h264", "-acodec", "aac", "-achannels", "2", "-vmap", "0", "-amap", "1",
+		"-smap", "2", "-vrange", "HLG")
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cmd.Process.Kill(); cmd.Wait() }()
+
+	url := waitReady(t, stdout, 60*time.Second)
+	if inf := streamInf(getBody(t, url)); !strings.Contains(inf, "VIDEO-RANGE=HLG") {
+		t.Fatalf("-vrange hint not applied: %q", inf)
+	}
+}
+
+// ffmpeg's hlsenc names H.264 + AAC itself once packaging ends, which makes
+// it an oracle for the init.mp4 parser: on the same output, the CODECS the
+// helper derives must be exactly the CODECS ffmpeg wrote.
+func TestInitSegmentCodecsMatchFfmpegOwn(t *testing.T) {
+	ffmpeg := findFFmpeg(t)
+	fixture := makeSubbedFixture(t, findSystemFFmpeg(t))
+	out := t.TempDir()
+	args := BuildArgs(JobConfig{Source: fixture, OutDir: out, VCodec: "h264", ACodec: "aac",
+		AChannels: 2, VMap: 0, AMap: 1, SubMap: "2"})
+	if b, err := exec.Command(ffmpeg, args...).CombinedOutput(); err != nil {
+		t.Fatalf("ffmpeg: %v\n%s", err, b)
+	}
+	raw, err := os.ReadFile(filepath.Join(out, "master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`CODECS="([^"]+)"`).FindStringSubmatch(streamInf(string(raw)))
+	if m == nil {
+		t.Fatalf("ffmpeg wrote no CODECS to compare against:\n%s", raw)
+	}
+	if got := VariantAttrs(out, "").Codecs; got != m[1] {
+		t.Fatalf("derived CODECS %q, ffmpeg wrote %q", got, m[1])
+	}
+}
+
+func TestFindFFmpegPrefersEnvOverride(t *testing.T) {
+	fake := filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("IINA_AIRPLAY_FFMPEG", fake)
+	if got := findFFmpeg(t); got != fake {
+		t.Fatalf("findFFmpeg = %q, want the env override %q", got, fake)
+	}
+}
+
+// TestLocateSystemFFmpeg exercises the fallback-vs-fatal decision in
+// locateSystemFFmpeg directly, with fake paths, so the "gate run requested
+// but no system ffmpeg available" scenario is proven without needing to
+// uninstall Homebrew's ffmpeg (which findSystemFFmpeg would otherwise find
+// on this machine every time).
+func TestLocateSystemFFmpeg(t *testing.T) {
+	exists := func(p string) error { return nil }
+	missing := func(p string) error { return os.ErrNotExist }
+
+	t.Run("found: returns the path", func(t *testing.T) {
+		path, skip, fatal := locateSystemFFmpeg([]string{"/found/ffmpeg"}, exists, false)
+		if path != "/found/ffmpeg" || skip || fatal != "" {
+			t.Fatalf("got (%q, %v, %q), want (\"/found/ffmpeg\", false, \"\")", path, skip, fatal)
+		}
+	})
+
+	t.Run("missing, no gate requested: skip, not fatal", func(t *testing.T) {
+		path, skip, fatal := locateSystemFFmpeg([]string{"/nowhere/ffmpeg"}, missing, false)
+		if path != "" || !skip || fatal != "" {
+			t.Fatalf("got (%q, %v, %q), want (\"\", true, \"\")", path, skip, fatal)
+		}
+	})
+
+	t.Run("missing, gate requested: fatal, not skip", func(t *testing.T) {
+		path, skip, fatal := locateSystemFFmpeg([]string{"/nowhere/ffmpeg"}, missing, true)
+		if path != "" || skip || fatal == "" {
+			t.Fatalf("got (%q, %v, %q), want (\"\", false, non-empty)", path, skip, fatal)
+		}
+		for _, want := range []string{"IINA_AIRPLAY_FFMPEG", "libx264", "flac", "srt", "matroska"} {
+			if !strings.Contains(fatal, want) {
+				t.Errorf("fatal message missing %q: %s", want, fatal)
+			}
+		}
+	})
+}
