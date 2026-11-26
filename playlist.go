@@ -38,11 +38,18 @@ func GenerateHLSVariant(resOptions []string, locPrefix string) ([]*Variant, erro
 
 	var variants []*Variant
 
+	// De-duplicate presets on first occurrence while preserving the caller
+	// order. Invalid presets keep being skipped as in the historical behavior.
+	seen := make(map[string]struct{}, len(resOptions))
 	for _, r := range resOptions {
 		c, err := getConfig(r)
 		if err != nil {
 			continue
 		}
+		if _, ok := seen[c.Name]; ok {
+			continue
+		}
+		seen[c.Name] = struct{}{}
 
 		url := fmt.Sprintf("%s.m3u8", c.Name)
 		if locPrefix != "" {
@@ -65,15 +72,10 @@ func GenerateHLSVariant(resOptions []string, locPrefix string) ([]*Variant, erro
 	return variants, nil
 }
 
-// GeneratePlaylist will generate playlist file from the given variants.
-// Variant itself can be generate from GenerateHLSVariant() function of
-// suplied by the caller
-func GeneratePlaylist(variants []*Variant, targetPath, filename string) {
-	// Set default filename
-	if filename == "" {
-		filename = "playlist.m3u8"
-	}
-
+// renderPlaylist builds the exact master playlist text used by
+// GeneratePlaylist. Keeping it in one place guarantees the multi-rendition
+// flow emits the unchanged field/line format.
+func renderPlaylist(variants []*Variant) string {
 	// M3U Header
 	data := "#EXTM3U\n"
 	data += "#EXT-X-VERSION:3\n"
@@ -98,9 +100,54 @@ func GeneratePlaylist(variants []*Variant, targetPath, filename string) {
 		data += fmt.Sprintf("\n%s\n", v.URL)
 	}
 
-	// Write everything to the file
-	f, _ := os.Create(filepath.Join(targetPath, filename))
-	defer f.Close()
+	return data
+}
 
-	f.Write([]byte(data))
+// GeneratePlaylist will generate playlist file from the given variants.
+// Variant itself can be generate from GenerateHLSVariant() function of
+// suplied by the caller.
+//
+// It returns the create/write/sync error (if any); callers that ignore the
+// returned value keep the historical statement-style usage.
+func GeneratePlaylist(variants []*Variant, targetPath, filename string) error {
+	// Set default filename
+	if filename == "" {
+		filename = "playlist.m3u8"
+	}
+
+	return WritePlaylist(variants, filepath.Join(targetPath, filename))
+}
+
+// GeneratePlaylistE is kept as an explicitly error-returning alias of
+// GeneratePlaylist for callers/tests that prefer that name.
+func GeneratePlaylistE(variants []*Variant, targetPath, filename string) error {
+	return GeneratePlaylist(variants, targetPath, filename)
+}
+
+// WritePlaylist writes the rendered playlist to filename, surfacing create,
+// write, sync and close errors.
+func WritePlaylist(variants []*Variant, filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+
+	data := []byte(renderPlaylist(variants))
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// WritePlaylistAtomic writes data to a temp file in the same directory as
+// destination and renames it into place, so readers either observe the previous
+// complete file or the new complete file - never a half-written playlist.
+func WritePlaylistAtomic(variants []*Variant, destination string) error {
+	data := []byte(renderPlaylist(variants))
+	return atomicWriteFile(destination, data, 0o644)
 }
