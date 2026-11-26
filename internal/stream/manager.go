@@ -200,11 +200,14 @@ func (m *Manager) finish(id string, c *channel) {
 
 // Stop ends every viewer of one shared channel and cancels its upstream pair.
 // Removing the channel first lets a later tune start a fresh controller safely.
+// Stop waits for the channel controller (and any previous generation it is
+// serialized behind) to finish, including reaping the upstream process, so the
+// channel's upstream is truly gone when Stop returns.
 func (m *Manager) Stop(id string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	c := m.channels[id]
 	if c == nil {
+		m.mu.Unlock()
 		return false
 	}
 	delete(m.channels, id)
@@ -212,6 +215,18 @@ func (m *Manager) Stop(id string) bool {
 		c.timer.Stop()
 	}
 	c.cancel()
+	m.closeViewersLocked(c)
+	m.mu.Unlock()
+	// Wait without holding m.mu: the controller's finish needs the same lock.
+	// c.done is closed only after the runner returned (process cancelled and
+	// waited on) and its teardown completed.
+	<-c.done
+	return true
+}
+
+// closeViewersLocked discards buffered media and closes every subscriber of c,
+// balancing each removal against the active viewer count. Caller holds m.mu.
+func (m *Manager) closeViewersLocked(c *channel) {
 	for sub := range c.subscribers {
 	drain:
 		for {
@@ -225,20 +240,39 @@ func (m *Manager) Stop(id string) bool {
 		delete(c.subscribers, sub)
 		m.active--
 	}
-	return true
 }
 
 func (m *Manager) Close() {
 	m.mu.Lock()
+	if m.closing {
+		// Keep concurrent Close calls waiting until every controller is gone,
+		// rather than returning while the first shutdown is still reaping.
+		m.mu.Unlock()
+		m.wg.Wait()
+		return
+	}
 	m.closing = true
 	for _, c := range m.channels {
 		if c.timer != nil {
 			c.timer.Stop()
 		}
 		c.cancel()
+		// Release connected viewers immediately (and balance the count) so HTTP
+		// handlers do not linger behind a slow upstream cleanup. Deleting each
+		// subscriber also keeps finish/release from closing a channel twice.
+		m.closeViewersLocked(c)
 	}
+	m.active = 0
 	m.mu.Unlock()
 	m.wg.Wait()
+	// Every controller has now run finish. Reset the surfaces read by the
+	// dashboard so a final status snapshot reports the truthful closed state
+	// even if a controller was cancelled before its runner first started.
+	m.mu.Lock()
+	m.channels = map[string]*channel{}
+	m.runners = map[string]*channel{}
+	m.active = 0
+	m.mu.Unlock()
 }
 func FixtureRunner(binary, dir string) Runner {
 	return func(ctx context.Context, fixture string, emit func([]byte)) error {
