@@ -36,3 +36,23 @@ go get github.com/xfrr/goffmpeg
 
 ## Usage
 Check the [examples](./examples)
+
+### Stopping a transcode
+
+`Run` returns a channel that carries the process result; `Output` returns the
+progress channel of the current run. Both belong to one transcoding
+lifecycle:
+
+- `Stop` on a transcoder that was never started, already finished or already
+  stopping is safe and returns immediately.
+- After `Stop` on a running task, that task's progress channel is closed and
+  no progress parsed after the stop is published.
+- Starting the same transcoder again installs a fresh process, stderr pipe and
+  progress channel; the previous run is torn down first, so late output from
+  the old task can never appear as progress of the new one.
+- A failed process start follows the same teardown path, so no progress reader
+  or pipe is left dangling.
+
+The `examples/lifecycle-check` program (also `make lifecycle-check`) exercises
+a midway stop and a stop-then-restart against the real `ffmpeg`/`ffprobe`
+binaries using the repository 3gp sample.
