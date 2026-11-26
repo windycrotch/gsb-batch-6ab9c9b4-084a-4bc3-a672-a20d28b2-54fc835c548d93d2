@@ -1,0 +1,502 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/im-pingo/liveforge/core"
+	"github.com/im-pingo/liveforge/module/dvr"
+	"github.com/im-pingo/liveforge/module/record"
+)
+
+type recordingReadSeekCloser struct{ *bytes.Reader }
+
+func (recordingReadSeekCloser) Close() error { return nil }
+
+type recordingDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (w *recordingDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
+type recordingProviderStub struct {
+	items   []record.RecordingInfo
+	content []byte
+	deleted string
+	opened  int
+}
+
+func (*recordingProviderStub) Name() string                   { return "record" }
+func (*recordingProviderStub) Init(*core.Server) error        { return nil }
+func (*recordingProviderStub) Hooks() []core.HookRegistration { return nil }
+func (*recordingProviderStub) Close() error                   { return nil }
+func (m *recordingProviderStub) ListRecordings(context.Context) ([]record.RecordingInfo, error) {
+	return append([]record.RecordingInfo(nil), m.items...), nil
+}
+func (m *recordingProviderStub) Recording(_ context.Context, id string) (record.RecordingInfo, error) {
+	for _, item := range m.items {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return record.RecordingInfo{}, record.ErrRecordingNotFound
+}
+func (m *recordingProviderStub) OpenRecording(ctx context.Context, id string) (record.ReadSeekCloser, record.RecordingInfo, error) {
+	m.opened++
+	info, err := m.Recording(ctx, id)
+	if err != nil {
+		return nil, record.RecordingInfo{}, err
+	}
+	return recordingReadSeekCloser{bytes.NewReader(m.content)}, info, nil
+}
+
+func TestRecordingMediaRejectsBeforeOpenWhenGlobalConnectionLimitIsFull(t *testing.T) {
+	for _, action := range []string{"play", "download"} {
+		t.Run(action, func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.Limits.MaxConnections = 1
+			server := core.NewServer(cfg)
+			provider := &recordingProviderStub{
+				items:   []record.RecordingInfo{{ID: "live/cam.mp4", Format: "fmp4", State: record.RecordingCompleted}},
+				content: []byte("recording-data"),
+			}
+			server.RegisterModule(provider)
+			if !server.AcquireConn() {
+				t.Fatal("failed to occupy the only global connection slot")
+			}
+			defer server.ReleaseConn()
+
+			h := NewHandlers(server)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/cam.mp4?action="+action, nil)
+			req.SetPathValue("id", "live/cam.mp4")
+			response := httptest.NewRecorder()
+			if action == "play" {
+				h.handleRecordingPlay(response, req)
+			} else {
+				h.handleRecordingDownload(response, req)
+			}
+
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+			}
+			if provider.opened != 0 {
+				t.Fatalf("OpenRecording calls = %d, want 0", provider.opened)
+			}
+			if got := server.ConnectionCount(); got != 1 {
+				t.Fatalf("connection count = %d, want occupied count 1", got)
+			}
+		})
+	}
+}
+
+func TestRecordingMediaSetsWriteDeadlineAndReleasesConnectionSlot(t *testing.T) {
+	for _, action := range []string{"play", "download"} {
+		t.Run(action, func(t *testing.T) {
+			server := core.NewServer(newTestConfig())
+			provider := &recordingProviderStub{
+				items:   []record.RecordingInfo{{ID: "live/cam.mp4", Format: "fmp4", State: record.RecordingCompleted}},
+				content: []byte("recording-data"),
+			}
+			server.RegisterModule(provider)
+			if !server.AcquireConn() {
+				t.Fatal("failed to occupy baseline global connection slot")
+			}
+			defer server.ReleaseConn()
+
+			h := NewHandlers(server)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/cam.mp4?action="+action, nil)
+			req.SetPathValue("id", "live/cam.mp4")
+			response := &recordingDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			started := time.Now()
+			if action == "play" {
+				h.handleRecordingPlay(response, req)
+			} else {
+				h.handleRecordingDownload(response, req)
+			}
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+			}
+			if len(response.deadlines) != 1 {
+				t.Fatalf("write deadlines = %v, want exactly one", response.deadlines)
+			}
+			if got := response.deadlines[0]; got.Before(started.Add(9*time.Second)) || got.After(started.Add(11*time.Second)) {
+				t.Fatalf("write deadline = %v, want about 10s after start", got)
+			}
+			if provider.opened != 1 {
+				t.Fatalf("OpenRecording calls = %d, want 1", provider.opened)
+			}
+			if got := server.ConnectionCount(); got != 1 {
+				t.Fatalf("connection count = %d, want baseline count 1", got)
+			}
+		})
+	}
+}
+
+func TestRecordingDownloadRejectsFailedRecordingWithoutMedia(t *testing.T) {
+	server := core.NewServer(newTestConfig())
+	provider := &recordingProviderStub{
+		items:   []record.RecordingInfo{{ID: "live/failed.mp4", Format: "fmp4", State: record.RecordingFailed, Error: "disk full"}},
+		content: []byte("failed-media-must-not-be-served"),
+	}
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/failed.mp4?action=download", nil)
+	request.SetPathValue("id", "live/failed.mp4")
+	response := httptest.NewRecorder()
+	h.handleRecordingDownload(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "failed-media-must-not-be-served") {
+		t.Fatalf("failed recording download returned media body: %s", response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("content type = %q, want JSON error", got)
+	}
+}
+func (m *recordingProviderStub) DeleteRecording(_ context.Context, id string) error {
+	if _, err := m.Recording(context.Background(), id); err != nil {
+		return err
+	}
+	m.deleted = id
+	return nil
+}
+func (m *recordingProviderStub) RecordingStatus(context.Context) record.RecordingStatusSnapshot {
+	return record.RecordingStatusSnapshot{Metrics: record.RecordingMetricsSnapshot{FilesCompleted: 1}}
+}
+
+type dvrStatusProviderStub struct {
+	status  dvr.DVRStatusSnapshot
+	details map[string]dvr.DVRSessionStatus
+}
+
+func (*dvrStatusProviderStub) Name() string                       { return "dvr" }
+func (*dvrStatusProviderStub) Init(*core.Server) error            { return nil }
+func (*dvrStatusProviderStub) Hooks() []core.HookRegistration     { return nil }
+func (*dvrStatusProviderStub) Close() error                       { return nil }
+func (m *dvrStatusProviderStub) DVRStatus() dvr.DVRStatusSnapshot { return m.status }
+func (m *dvrStatusProviderStub) DVRSession(key string) (dvr.DVRSessionStatus, bool) {
+	status, ok := m.details[key]
+	return status, ok
+}
+
+func TestRecordingManagementHandlers(t *testing.T) {
+	completedAt := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	provider := &recordingProviderStub{
+		items:   []record.RecordingInfo{{ID: "live/cam.flv", State: record.RecordingCompleted, CompletedAt: completedAt}},
+		content: []byte("recording-data"),
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+
+	list := httptest.NewRecorder()
+	h.handleRecordings(list, httptest.NewRequest(http.MethodGet, "/api/v1/recordings", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "live/cam.flv") {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+
+	status := httptest.NewRecorder()
+	h.handleRecordingStatus(status, httptest.NewRequest(http.MethodGet, "/api/v1/recordings/status", nil))
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"files_completed":1`) {
+		t.Fatalf("status=%d body=%s", status.Code, status.Body.String())
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/cam.flv", nil)
+	detailReq.SetPathValue("id", "live/cam.flv")
+	detail := httptest.NewRecorder()
+	h.handleRecording(detail, detailReq)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), "live/cam.flv") {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	downloadReq := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/cam.flv/download", nil)
+	downloadReq.SetPathValue("id", "live/cam.flv")
+	download := httptest.NewRecorder()
+	h.handleRecordingDownload(download, downloadReq)
+	body, err := io.ReadAll(download.Result().Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if download.Code != http.StatusOK || string(body) != "recording-data" || !strings.Contains(download.Header().Get("Content-Disposition"), "cam.flv") {
+		t.Fatalf("download status=%d headers=%v body=%q", download.Code, download.Header(), body)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/recordings/live/cam.flv", nil)
+	deleteReq.SetPathValue("id", "live/cam.flv")
+	deleted := httptest.NewRecorder()
+	h.handleRecording(deleted, deleteReq)
+	if deleted.Code != http.StatusOK || provider.deleted != "live/cam.flv" {
+		t.Fatalf("delete status=%d id=%q", deleted.Code, provider.deleted)
+	}
+}
+
+func TestRecordingManagementReportsDisabledWithoutModule(t *testing.T) {
+	server := core.NewServer(newTestConfig())
+	h := NewHandlers(server)
+
+	list := httptest.NewRecorder()
+	h.handleRecordings(list, httptest.NewRequest(http.MethodGet, "/api/v1/recordings", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("disabled list status=%d body=%s", list.Code, list.Body.String())
+	}
+	var listEnvelope struct {
+		Data []record.RecordingInfo `json:"data"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listEnvelope); err != nil {
+		t.Fatalf("decode disabled list: %v", err)
+	}
+	if len(listEnvelope.Data) != 0 {
+		t.Fatalf("disabled list = %#v, want empty", listEnvelope.Data)
+	}
+
+	status := httptest.NewRecorder()
+	h.handleRecordingStatus(status, httptest.NewRequest(http.MethodGet, "/api/v1/recordings/status", nil))
+	if status.Code != http.StatusOK {
+		t.Fatalf("disabled status=%d body=%s", status.Code, status.Body.String())
+	}
+	var statusEnvelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(status.Body.Bytes(), &statusEnvelope); err != nil {
+		t.Fatalf("decode disabled status: %v", err)
+	}
+	if statusEnvelope.Data["enabled"] != false || statusEnvelope.Data["available"] != true || statusEnvelope.Data["state"] != "disabled" || statusEnvelope.Data["reason"] != "recording disabled" {
+		t.Fatalf("disabled status = %#v", statusEnvelope.Data)
+	}
+}
+
+func TestRecordingPlayHandlerServesInlineRangeableMedia(t *testing.T) {
+	provider := &recordingProviderStub{
+		items:   []record.RecordingInfo{{ID: "live/cam.mp4", Format: "fmp4", State: record.RecordingCompleted}},
+		content: []byte("0123456789"),
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/cam.mp4/play", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	req.SetPathValue("id", "live/cam.mp4")
+	w := httptest.NewRecorder()
+	h.handleRecordingPlay(w, req)
+
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("play status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Type"); got != "video/mp4" {
+		t.Fatalf("content type=%q", got)
+	}
+	if got := w.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "inline") || !strings.Contains(got, "cam.mp4") {
+		t.Fatalf("content disposition=%q", got)
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+		t.Fatalf("content range=%q", got)
+	}
+	if got := w.Body.String(); got != "2345" {
+		t.Fatalf("body=%q", got)
+	}
+}
+
+func TestRecordingPlayUsesFormatForMediaTypeBeforePathExtension(t *testing.T) {
+	provider := &recordingProviderStub{
+		items:   []record.RecordingInfo{{ID: "live/mismatch.flv", Format: "fmp4", State: record.RecordingCompleted}},
+		content: []byte("media"),
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/mismatch.flv/play", nil)
+	req.SetPathValue("id", "live/mismatch.flv")
+	w := httptest.NewRecorder()
+	h.handleRecordingPlay(w, req)
+	if got := w.Header().Get("Content-Type"); got != "video/mp4" {
+		t.Fatalf("content type = %q, want video/mp4", got)
+	}
+}
+
+func TestRecordingPlayHandlerRejectsActiveRecording(t *testing.T) {
+	provider := &recordingProviderStub{
+		items:   []record.RecordingInfo{{ID: "live/cam.ts", Format: "ts", State: record.RecordingActive}},
+		content: []byte("partial"),
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/live/cam.ts/play", nil)
+	req.SetPathValue("id", "live/cam.ts")
+	w := httptest.NewRecorder()
+	h.handleRecordingPlay(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("play active status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRecordingHandlerMapsProviderErrors(t *testing.T) {
+	provider := &recordingProviderStub{}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+
+	for _, test := range []struct {
+		id   string
+		want int
+	}{
+		{"missing.flv", http.StatusNotFound},
+		{"../escape.flv", http.StatusBadRequest},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/recordings/"+test.id, nil)
+		req.SetPathValue("id", test.id)
+		w := httptest.NewRecorder()
+		if test.id == "../escape.flv" {
+			writeRecordingError(w, record.ErrInvalidRecordingID)
+		} else {
+			h.handleRecording(w, req)
+		}
+		if w.Code != test.want {
+			t.Errorf("id=%q status=%d want=%d body=%s", test.id, w.Code, test.want, w.Body.String())
+		}
+	}
+	if got := recordingHTTPStatus(errors.New("storage unavailable")); got != http.StatusInternalServerError {
+		t.Fatalf("unexpected storage error status=%d", got)
+	}
+}
+
+func TestDVRStatusAndDetailHandlers(t *testing.T) {
+	provider := &dvrStatusProviderStub{
+		status:  dvr.DVRStatusSnapshot{Sessions: []dvr.DVRSessionStatus{{StreamKey: "live/cam", Segments: 3}}},
+		details: map[string]dvr.DVRSessionStatus{"live/cam": {StreamKey: "live/cam", Segments: 3}},
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	h := NewHandlers(server)
+
+	status := httptest.NewRecorder()
+	h.handleDVRStatus(status, httptest.NewRequest(http.MethodGet, "/api/v1/dvr/status", nil))
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"segments":3`) {
+		t.Fatalf("status=%d body=%s", status.Code, status.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/dvr/sessions/live/cam", nil)
+	req.SetPathValue("stream_key", "live/cam")
+	detail := httptest.NewRecorder()
+	h.handleDVRSession(detail, req)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), "live/cam") {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	missingReq := httptest.NewRequest(http.MethodGet, "/api/v1/dvr/sessions/missing", nil)
+	missingReq.SetPathValue("stream_key", "missing")
+	missing := httptest.NewRecorder()
+	h.handleDVRSession(missing, missingReq)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestRecordingAndDVRRoutesUseRegisteredProviders(t *testing.T) {
+	recordProvider := &recordingProviderStub{
+		items:   []record.RecordingInfo{{ID: "live/cam.flv", State: record.RecordingCompleted}},
+		content: []byte("media"),
+	}
+	dvrProvider := &dvrStatusProviderStub{
+		status:  dvr.DVRStatusSnapshot{Sessions: []dvr.DVRSessionStatus{{StreamKey: "live/cam"}}},
+		details: map[string]dvr.DVRSessionStatus{"live/cam": {StreamKey: "live/cam"}},
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(recordProvider)
+	server.RegisterModule(dvrProvider)
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, server)
+
+	for _, test := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodGet, "/api/v1/recordings", http.StatusOK},
+		{http.MethodGet, "/api/v1/recordings/status", http.StatusOK},
+		{http.MethodGet, "/api/v1/recordings/live/cam.flv", http.StatusOK},
+		{http.MethodGet, "/api/v1/recordings/live/cam.flv/download", http.StatusOK},
+		{http.MethodGet, "/api/v1/recordings/live/cam.flv/play", http.StatusOK},
+		{http.MethodDelete, "/api/v1/recordings/live/cam.flv", http.StatusOK},
+		{http.MethodGet, "/api/v1/dvr/status", http.StatusOK},
+		{http.MethodGet, "/api/v1/dvr/sessions/live/cam", http.StatusOK},
+	} {
+		req := httptest.NewRequest(test.method, test.path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != test.want {
+			t.Errorf("%s %s status=%d want=%d body=%s", test.method, test.path, w.Code, test.want, w.Body.String())
+		}
+	}
+}
+
+func TestRecordingRoutesPreserveExactActionLookingIDs(t *testing.T) {
+	provider := &recordingProviderStub{
+		items: []record.RecordingInfo{
+			{ID: "archive/play", Format: "fmp4", State: record.RecordingCompleted},
+			{ID: "archive/download", Format: "fmp4", State: record.RecordingCompleted},
+			{ID: "legacy/cam.mp4", Format: "fmp4", State: record.RecordingCompleted},
+		},
+		content: []byte("media"),
+	}
+	server := core.NewServer(newTestConfig())
+	server.RegisterModule(provider)
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, server)
+
+	request := func(method, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(method, target, nil))
+		return w
+	}
+
+	for _, id := range []string{"archive/play", "archive/download"} {
+		w := request(http.MethodGet, "/api/v1/recordings/"+id)
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"`+id+`"`) {
+			t.Errorf("detail %q status=%d body=%s", id, w.Code, w.Body.String())
+		}
+	}
+
+	for _, test := range []struct {
+		target      string
+		disposition string
+	}{
+		{target: "/api/v1/recordings/archive/play?action=play", disposition: "inline"},
+		{target: "/api/v1/recordings/archive/download?action=download", disposition: "attachment"},
+		{target: "/api/v1/recordings/legacy/cam.mp4/play", disposition: "inline"},
+		{target: "/api/v1/recordings/legacy/cam.mp4/download", disposition: "attachment"},
+	} {
+		w := request(http.MethodGet, test.target)
+		if w.Code != http.StatusOK || w.Body.String() != "media" || !strings.HasPrefix(w.Header().Get("Content-Disposition"), test.disposition) {
+			t.Errorf("GET %s status=%d disposition=%q body=%q", test.target, w.Code, w.Header().Get("Content-Disposition"), w.Body.String())
+		}
+	}
+
+	for _, id := range []string{"archive/play", "archive/download"} {
+		provider.deleted = ""
+		w := request(http.MethodDelete, "/api/v1/recordings/"+id)
+		if w.Code != http.StatusOK || provider.deleted != id {
+			t.Errorf("delete %q status=%d deleted=%q body=%s", id, w.Code, provider.deleted, w.Body.String())
+		}
+	}
+}

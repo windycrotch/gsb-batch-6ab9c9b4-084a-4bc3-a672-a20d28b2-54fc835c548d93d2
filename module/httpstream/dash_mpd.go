@@ -1,0 +1,282 @@
+package httpstream
+
+import (
+	"encoding/binary"
+	"encoding/xml"
+	"fmt"
+	"math"
+	"math/bits"
+	"strings"
+	"time"
+
+	"github.com/im-pingo/liveforge/pkg/avframe"
+	"github.com/im-pingo/liveforge/pkg/codec/aac"
+)
+
+// GenerateMPD generates a DASH MPD manifest for the current segment state.
+func (d *DASHManager) GenerateMPD() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	videoSegs := d.videoSegments
+	audioSegs := d.audioSegments
+	timelineSegs := videoSegs
+	if len(timelineSegs) == 0 {
+		timelineSegs = audioSegs
+	}
+
+	var totalDur float64
+	for _, seg := range timelineSegs {
+		totalDur += seg.Duration
+	}
+
+	bufferDepth := totalDur
+	if bufferDepth < d.targetDur*3 {
+		bufferDepth = d.targetDur * 3
+	}
+
+	// Compute average segment duration for minimumUpdatePeriod.
+	avgDurMs := int(d.targetDur * 1000)
+	if len(timelineSegs) > 2 {
+		var stableDur float64
+		for _, seg := range timelineSegs[2:] {
+			stableDur += seg.Duration
+		}
+		avgDurMs = int(math.Round(stableDur / float64(len(timelineSegs)-2) * 1000))
+	} else if len(timelineSegs) > 0 {
+		avgDurMs = int(math.Round(timelineSegs[len(timelineSegs)-1].Duration * 1000))
+	}
+	if avgDurMs <= 0 {
+		avgDurMs = int(d.targetDur * 1000)
+	}
+	updatePeriodSeconds := int(math.Ceil(float64(avgDurMs) / 1000.0))
+	if updatePeriodSeconds < 1 {
+		updatePeriodSeconds = 1
+	}
+	if updatePeriodSeconds > 2 {
+		updatePeriodSeconds = 2
+	}
+
+	// startNumber corresponds to the first segment in the current window.
+	startNumber := 1
+	if len(timelineSegs) > 0 {
+		startNumber = timelineSegs[0].SeqNum + 1 // SeqNum is 0-based; URL numbers are 1-based
+	}
+
+	ast := d.startTime
+
+	var sb strings.Builder
+	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+	fmt.Fprintf(&sb, `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" minimumUpdatePeriod="PT%dS" availabilityStartTime="%s" publishTime="%s" timeShiftBufferDepth="PT%dS" minBufferTime="PT2S" profiles="urn:mpeg:dash:profile:isoff-live:2011">`,
+		updatePeriodSeconds,
+		ast.Format(time.RFC3339),
+		time.Now().UTC().Format(time.RFC3339),
+		int(math.Ceil(bufferDepth)),
+	)
+	sb.WriteString("\n")
+	// UTCTiming: embed the current server time directly so dash.js can
+	// synchronize its clock without a separate round-trip.
+	fmt.Fprintf(&sb, "  <UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:direct:2014\" value=\"%s\"/>\n",
+		time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+	sb.WriteString(`  <Period id="0" start="PT0S">` + "\n")
+
+	// Video AdaptationSet with SegmentTimeline.
+	if d.hasVideo || len(videoSegs) > 0 {
+		sb.WriteString(`    <AdaptationSet id="0" contentType="video" mimeType="video/mp4" startWithSAP="1" segmentAlignment="true">` + "\n")
+		videoInitURL := d.basePath + "/vinit.mp4"
+		if version := initSegmentVersion(d.videoInitSeg); version != "" {
+			videoInitURL += "?v=" + version
+		}
+		fmt.Fprintf(&sb, `      <SegmentTemplate timescale="1000" startNumber="%d" initialization="%s" media="%s/v$Number$.m4s">`,
+			startNumber, escapeXMLAttribute(videoInitURL), escapeXMLAttribute(d.basePath))
+		sb.WriteString("\n")
+		sb.WriteString("        <SegmentTimeline>\n")
+		timeMs := int64(math.Round(d.timeBase * 1000))
+		for i, seg := range videoSegs {
+			durMs := int64(math.Round(seg.Duration * 1000))
+			if i == 0 {
+				fmt.Fprintf(&sb, "          <S t=\"%d\" d=\"%d\"/>\n", timeMs, durMs)
+			} else {
+				fmt.Fprintf(&sb, "          <S d=\"%d\"/>\n", durMs)
+			}
+			timeMs += durMs
+		}
+		sb.WriteString("        </SegmentTimeline>\n")
+		sb.WriteString("      </SegmentTemplate>\n")
+		videoCodecStr := d.videoCodecStr
+		if videoCodecStr == "" {
+			videoCodecStr = "avc1.640028"
+		}
+		vw, vh := d.videoWidth, d.videoHeight
+		if vw <= 0 {
+			vw = 1920
+		}
+		if vh <= 0 {
+			vh = 1080
+		}
+		fmt.Fprintf(&sb, "      <Representation id=\"0\" bandwidth=\"2000000\" codecs=\"%s\" width=\"%d\" height=\"%d\"/>\n",
+			videoCodecStr, vw, vh)
+		sb.WriteString("    </AdaptationSet>\n")
+	}
+
+	// Audio AdaptationSet with SegmentTimeline.
+	if d.hasAudio && len(audioSegs) > 0 {
+		audioCodecs := d.audioCodec
+		if audioCodecs == "" {
+			audioCodecs = "mp4a.40.2"
+		}
+		audioStartNumber := 1
+		if len(audioSegs) > 0 {
+			audioStartNumber = audioSegs[0].SeqNum + 1
+		}
+		sb.WriteString(`    <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" startWithSAP="1" segmentAlignment="true">` + "\n")
+		audioInitURL := d.basePath + "/audio_init.mp4"
+		if version := initSegmentVersion(d.audioInitSeg); version != "" {
+			audioInitURL += "?v=" + version
+		}
+		fmt.Fprintf(&sb, `      <SegmentTemplate timescale="1000" startNumber="%d" initialization="%s" media="%s/a$Number$.m4s">`,
+			audioStartNumber, escapeXMLAttribute(audioInitURL), escapeXMLAttribute(d.basePath))
+		sb.WriteString("\n")
+		sb.WriteString("        <SegmentTimeline>\n")
+		audioTimeMs := int64(math.Round(d.timeBase * 1000))
+		for i, seg := range audioSegs {
+			durMs := int64(math.Round(seg.Duration * 1000))
+			if i == 0 {
+				fmt.Fprintf(&sb, "          <S t=\"%d\" d=\"%d\"/>\n", audioTimeMs, durMs)
+			} else {
+				fmt.Fprintf(&sb, "          <S d=\"%d\"/>\n", durMs)
+			}
+			audioTimeMs += durMs
+		}
+		sb.WriteString("        </SegmentTimeline>\n")
+		sb.WriteString("      </SegmentTemplate>\n")
+		asr := d.audioSampleRate
+		if asr <= 0 {
+			asr = 44100
+		}
+		fmt.Fprintf(&sb, `      <Representation id="1" bandwidth="128000" codecs="%s" audioSamplingRate="%d"/>`, audioCodecs, asr)
+		sb.WriteString("\n")
+		sb.WriteString("    </AdaptationSet>\n")
+	}
+
+	sb.WriteString("  </Period>\n")
+	sb.WriteString("</MPD>\n")
+
+	return sb.String()
+}
+
+func escapeXMLAttribute(value string) string {
+	var escaped strings.Builder
+	_ = xml.EscapeText(&escaped, []byte(value))
+	return escaped.String()
+}
+
+// SegmentCount returns the number of timeline segments currently available.
+func (d *DASHManager) SegmentCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.videoSegments) == 0 {
+		return len(d.audioSegments)
+	}
+	return len(d.videoSegments)
+}
+
+// SegmentRange returns the SeqNum range [lo, hi] of timeline segments in memory.
+func (d *DASHManager) SegmentRange() (lo, hi int) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	segments := d.videoSegments
+	if len(segments) == 0 {
+		segments = d.audioSegments
+	}
+	if len(segments) == 0 {
+		return -1, -1
+	}
+	return segments[0].SeqNum, segments[len(segments)-1].SeqNum
+}
+
+// dashVideoCodecString returns the DASH codecs string (e.g., "avc1.640028")
+// extracted from the video sequence header. Falls back to a sensible default
+// if the header is unavailable or the codec is not recognized.
+func dashVideoCodecString(codec avframe.CodecType, seqHeader *avframe.AVFrame) string {
+	if seqHeader != nil && codec == avframe.CodecH264 && len(seqHeader.Payload) >= 4 {
+		// AVCDecoderConfigurationRecord: [1]=profile, [2]=constraint, [3]=level
+		return fmt.Sprintf("avc1.%02x%02x%02x",
+			seqHeader.Payload[1], seqHeader.Payload[2], seqHeader.Payload[3])
+	}
+	if seqHeader != nil && codec == avframe.CodecH265 {
+		if codecString, ok := dashHEVCCodecString("hvc1", seqHeader.Payload); ok {
+			return codecString
+		}
+	}
+	switch codec {
+	case avframe.CodecH264:
+		return "avc1.640028" // fallback: High profile, level 4.0
+	case avframe.CodecH265:
+		return "hvc1.1.6.L120.B0" // fallback: Main profile, level 4.0
+	default:
+		return "avc1.640028"
+	}
+}
+
+func dashHEVCCodecString(sampleEntry string, config []byte) (string, bool) {
+	if len(config) < 13 || config[0] != 1 {
+		return "", false
+	}
+
+	profileSpace := ""
+	switch config[1] >> 6 {
+	case 1:
+		profileSpace = "A"
+	case 2:
+		profileSpace = "B"
+	case 3:
+		profileSpace = "C"
+	}
+	profile := fmt.Sprintf("%s%d", profileSpace, config[1]&0x1F)
+	compatibility := fmt.Sprintf("%X", bits.Reverse32(binary.BigEndian.Uint32(config[2:6])))
+	tier := "L"
+	if config[1]&0x20 != 0 {
+		tier = "H"
+	}
+	level := fmt.Sprintf("%s%d", tier, config[12])
+
+	var constraints uint64
+	for _, value := range config[6:12] {
+		constraints = constraints<<8 | uint64(value)
+	}
+	constraintBytes := 6
+	for constraintBytes > 1 && constraints&0xFF == 0 {
+		constraints >>= 8
+		constraintBytes--
+	}
+	var constraintString strings.Builder
+	for index := constraintBytes - 1; index >= 0; index-- {
+		fmt.Fprintf(&constraintString, ".%X", constraints>>uint(index*8)&0xFF)
+	}
+
+	return fmt.Sprintf("%s.%s.%s.%s%s", sampleEntry, profile, compatibility, level, constraintString.String()), true
+}
+
+// dashAudioCodecString returns the DASH codecs string for an audio codec.
+// For AAC it parses the AudioSpecificConfig to extract the actual audioObjectType
+// so the codec string (e.g. "mp4a.40.2" for AAC-LC, "mp4a.40.5" for HE-AAC)
+// matches the ESDS in the init segment. Chrome MSE validates this match.
+func dashAudioCodecString(codec avframe.CodecType, audioSeqHeader *avframe.AVFrame) string {
+	switch codec {
+	case avframe.CodecAAC:
+		aot := 2 // default: AAC-LC
+		if audioSeqHeader != nil && len(audioSeqHeader.Payload) >= 2 {
+			if info, err := aac.ParseAudioSpecificConfig(audioSeqHeader.Payload); err == nil {
+				aot = info.ObjectType
+			}
+		}
+		return fmt.Sprintf("mp4a.40.%d", aot)
+	case avframe.CodecOpus:
+		return "opus"
+	case avframe.CodecMP3:
+		return "mp4a.40.34"
+	default:
+		return "mp4a.40.2"
+	}
+}

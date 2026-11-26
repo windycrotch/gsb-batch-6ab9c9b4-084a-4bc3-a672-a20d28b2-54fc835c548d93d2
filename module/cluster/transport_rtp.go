@@ -1,0 +1,1117 @@
+package cluster
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/im-pingo/liveforge/config"
+	"github.com/im-pingo/liveforge/core"
+	"github.com/im-pingo/liveforge/pkg/avframe"
+	"github.com/im-pingo/liveforge/pkg/portalloc"
+	pkgrtp "github.com/im-pingo/liveforge/pkg/rtp"
+	"github.com/im-pingo/liveforge/pkg/sdp"
+	pionrtp "github.com/pion/rtp/v2"
+)
+
+// parsePortRange parses a "min-max" string into a portalloc.PortAllocator.
+func parsePortRange(portRange string) (*portalloc.PortAllocator, error) {
+	parts := strings.SplitN(portRange, "-", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid port range %q: expected min-max", portRange)
+	}
+	minPort, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid min port %q: %w", parts[0], err)
+	}
+	maxPort, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid max port %q: %w", parts[1], err)
+	}
+	return portalloc.New(minPort, maxPort)
+}
+
+// RTPTransport implements RelayTransport for direct RTP relay with SDP-over-HTTP signaling.
+type RTPTransport struct {
+	cfg      config.ClusterRTPConfig
+	ports    *portalloc.PortAllocator
+	hub      *core.StreamHub
+	server   *core.Server
+	metrics  *RelayMetrics
+	sessions relaySessions
+}
+
+type sequenceLossTracker struct {
+	initialized bool
+	highest     uint16
+	expected    uint64
+	received    uint64
+	recent      uint64
+}
+
+func newSequenceLossTracker() *sequenceLossTracker {
+	return &sequenceLossTracker{}
+}
+
+func (t *sequenceLossTracker) Observe(sequence uint16) {
+	if !t.initialized {
+		t.initialized = true
+		t.highest = sequence
+		t.expected = 1
+		t.received = 1
+		t.recent = 1
+		return
+	}
+
+	advance := int16(sequence - t.highest)
+	if advance > 0 {
+		t.expected += uint64(advance)
+		t.highest = sequence
+		if advance >= 64 {
+			t.recent = 1
+		} else {
+			t.recent = (t.recent << uint(advance)) | 1
+		}
+		t.received++
+		return
+	}
+
+	offset := -int(advance)
+	if offset >= 64 {
+		return
+	}
+	mask := uint64(1) << uint(offset)
+	if t.recent&mask == 0 {
+		t.recent |= mask
+		t.received++
+	}
+}
+
+func (t *sequenceLossTracker) Ratio() float64 {
+	if t.expected == 0 || t.received >= t.expected {
+		return 0
+	}
+	return float64(t.expected-t.received) / float64(t.expected)
+}
+
+// NewRTPTransport creates a new RTP relay transport.
+// It registers SDP signaling HTTP handlers on the server.
+func NewRTPTransport(cfg config.ClusterRTPConfig, s *core.Server) *RTPTransport {
+	if cfg.PortRange == "" {
+		cfg.PortRange = "20000-20100"
+	}
+	if cfg.SignalingPath == "" {
+		cfg.SignalingPath = "/api/relay"
+	}
+	if cfg.RTCPInterval == 0 {
+		cfg.RTCPInterval = 5 * time.Second
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 15 * time.Second
+	}
+
+	ports, err := parsePortRange(cfg.PortRange)
+	if err != nil {
+		slog.Warn("rtp port allocator init failed, using defaults", "module", "cluster", "error", err)
+		ports, _ = portalloc.New(20000, 20100)
+	}
+
+	t := &RTPTransport{
+		cfg:    cfg,
+		ports:  ports,
+		hub:    s.StreamHub(),
+		server: s,
+	}
+
+	// Register signaling handlers.
+	pushPath := cfg.SignalingPath + "/push"
+	pullPath := cfg.SignalingPath + "/pull"
+	s.RegisterAPIHandler("POST "+pushPath, core.WithAPIPermission("server:mutate", http.HandlerFunc(t.handleSignalingPush)))
+	s.RegisterAPIHandler("POST "+pullPath, core.WithAPIPermission("server:mutate", http.HandlerFunc(t.handleSignalingPull)))
+
+	slog.Info("rtp transport initialized", "module", "cluster",
+		"port_range", cfg.PortRange, "signaling_path", cfg.SignalingPath)
+	return t
+}
+
+func (t *RTPTransport) Scheme() string { return "rtp" }
+
+// Push sends stream data via RTP to a remote node.
+// It performs SDP signaling via HTTP POST and then sends RTP packets over UDP.
+func (t *RTPTransport) Push(ctx context.Context, targetURL string, stream *core.Stream) error {
+	host, streamKey, err := parseRTPURL(targetURL)
+	if err != nil {
+		return fmt.Errorf("parse RTP URL: %w", err)
+	}
+	owner, err := t.sessions.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer owner.finish()
+	snapshot := stream.StartupSnapshot()
+	if !stream.IsPublisherGeneration(snapshot.Generation) {
+		return nil
+	}
+	owner.bindGeneration(snapshot)
+	relayCtx := owner.ctx
+
+	if !stream.IsPublisherGeneration(snapshot.Generation) {
+		return nil
+	}
+	mi := &snapshot.MediaInfo
+
+	// Build SDP offer from stream media info.
+	sd := sdp.BuildFromMediaInfo(mi, targetURL, "0.0.0.0")
+	offerSDP := sd.Marshal()
+
+	// POST SDP offer to signaling endpoint.
+	sigURL := fmt.Sprintf("http://%s%s/push?stream=%s", host, t.cfg.SignalingPath, url.QueryEscape(streamKey))
+	answerBody, err := t.postSDP(relayCtx, sigURL, offerSDP)
+	if err != nil {
+		return fmt.Errorf("signaling POST to %s: %w", sigURL, err)
+	}
+
+	// Parse SDP answer to get remote address.
+	answerSD, err := sdp.Parse(answerBody)
+	if err != nil {
+		return fmt.Errorf("parse SDP answer: %w", err)
+	}
+
+	remoteAddr, err := extractRemoteAddr(answerSD)
+	if err != nil {
+		return fmt.Errorf("extract remote address: %w", err)
+	}
+
+	// Allocate local UDP port and dial remote.
+	udpConn, err := owner.dialUDP(t.ports, remoteAddr)
+	if err != nil {
+		return fmt.Errorf("dial UDP %s: %w", remoteAddr, err)
+	}
+
+	slog.Info("rtp relay push connected", "module", "cluster",
+		"target", targetURL, "remote", remoteAddr, "local_port", udpConn.LocalAddr().(*net.UDPAddr).Port)
+	markRelayConnected(relayCtx)
+	if !stream.IsPublisherGeneration(snapshot.Generation) {
+		return nil
+	}
+
+	// Build packetizers and sessions per codec.
+	var videoSession, audioSession *pkgrtp.Session
+	var videoPkt, audioPkt pkgrtp.Packetizer
+
+	if mi.VideoCodec != 0 {
+		videoPkt, _ = pkgrtp.NewPacketizer(mi.VideoCodec)
+		videoSession = relayMediaSession(sd, "video")
+	}
+	if mi.AudioCodec != 0 {
+		audioPkt, _ = pkgrtp.NewPacketizer(mi.AudioCodec)
+		audioSession = relayMediaSession(sd, "audio")
+	}
+
+	// Start RTCP SR goroutine.
+	rtcpDone := make(chan struct{})
+	go func() {
+		defer close(rtcpDone)
+		ticker := time.NewTicker(t.cfg.RTCPInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-ticker.C:
+				if videoSession != nil {
+					sr := pkgrtp.BuildSR(videoSession.SSRC, 0, 0, 0, 0)
+					udpConn.Write(sr)
+				}
+				if audioSession != nil {
+					sr := pkgrtp.BuildSR(audioSession.SSRC, 0, 0, 0, 0)
+					udpConn.Write(sr)
+				}
+			}
+		}
+	}()
+	defer func() { owner.cancel(); <-rtcpDone }()
+
+	sendFrame := func(frame *avframe.AVFrame) error {
+		var pkt pkgrtp.Packetizer
+		var session *pkgrtp.Session
+
+		if frame.MediaType.IsVideo() && videoPkt != nil {
+			pkt = videoPkt
+			session = videoSession
+		} else if frame.MediaType.IsAudio() && audioPkt != nil {
+			pkt = audioPkt
+			session = audioSession
+		} else {
+			return nil
+		}
+		err := sendRTPFrame(relayCtx, udpConn, frame, pkt, session, func(n int64) {
+			recordRelayBytes(relayCtx, n)
+		})
+		if err != nil {
+			if relayCtx.Err() == nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, frame := range snapshot.ReplayFrames {
+		if !stream.IsPublisherGeneration(snapshot.Generation) {
+			return nil
+		}
+		if frame.FrameType == avframe.FrameTypeSequenceHeader {
+			continue
+		}
+		if err := sendFrame(frame); err != nil {
+			return err
+		}
+	}
+
+	reader := stream.RingBuffer().NewReaderAt(snapshot.LiveCursor)
+	for {
+		frame, ok, readErr := core.ReadFrameContext(relayCtx, reader)
+		if readErr != nil {
+			return fmt.Errorf("source ring continuity lost: %w", readErr)
+		}
+		if !ok {
+			sendBYE(udpConn, videoSession, audioSession)
+			return nil
+		}
+		if !stream.IsPublisherGeneration(snapshot.Generation) {
+			return nil
+		}
+
+		if frame.FrameType == avframe.FrameTypeSequenceHeader {
+			continue
+		}
+
+		if err := sendFrame(frame); err != nil {
+			return err
+		}
+	}
+}
+
+// Pull receives RTP data from a remote node into a local stream.
+func (t *RTPTransport) Pull(ctx context.Context, sourceURL string, stream *core.Stream) error {
+	host, streamKey, err := parseRTPURL(sourceURL)
+	if err != nil {
+		return fmt.Errorf("parse RTP URL: %w", err)
+	}
+
+	owner, err := t.sessions.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer owner.finish()
+	ctx = owner.ctx
+
+	// Bind before signaling so the peer cannot send into an unopened port.
+	udpConn, localPort, err := owner.listenUDP(t.ports)
+	if err != nil {
+		return fmt.Errorf("listen UDP: %w", err)
+	}
+
+	// Build a minimal SDP offer with our listen port.
+	offerSD := &sdp.SessionDescription{
+		Version: 0,
+		Origin: sdp.Origin{
+			Username: "-", SessionID: "0", SessionVersion: "1",
+			NetType: "IN", AddrType: "IP4", Address: "0.0.0.0",
+		},
+		Name: "LiveForge Pull",
+		Connection: &sdp.Connection{
+			NetType: "IN", AddrType: "IP4", Address: "0.0.0.0",
+		},
+		Timing: sdp.Timing{Start: 0, Stop: 0},
+		Media: []*sdp.MediaDescription{
+			{
+				Type:    "video",
+				Port:    localPort,
+				Proto:   "RTP/AVP",
+				Formats: []int{96, 97, 98, 99, 100},
+				Attributes: []sdp.Attribute{
+					{Key: "rtpmap", Value: "96 H264/90000"},
+					{Key: "rtpmap", Value: "97 H265/90000"},
+					{Key: "rtpmap", Value: "98 VP8/90000"},
+					{Key: "rtpmap", Value: "99 VP9/90000"},
+					{Key: "rtpmap", Value: "100 AV1/90000"},
+					{Key: "recvonly"},
+				},
+			},
+			{
+				Type:    "audio",
+				Port:    localPort,
+				Proto:   "RTP/AVP",
+				Formats: []int{101, 111, 0, 8},
+				Attributes: []sdp.Attribute{
+					{Key: "rtpmap", Value: "101 MPEG4-GENERIC/48000/2"},
+					{Key: "rtpmap", Value: "111 opus/48000/2"},
+					{Key: "rtpmap", Value: "0 PCMU/8000"},
+					{Key: "rtpmap", Value: "8 PCMA/8000"},
+					{Key: "recvonly"},
+				},
+			},
+		},
+	}
+	offerSDP := offerSD.Marshal()
+
+	// POST SDP offer to signaling endpoint.
+	sigURL := fmt.Sprintf("http://%s%s/pull?stream=%s", host, t.cfg.SignalingPath, url.QueryEscape(streamKey))
+	answerBody, err := t.postSDP(ctx, sigURL, offerSDP)
+	if err != nil {
+		return fmt.Errorf("signaling POST to %s: %w", sigURL, err)
+	}
+
+	// Parse SDP answer.
+	answerSD, err := sdp.Parse(answerBody)
+	if err != nil {
+		return fmt.Errorf("parse SDP answer: %w", err)
+	}
+
+	mi := sdpToMediaInfo(answerSD)
+	ptMap := buildPTMap(answerSD)
+
+	slog.Info("rtp relay pull listening", "module", "cluster",
+		"source", sourceURL, "local_port", localPort)
+	markRelayConnected(ctx)
+
+	pub := newOriginPublisher("rtp-pull", stream.Key(), mi)
+	event := &core.EventContext{StreamKey: stream.Key(), PublisherID: pub.ID(), Protocol: "rtp", RemoteAddr: host}
+	if _, err := admitRelayPublisher(owner, t.server, stream, pub, event); err != nil {
+		return fmt.Errorf("set publisher: %w", err)
+	}
+
+	// Build depacketizers.
+	depacketizers := make(map[uint8]pkgrtp.Depacketizer)
+	for pt, codec := range ptMap {
+		dp, err := pkgrtp.NewDepacketizer(codec)
+		if err == nil {
+			depacketizers[pt] = dp
+		}
+	}
+
+	// Track remote sender address and SSRC for RTCP RR.
+	var mu sync.Mutex
+	var senderAddr *net.UDPAddr
+	var senderSSRC uint32
+	localSSRC := uint32(0x12345678) // arbitrary SSRC for receiver
+	var highestSeq uint32
+	lossTracker := newSequenceLossTracker()
+
+	// RTCP RR goroutine — sends Receiver Reports to remote sender.
+	rtcpDone := make(chan struct{})
+	go func() {
+		defer close(rtcpDone)
+		ticker := time.NewTicker(t.cfg.RTCPInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				addr := senderAddr
+				ssrc := senderSSRC
+				seq := highestSeq
+				mu.Unlock()
+				if addr != nil {
+					rr := pkgrtp.BuildRR(localSSRC, []pkgrtp.ReceptionReport{{
+						SSRC:       ssrc,
+						HighestSeq: seq,
+					}})
+					udpConn.WriteTo(rr, addr)
+				}
+			}
+		}
+	}()
+	defer func() { owner.cancel(); <-rtcpDone }()
+
+	sendPullBYE := func() {
+		mu.Lock()
+		addr := senderAddr
+		mu.Unlock()
+		if addr != nil {
+			bye := pkgrtp.BuildBYE(localSSRC)
+			udpConn.WriteTo(bye, addr)
+		}
+	}
+
+	buf := make([]byte, 2048)
+	for {
+		udpConn.SetReadDeadline(time.Now().Add(t.cfg.Timeout))
+		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				sendPullBYE()
+				return nil
+			}
+			// Check if timeout (no data received).
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				slog.Info("rtp relay pull timeout", "module", "cluster",
+					"source", sourceURL)
+				sendPullBYE()
+				return nil
+			}
+			return fmt.Errorf("udp read: %w", err)
+		}
+
+		if n == 0 {
+			continue
+		}
+
+		// Track sender address for RTCP RR.
+		mu.Lock()
+		if senderAddr == nil {
+			senderAddr = remoteAddr
+		}
+		mu.Unlock()
+
+		// Check if RTCP packet (PT 200-204 range with V=2).
+		if n >= 4 && (buf[0]>>6) == 2 {
+			pt := buf[1]
+			if pt >= 200 && pt <= 204 {
+				continue // Skip RTCP packets.
+			}
+		}
+		recordRelayBytes(ctx, int64(n))
+
+		var pkt pionrtp.Packet
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+
+		// Track sender SSRC and highest sequence number.
+		mu.Lock()
+		senderSSRC = pkt.SSRC
+		lossTracker.Observe(pkt.SequenceNumber)
+		highestSeq = uint32(lossTracker.highest)
+		lossRatio := lossTracker.Ratio()
+		mu.Unlock()
+		t.metrics.RecordPacketLoss(stream.Key(), "origin", lossRatio)
+
+		dp, ok := depacketizers[pkt.PayloadType]
+		if !ok {
+			continue
+		}
+
+		frame, err := dp.Depacketize(&pkt)
+		if err != nil || frame == nil {
+			continue
+		}
+
+		if !stream.WriteFrameForPublisher(pub, frame) && stream.Publisher() != pub {
+			return nil
+		}
+	}
+}
+
+func (t *RTPTransport) Close() error { return t.sessions.close() }
+
+// handleSignalingPush handles POST {signaling_path}/push?stream={key}.
+// A remote node wants to push RTP to us. We allocate a local UDP port,
+// parse their SDP offer, and respond with an SDP answer containing our listen address.
+func (t *RTPTransport) handleSignalingPush(w http.ResponseWriter, r *http.Request) {
+	body, ok := readSignalingRequest(w, r)
+	if !ok {
+		return
+	}
+
+	streamKey := r.URL.Query().Get("stream")
+	if streamKey == "" {
+		http.Error(w, "missing stream parameter", http.StatusBadRequest)
+		return
+	}
+
+	offerSD, err := sdp.Parse(body)
+	if err != nil {
+		http.Error(w, "parse SDP: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Check that at least one offered codec is supported.
+	if !hasAnySupportedCodec(offerSD) {
+		http.Error(w, ErrCodecMismatch.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	session, err := t.sessions.begin(context.Background())
+	if err != nil {
+		http.Error(w, "transport unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			session.finish()
+		}
+	}()
+	conn, localPort, err := session.listenUDP(t.ports)
+	if err != nil {
+		http.Error(w, "no available UDP ports", http.StatusServiceUnavailable)
+		return
+	}
+	stream, pub, status, err := admitSignaledPublisher(session, t.server, t.hub, r, "rtp-push", "rtp", sdpToMediaInfo(offerSD))
+	if err != nil {
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	if session.ctx.Err() != nil {
+		http.Error(w, "transport unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Build SDP answer with our listen address.
+	answerSD := buildAnswerSDP(offerSD, localPort, getLocalIP())
+
+	slog.Info("rtp signaling push accepted", "module", "cluster",
+		"stream", streamKey, "local_port", localPort)
+
+	w.Header().Set("Content-Type", "application/sdp")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(answerSD.Marshal()); err != nil {
+		return
+	}
+	session.established = true
+	accepted = true
+	go func() { defer session.finish(); t.receiveRTP(stream, pub, conn, offerSD) }()
+}
+
+// handleSignalingPull handles POST {signaling_path}/pull?stream={key}.
+// A remote node wants to pull RTP from us. We look up the stream,
+// parse their SDP offer, and start sending RTP to them.
+func (t *RTPTransport) handleSignalingPull(w http.ResponseWriter, r *http.Request) {
+	body, ok := readSignalingRequest(w, r)
+	if !ok {
+		return
+	}
+
+	streamKey := r.URL.Query().Get("stream")
+	if streamKey == "" {
+		http.Error(w, "missing stream parameter", http.StatusBadRequest)
+		return
+	}
+
+	stream, ok := t.hub.Find(streamKey)
+	if !ok {
+		http.Error(w, "stream not found or no publisher", http.StatusNotFound)
+		return
+	}
+	snapshot := stream.StartupSnapshot()
+	if !stream.IsPublisherGeneration(snapshot.Generation) {
+		http.Error(w, "stream not found or no publisher", http.StatusNotFound)
+		return
+	}
+
+	offerSD, err := sdp.Parse(body)
+	if err != nil {
+		http.Error(w, "parse SDP: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Check codec compatibility first.
+	if !hasAnySupportedCodec(offerSD) {
+		http.Error(w, ErrCodecMismatch.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	// Get remote listen address from offer.
+	remoteAddr, err := extractRemoteAddr(offerSD)
+	if err != nil {
+		http.Error(w, "extract remote address: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if remoteAddr.IP.IsUnspecified() {
+		host, _, addressErr := net.SplitHostPort(r.RemoteAddr)
+		if addressErr != nil || net.ParseIP(host) == nil {
+			http.Error(w, "invalid peer address", http.StatusBadRequest)
+			return
+		}
+		remoteAddr.IP = net.ParseIP(host)
+	}
+	session, err := t.sessions.begin(context.Background())
+	if err != nil {
+		http.Error(w, "transport unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			session.finish()
+		}
+	}()
+	session.bindGeneration(snapshot)
+	conn, err := session.dialUDP(t.ports, remoteAddr)
+	if err != nil {
+		http.Error(w, "UDP setup failed", http.StatusServiceUnavailable)
+		return
+	}
+	if session.ctx.Err() != nil || !stream.IsPublisherGeneration(snapshot.Generation) {
+		http.Error(w, "publisher retired during setup", http.StatusServiceUnavailable)
+		return
+	}
+	if err := session.subscribe(stream, snapshot, "rtp"); err != nil {
+		http.Error(w, "subscriber admission failed", http.StatusServiceUnavailable)
+		return
+	}
+
+	mi := &snapshot.MediaInfo
+
+	// Build answer SDP from our stream info.
+	answerSD := sdp.BuildFromMediaInfo(mi, "", getLocalIP())
+
+	slog.Info("rtp signaling pull accepted", "module", "cluster",
+		"stream", streamKey, "remote", remoteAddr)
+
+	w.Header().Set("Content-Type", "application/sdp")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(answerSD.Marshal()); err != nil {
+		return
+	}
+	accepted = true
+	go func() { defer session.finish(); t.sendRTPConnection(session.ctx, stream, snapshot, conn) }()
+}
+
+// receiveRTP listens on localPort for incoming RTP and writes frames to a stream.
+func (t *RTPTransport) receiveRTP(stream *core.Stream, pub *originPublisher, udpConn *net.UDPConn, offerSD *sdp.SessionDescription) {
+	streamKey := stream.Key()
+	ptMap := buildPTMap(offerSD)
+
+	// Build depacketizers.
+	depacketizers := make(map[uint8]pkgrtp.Depacketizer)
+	for pt, codec := range ptMap {
+		dp, err := pkgrtp.NewDepacketizer(codec)
+		if err == nil {
+			depacketizers[pt] = dp
+		}
+	}
+
+	var senderAddr *net.UDPAddr
+	localSSRC := uint32(0x87654321)
+	lossTracker := newSequenceLossTracker()
+
+	buf := make([]byte, 2048)
+	for {
+		udpConn.SetReadDeadline(time.Now().Add(t.cfg.Timeout))
+		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				slog.Info("rtp receive timeout", "module", "cluster", "stream", streamKey)
+			}
+			// Send BYE if we know the sender.
+			if senderAddr != nil {
+				bye := pkgrtp.BuildBYE(localSSRC)
+				udpConn.WriteTo(bye, senderAddr)
+			}
+			return
+		}
+
+		if n < 4 {
+			continue
+		}
+
+		// Track sender address.
+		if senderAddr == nil {
+			senderAddr = remoteAddr
+		}
+
+		// Skip RTCP.
+		if (buf[0]>>6) == 2 && buf[1] >= 200 && buf[1] <= 204 {
+			continue
+		}
+
+		var pkt pionrtp.Packet
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+		lossTracker.Observe(pkt.SequenceNumber)
+		t.metrics.RecordPacketLoss(streamKey, "origin", lossTracker.Ratio())
+
+		dp, ok := depacketizers[pkt.PayloadType]
+		if !ok {
+			continue
+		}
+
+		frame, err := dp.Depacketize(&pkt)
+		if err != nil || frame == nil {
+			continue
+		}
+
+		if !stream.WriteFrameForPublisher(pub, frame) && stream.Publisher() != pub {
+			return
+		}
+	}
+}
+
+// sendRTP reads from a stream and sends RTP to the remote address.
+func (t *RTPTransport) sendRTP(stream *core.Stream, snapshot core.StreamStartupSnapshot, remoteAddr *net.UDPAddr) {
+	session, err := t.sessions.begin(context.Background())
+	if err != nil {
+		return
+	}
+	defer session.finish()
+	session.bindGeneration(snapshot)
+	udpConn, err := session.dialUDP(t.ports, remoteAddr)
+	if err != nil {
+		slog.Warn("rtp send: dial failed", "module", "cluster", "error", err)
+		return
+	}
+	t.sendRTPConnection(session.ctx, stream, snapshot, udpConn)
+}
+
+func (t *RTPTransport) sendRTPConnection(parent context.Context, stream *core.Stream, snapshot core.StreamStartupSnapshot, udpConn *net.UDPConn) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	if !stream.IsPublisherGeneration(snapshot.Generation) {
+		return
+	}
+	mi := &snapshot.MediaInfo
+	sd := sdp.BuildFromMediaInfo(mi, "", "")
+
+	var videoSession, audioSession *pkgrtp.Session
+	var videoPkt, audioPkt pkgrtp.Packetizer
+
+	if mi.VideoCodec != 0 {
+		videoPkt, _ = pkgrtp.NewPacketizer(mi.VideoCodec)
+		videoSession = relayMediaSession(sd, "video")
+	}
+	if mi.AudioCodec != 0 {
+		audioPkt, _ = pkgrtp.NewPacketizer(mi.AudioCodec)
+		audioSession = relayMediaSession(sd, "audio")
+	}
+
+	// RTCP SR goroutine for server-side send.
+	srDone := make(chan struct{})
+	go func() {
+		defer close(srDone)
+		ticker := time.NewTicker(t.cfg.RTCPInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if videoSession != nil {
+					sr := pkgrtp.BuildSR(videoSession.SSRC, 0, 0, 0, 0)
+					udpConn.Write(sr)
+				}
+				if audioSession != nil {
+					sr := pkgrtp.BuildSR(audioSession.SSRC, 0, 0, 0, 0)
+					udpConn.Write(sr)
+				}
+			}
+		}
+	}()
+	defer func() { cancel(); <-srDone }()
+
+	if !stream.IsPublisherGeneration(snapshot.Generation) {
+		return
+	}
+	sendFrame := func(frame *avframe.AVFrame) error {
+		var pkt pkgrtp.Packetizer
+		var session *pkgrtp.Session
+
+		if frame.MediaType.IsVideo() && videoPkt != nil {
+			pkt = videoPkt
+			session = videoSession
+		} else if frame.MediaType.IsAudio() && audioPkt != nil {
+			pkt = audioPkt
+			session = audioSession
+		} else {
+			return nil
+		}
+		if err := sendRTPFrame(ctx, udpConn, frame, pkt, session, nil); err != nil {
+			slog.Warn("rtp relay frame send failed", "module", "cluster", "error", err)
+			return err
+		}
+		return nil
+	}
+	for _, frame := range snapshot.ReplayFrames {
+		if !stream.IsPublisherGeneration(snapshot.Generation) {
+			return
+		}
+		if frame.FrameType == avframe.FrameTypeSequenceHeader {
+			continue
+		}
+		if err := sendFrame(frame); err != nil {
+			return
+		}
+	}
+
+	reader := stream.RingBuffer().NewReaderAt(snapshot.LiveCursor)
+	for {
+		frame, ok, readErr := core.ReadFrameContext(ctx, reader)
+		if readErr != nil {
+			slog.Warn("rtp relay source continuity lost", "module", "cluster", "error", readErr)
+			return
+		}
+		if !ok {
+			sendBYE(udpConn, videoSession, audioSession)
+			return
+		}
+		if !stream.IsPublisherGeneration(snapshot.Generation) {
+			return
+		}
+		if frame.FrameType == avframe.FrameTypeSequenceHeader {
+			continue
+		}
+
+		if err := sendFrame(frame); err != nil {
+			return
+		}
+	}
+}
+
+// --- Helper functions ---
+
+func relayMediaSession(sd *sdp.SessionDescription, kind string) *pkgrtp.Session {
+	for _, media := range sd.Media {
+		if media.Type != kind || len(media.Formats) == 0 {
+			continue
+		}
+		pt := media.Formats[0]
+		if pt < 0 || pt > 127 {
+			return nil
+		}
+		clockRate := uint32(90000)
+		if mapping := media.RTPMap(pt); mapping != nil {
+			rate := int64(mapping.ClockRate)
+			if rate < 1 || rate > math.MaxUint32 {
+				return nil
+			}
+			clockRate = uint32(rate)
+		}
+		return pkgrtp.NewSession(uint8(pt), clockRate)
+	}
+	return nil
+}
+
+type rtpFrameWriter interface {
+	Write([]byte) (int, error)
+}
+
+// sendRTPFrame packetizes and writes one media frame. It intentionally treats
+// packetization, serialization, and short writes as fatal so a relay cannot
+// remain healthy while silently dropping media.
+func sendRTPFrame(ctx context.Context, writer rtpFrameWriter, frame *avframe.AVFrame, packetizer pkgrtp.Packetizer, session *pkgrtp.Session, onWrite func(int64)) error {
+	if frame == nil {
+		return fmt.Errorf("nil RTP frame")
+	}
+	if packetizer == nil {
+		return fmt.Errorf("nil RTP packetizer")
+	}
+	if session == nil {
+		return fmt.Errorf("nil RTP session")
+	}
+	rtpPackets, err := packetizer.Packetize(frame, pkgrtp.DefaultMTU)
+	if err != nil {
+		return fmt.Errorf("packetize RTP frame: %w", err)
+	}
+	if len(rtpPackets) == 0 {
+		return fmt.Errorf("packetize RTP frame: no packets")
+	}
+	session.WrapPackets(rtpPackets, frame.DTS)
+	for index, packet := range rtpPackets {
+		if packet == nil {
+			return fmt.Errorf("marshal RTP packet %d: nil packet", index)
+		}
+		raw, err := packet.Marshal()
+		if err != nil {
+			return fmt.Errorf("marshal RTP packet %d: %w", index, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		n, err := writer.Write(raw)
+		if err != nil {
+			return fmt.Errorf("write RTP packet %d: %w", index, err)
+		}
+		if n != len(raw) {
+			return fmt.Errorf("write RTP packet %d: %w", index, io.ErrShortWrite)
+		}
+		if onWrite != nil {
+			onWrite(int64(n))
+		}
+	}
+	return nil
+}
+
+// parseRTPURL parses rtp://host:port/streamKey into host:port and stream key.
+func parseRTPURL(rawURL string) (host, streamKey string, err error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid RTP URL: %w", err)
+	}
+	if u.Scheme != "rtp" {
+		return "", "", fmt.Errorf("unsupported scheme %q, want rtp", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", "", fmt.Errorf("missing host in RTP URL")
+	}
+	host = u.Host
+	if u.Path == "" || u.Path == "/" {
+		return "", "", fmt.Errorf("missing stream key in RTP URL")
+	}
+	streamKey = strings.TrimPrefix(u.Path, "/")
+	return host, streamKey, nil
+}
+
+// postSDP posts SDP data to a peer using the current management credential.
+func (t *RTPTransport) postSDP(ctx context.Context, sigURL string, sdpData []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sigURL, bytes.NewReader(sdpData))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/sdp")
+	if err := authorizePeerRequest(req, t.server); err != nil {
+		return nil, fmt.Errorf("authorize peer signaling: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP POST: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotAcceptable {
+		discardPeerSignalingResponse(resp.Body)
+		return nil, ErrCodecMismatch
+	}
+	if resp.StatusCode != http.StatusOK {
+		discardPeerSignalingResponse(resp.Body)
+		return nil, peerSignalingStatusError(resp.StatusCode)
+	}
+	return readPeerSignalingResponse(resp.Body)
+}
+
+// extractRemoteAddr extracts the UDP address from an SDP session description.
+// It uses the c= line address and the first m= line port.
+func extractRemoteAddr(sd *sdp.SessionDescription) (*net.UDPAddr, error) {
+	addr := "0.0.0.0"
+	port := 0
+
+	// Session-level connection.
+	if sd.Connection != nil && sd.Connection.Address != "" {
+		addr = sd.Connection.Address
+	}
+
+	// First media section.
+	if len(sd.Media) > 0 {
+		m := sd.Media[0]
+		port = m.Port
+		// Media-level connection overrides session-level.
+		if m.Connection != nil && m.Connection.Address != "" {
+			addr = m.Connection.Address
+		}
+	}
+
+	if port == 0 {
+		return nil, fmt.Errorf("no port found in SDP")
+	}
+
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		// Try resolving hostname.
+		ips, err := net.LookupIP(addr)
+		if err != nil || len(ips) == 0 {
+			return nil, fmt.Errorf("resolve address %q: %w", addr, err)
+		}
+		ip = ips[0]
+	}
+
+	return &net.UDPAddr{IP: ip, Port: port}, nil
+}
+
+// buildAnswerSDP creates an SDP answer with the given local port and address.
+func buildAnswerSDP(offer *sdp.SessionDescription, localPort int, localAddr string) *sdp.SessionDescription {
+	answer := &sdp.SessionDescription{
+		Version: 0,
+		Origin: sdp.Origin{
+			Username: "-", SessionID: "0", SessionVersion: "1",
+			NetType: "IN", AddrType: "IP4", Address: localAddr,
+		},
+		Name: "LiveForge RTP Answer",
+		Connection: &sdp.Connection{
+			NetType: "IN", AddrType: "IP4", Address: localAddr,
+		},
+		Timing: sdp.Timing{Start: 0, Stop: 0},
+	}
+
+	// Mirror offered media sections with our port.
+	for _, om := range offer.Media {
+		md := &sdp.MediaDescription{
+			Type:       om.Type,
+			Port:       localPort,
+			Proto:      om.Proto,
+			Formats:    om.Formats,
+			Attributes: om.Attributes,
+		}
+		answer.Media = append(answer.Media, md)
+	}
+
+	return answer
+}
+
+// hasAnySupportedCodec checks if the SDP has at least one codec we can handle.
+func hasAnySupportedCodec(sd *sdp.SessionDescription) bool {
+	for _, md := range sd.Media {
+		for _, pt := range md.Formats {
+			rtpMap := md.RTPMap(pt)
+			if rtpMap == nil {
+				continue
+			}
+			codec := encodingNameToCodec(rtpMap.EncodingName)
+			if codec != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sendBYE sends RTCP BYE for all active sessions.
+func sendBYE(conn *net.UDPConn, sessions ...*pkgrtp.Session) {
+	for _, s := range sessions {
+		if s != nil {
+			bye := pkgrtp.BuildBYE(s.SSRC)
+			conn.Write(bye)
+		}
+	}
+}
+
+// getLocalIP returns the local machine's first non-loopback IP address.
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "0.0.0.0"
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return "0.0.0.0"
+}
+
+// defaultClusterRTPConfig returns a config with defaults for testing.
+func defaultClusterRTPConfig() config.ClusterRTPConfig {
+	return config.ClusterRTPConfig{
+		PortRange:     "20000-20100",
+		SignalingPath: "/api/relay",
+		RTCPInterval:  5 * time.Second,
+		Timeout:       15 * time.Second,
+	}
+}

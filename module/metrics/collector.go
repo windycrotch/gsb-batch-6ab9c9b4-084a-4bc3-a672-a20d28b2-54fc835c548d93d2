@@ -1,0 +1,312 @@
+package metrics
+
+import (
+	"sort"
+	"sync"
+	"sync/atomic"
+
+	"github.com/im-pingo/liveforge/core"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+type streamDetailSnapshot struct {
+	keys []string
+}
+
+// Collector implements prometheus.Collector and gathers LiveForge metrics.
+type Collector struct {
+	server                *core.Server
+	streamDetail          bool
+	streamDetailLimit     int
+	streamDetailAllowlist []string
+	// Admitted scalar keys persist for the Collector lifetime; streams do not.
+	streamDetailMu       sync.Mutex
+	streamDetailSnapshot atomic.Value // stores streamDetailSnapshot
+
+	// Server-level gauges
+	streamCount     *prometheus.Desc
+	connectionCount *prometheus.Desc
+	uptimeSeconds   *prometheus.Desc
+	configFailures  *prometheus.Desc
+	configPending   *prometheus.Desc
+	configCallbacks *prometheus.Desc
+	configDropped   *prometheus.Desc
+	configChanges   *prometheus.Desc
+	apiAuthFailures *prometheus.Desc
+	apiRBACFailures *prometheus.Desc
+	apiRateDenials  *prometheus.Desc
+	apiAuditEvents  *prometheus.Desc
+
+	// Per-stream gauges (labels: stream_key)
+	streamBytesIn     *prometheus.Desc
+	streamVideoFrames *prometheus.Desc
+	streamAudioFrames *prometheus.Desc
+	streamBitrateKbps *prometheus.Desc
+	streamFPS         *prometheus.Desc
+	streamUptimeSec   *prometheus.Desc
+	streamSubscribers *prometheus.Desc
+	streamGOPFrames   *prometheus.Desc
+}
+
+// NewCollector creates a Collector that scrapes metrics from the server.
+func NewCollector(s *core.Server) *Collector {
+	ns := "liveforge"
+	metricsConfig := s.Config().Metrics
+	allowlistSet := make(map[string]struct{}, len(metricsConfig.StreamDetailAllowlist))
+	for _, key := range metricsConfig.StreamDetailAllowlist {
+		if key != "" {
+			allowlistSet[key] = struct{}{}
+		}
+	}
+	allowlist := make([]string, 0, len(allowlistSet))
+	for key := range allowlistSet {
+		allowlist = append(allowlist, key)
+	}
+	sort.Strings(allowlist)
+	collector := &Collector{
+		server:                s,
+		streamDetail:          metricsConfig.StreamDetail,
+		streamDetailLimit:     metricsConfig.StreamDetailLimit,
+		streamDetailAllowlist: allowlist,
+
+		streamCount: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "server", "streams_active"),
+			"Number of active streams.",
+			nil, nil,
+		),
+		connectionCount: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "server", "connections_active"),
+			"Number of active connections.",
+			nil, nil,
+		),
+		uptimeSeconds: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "server", "uptime_seconds"),
+			"Server uptime in seconds.",
+			nil, nil,
+		),
+		configFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "config", "consecutive_failures"),
+			"Consecutive runtime configuration refresh failures.", nil, nil,
+		),
+		configPending: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "config", "pending_restart"),
+			"Number of configuration paths waiting for a process restart.", nil, nil,
+		),
+		configCallbacks: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "config", "callback_failures"),
+			"Total runtime configuration callback failures.", nil, nil,
+		),
+		configDropped: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "config", "callbacks_dropped"),
+			"Total runtime configuration callbacks dropped because the callback queue was full.", nil, nil,
+		),
+		configChanges: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "config", "changes_total"),
+			"Total runtime configuration changes by terminal result.", []string{"result"}, nil,
+		),
+		apiAuthFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "api", "authentication_failures_total"),
+			"Total management API authentication failures.", nil, nil,
+		),
+		apiRBACFailures: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "api", "authorization_failures_total"),
+			"Total management API authorization failures.", nil, nil,
+		),
+		apiRateDenials: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "api", "rate_limit_denials_total"),
+			"Total management API requests rejected by rate limiting.", nil, nil,
+		),
+		apiAuditEvents: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "api", "audit_events_total"),
+			"Total management audit events emitted.", nil, nil,
+		),
+
+		streamBytesIn: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "bytes_in_total"),
+			"Total bytes received for a stream.",
+			[]string{"stream_key"}, nil,
+		),
+		streamVideoFrames: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "video_frames_total"),
+			"Total video frames received for a stream.",
+			[]string{"stream_key"}, nil,
+		),
+		streamAudioFrames: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "audio_frames_total"),
+			"Total audio frames received for a stream.",
+			[]string{"stream_key"}, nil,
+		),
+		streamBitrateKbps: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "bitrate_kbps"),
+			"Current bitrate in kbps for a stream.",
+			[]string{"stream_key"}, nil,
+		),
+		streamFPS: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "fps"),
+			"Current FPS for a stream.",
+			[]string{"stream_key"}, nil,
+		),
+		streamUptimeSec: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "uptime_seconds"),
+			"Stream uptime in seconds.",
+			[]string{"stream_key"}, nil,
+		),
+		streamSubscribers: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "subscribers"),
+			"Number of subscribers per stream and protocol.",
+			[]string{"stream_key", "protocol"}, nil,
+		),
+		streamGOPFrames: prometheus.NewDesc(
+			prometheus.BuildFQName(ns, "stream", "gop_cache_frames"),
+			"Number of frames in the GOP cache.",
+			[]string{"stream_key"}, nil,
+		),
+	}
+	collector.streamDetailSnapshot.Store(streamDetailSnapshot{})
+	return collector
+}
+
+// Describe sends metric descriptors to the channel.
+func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.streamCount
+	ch <- c.connectionCount
+	ch <- c.uptimeSeconds
+	ch <- c.configFailures
+	ch <- c.configPending
+	ch <- c.configCallbacks
+	ch <- c.configDropped
+	ch <- c.configChanges
+	ch <- c.apiAuthFailures
+	ch <- c.apiRBACFailures
+	ch <- c.apiRateDenials
+	ch <- c.apiAuditEvents
+	ch <- c.streamBytesIn
+	ch <- c.streamVideoFrames
+	ch <- c.streamAudioFrames
+	ch <- c.streamBitrateKbps
+	ch <- c.streamFPS
+	ch <- c.streamUptimeSec
+	ch <- c.streamSubscribers
+	ch <- c.streamGOPFrames
+}
+
+// Collect gathers current metrics from the server and streams.
+func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	hub := c.server.StreamHub()
+
+	// Server-level metrics
+	ch <- prometheus.MustNewConstMetric(c.streamCount, prometheus.GaugeValue, float64(hub.Count()))
+	ch <- prometheus.MustNewConstMetric(c.connectionCount, prometheus.GaugeValue, float64(c.server.ConnectionCount()))
+	ch <- prometheus.MustNewConstMetric(c.uptimeSeconds, prometheus.GaugeValue, c.server.UptimeSeconds())
+	if manager := c.server.ConfigManager(); manager != nil {
+		status := manager.Status()
+		ch <- prometheus.MustNewConstMetric(c.configFailures, prometheus.GaugeValue, float64(status.ConsecutiveFailures))
+		ch <- prometheus.MustNewConstMetric(c.configPending, prometheus.GaugeValue, float64(len(status.PendingRestart)))
+		ch <- prometheus.MustNewConstMetric(c.configCallbacks, prometheus.CounterValue, float64(status.CallbackFailures))
+		ch <- prometheus.MustNewConstMetric(c.configDropped, prometheus.CounterValue, float64(status.DroppedCallbacks))
+		ch <- prometheus.MustNewConstMetric(c.configChanges, prometheus.CounterValue, float64(status.ConfigChangesAccepted), "accepted")
+		ch <- prometheus.MustNewConstMetric(c.configChanges, prometheus.CounterValue, float64(status.ConfigChangesRejected), "rejected")
+		ch <- prometheus.MustNewConstMetric(c.configChanges, prometheus.CounterValue, float64(status.ConfigChangesApplicationFailed), "application_failed")
+	}
+	if module := c.server.ModuleByName("api"); module != nil {
+		if provider, ok := module.(interface{ SecurityMetricValues() map[string]float64 }); ok {
+			values := provider.SecurityMetricValues()
+			ch <- prometheus.MustNewConstMetric(c.apiAuthFailures, prometheus.CounterValue, values["authentication_failures"])
+			ch <- prometheus.MustNewConstMetric(c.apiRBACFailures, prometheus.CounterValue, values["authorization_failures"])
+			ch <- prometheus.MustNewConstMetric(c.apiRateDenials, prometheus.CounterValue, values["rate_limit_denials"])
+			ch <- prometheus.MustNewConstMetric(c.apiAuditEvents, prometheus.CounterValue, values["audit_events"])
+		}
+	}
+
+	if !c.streamDetail || c.streamDetailLimit <= 0 {
+		return
+	}
+	streams := c.detailStreams(hub)
+	// Per-stream metrics are opt-in, deterministic, and bounded.
+	for _, stream := range streams {
+		key := stream.Key()
+		stats := stream.Stats()
+		ch <- prometheus.MustNewConstMetric(c.streamBytesIn, prometheus.CounterValue, float64(stats.BytesIn), key)
+		ch <- prometheus.MustNewConstMetric(c.streamVideoFrames, prometheus.CounterValue, float64(stats.VideoFrames), key)
+		ch <- prometheus.MustNewConstMetric(c.streamAudioFrames, prometheus.CounterValue, float64(stats.AudioFrames), key)
+		ch <- prometheus.MustNewConstMetric(c.streamBitrateKbps, prometheus.GaugeValue, float64(stats.BitrateKbps), key)
+		ch <- prometheus.MustNewConstMetric(c.streamFPS, prometheus.GaugeValue, stats.FPS, key)
+		ch <- prometheus.MustNewConstMetric(c.streamUptimeSec, prometheus.GaugeValue, stats.Uptime.Seconds(), key)
+
+		gopDetail := stream.GOPCacheDetail()
+		ch <- prometheus.MustNewConstMetric(c.streamGOPFrames, prometheus.GaugeValue, float64(gopDetail.TotalFrames), key)
+
+		// Subscriber counts per protocol
+		for proto, count := range stream.Subscribers() {
+			ch <- prometheus.MustNewConstMetric(c.streamSubscribers, prometheus.GaugeValue, float64(count), key, proto)
+		}
+		for proto, count := range stream.MuxerManager().Formats() {
+			ch <- prometheus.MustNewConstMetric(c.streamSubscribers, prometheus.GaugeValue, float64(count), key, proto)
+		}
+	}
+}
+
+func (c *Collector) detailStreams(hub *core.StreamHub) []*core.Stream {
+	if len(c.streamDetailAllowlist) > 0 {
+		capacity := min(c.streamDetailLimit, len(c.streamDetailAllowlist))
+		streams := make([]*core.Stream, 0, capacity)
+		for _, key := range c.streamDetailAllowlist {
+			stream, ok := hub.Find(key)
+			if !ok || stream.State() == core.StreamStateDestroying {
+				continue
+			}
+			streams = append(streams, stream)
+			if len(streams) == c.streamDetailLimit {
+				break
+			}
+		}
+		return streams
+	}
+
+	snapshot := c.streamDetailSnapshot.Load().(streamDetailSnapshot)
+	admissionLocked := false
+	if len(snapshot.keys) < c.streamDetailLimit {
+		c.streamDetailMu.Lock()
+		admissionLocked = true
+		snapshot = c.streamDetailSnapshot.Load().(streamDetailSnapshot)
+	}
+	if len(snapshot.keys) < c.streamDetailLimit {
+		keys := append([]string(nil), snapshot.keys...)
+		admitted := make(map[string]struct{}, len(keys))
+		for _, key := range keys {
+			admitted[key] = struct{}{}
+		}
+		for _, stream := range hub.StableStreams(c.streamDetailLimit) {
+			key := stream.Key()
+			if _, exists := admitted[key]; exists {
+				continue
+			}
+			current, active := hub.Find(key)
+			if !active || current != stream || current.State() == core.StreamStateDestroying {
+				continue
+			}
+			admitted[key] = struct{}{}
+			keys = append(keys, key)
+			if len(keys) == c.streamDetailLimit {
+				break
+			}
+		}
+		if len(keys) != len(snapshot.keys) {
+			snapshot = streamDetailSnapshot{keys: keys}
+			c.streamDetailSnapshot.Store(snapshot)
+		}
+	}
+	if admissionLocked {
+		c.streamDetailMu.Unlock()
+	}
+
+	streams := make([]*core.Stream, 0, len(snapshot.keys))
+	for _, key := range snapshot.keys {
+		stream, active := hub.Find(key)
+		if !active || stream.State() == core.StreamStateDestroying {
+			continue
+		}
+		streams = append(streams, stream)
+	}
+	return streams
+}

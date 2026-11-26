@@ -1,0 +1,209 @@
+package httpstream
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/im-pingo/liveforge/core"
+)
+
+// serveHLSPlaylist serves the m3u8 playlist for a stream.
+func (m *Module) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, streamKey string) {
+	stream, found := m.server.StreamHub().Find(streamKey)
+	if !found || stream.State() != core.StreamStatePublishing {
+		http.Error(w, "stream not found or not publishing", http.StatusNotFound)
+		return
+	}
+
+	// LL-HLS takes precedence when enabled
+	if m.server.Config().HTTP.LLHLS.Enabled {
+		m.serveLLHLSPlaylist(w, r, streamKey, stream)
+		return
+	}
+
+	mgr := m.getOrCreateHLS(streamKey, stream)
+	if mgr == nil {
+		http.Error(w, "stream generation ended", http.StatusNotFound)
+		return
+	}
+
+	// Wait for at least one segment before serving playlist.
+	// An empty playlist causes ffplay to give up immediately.
+	if !waitForCondition(r.Context(), 10*time.Second, 100*time.Millisecond, func() bool {
+		return mgr.SegmentCount() > 0
+	}) {
+		if r.Context().Err() != nil {
+			return
+		}
+		writeHTTPError(w, "initial HLS segment not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	playlist := mgr.GenerateM3U8()
+
+	m.setCORSHeaders(w)
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	_ = writeHTTPResponse(w, []byte(playlist), httpStreamWriteTimeout)
+}
+
+// serveLLHLSPlaylist serves the LL-HLS m3u8 playlist with blocking reload support.
+func (m *Module) serveLLHLSPlaylist(w http.ResponseWriter, r *http.Request, streamKey string, stream *core.Stream) {
+	mgr := m.getOrCreateLLHLS(streamKey, stream)
+	if mgr == nil {
+		http.Error(w, "stream generation ended", http.StatusNotFound)
+		return
+	}
+
+	// Parse blocking reload params
+	targetMSN := -1
+	targetPart := -1
+	skip := false
+
+	if msn := r.URL.Query().Get("_HLS_msn"); msn != "" {
+		if n, err := strconv.Atoi(msn); err == nil {
+			targetMSN = n
+		}
+	}
+	if part := r.URL.Query().Get("_HLS_part"); part != "" {
+		if n, err := strconv.Atoi(part); err == nil {
+			targetPart = n
+		}
+	}
+	if r.URL.Query().Get("_HLS_skip") == "YES" {
+		skip = true
+	}
+
+	// Hold the initial non-blocking request until one complete segment exists.
+	// The bundled Hls.js rejects a part-only initial manifest as levelEmptyError,
+	// but waiting for one segment still avoids the old three-GOP startup delay.
+	if targetMSN < 0 {
+		if !mgr.WaitForCompletedSegment(r.Context(), mgr.initialPlaylistWait) {
+			if r.Context().Err() != nil {
+				return
+			}
+			writeHTTPError(w, "initial LL-HLS segment not ready", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	playlist, _ := mgr.GeneratePlaylist(r.Context(), targetMSN, targetPart, skip)
+
+	m.setCORSHeaders(w)
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	_ = writeHTTPResponse(w, []byte(playlist), httpStreamWriteTimeout)
+}
+
+// serveHLSSegment serves a single TS segment by sequence number.
+func (m *Module) serveHLSSegment(w http.ResponseWriter, r *http.Request, streamKey string, seqNum int) {
+	m.hlsMu.Lock()
+	mgr, ok := m.hlsManagers[streamKey]
+	m.hlsMu.Unlock()
+
+	if !ok {
+		http.Error(w, "no HLS session for this stream", http.StatusNotFound)
+		return
+	}
+
+	data, found := mgr.GetSegment(seqNum)
+	if !found {
+		http.Error(w, "segment not found", http.StatusNotFound)
+		return
+	}
+
+	m.setCORSHeaders(w)
+	w.Header().Set("Content-Type", "video/mp2t")
+	w.Header().Set("Cache-Control", "public, max-age=10")
+	_ = writeHTTPResponse(w, data, httpStreamWriteTimeout)
+}
+
+// serveLLHLSPartialSegment serves a partial segment by MSN and part index.
+func (m *Module) serveLLHLSPartialSegment(w http.ResponseWriter, _ *http.Request, streamKey string, msn, partIdx int) {
+	m.llhlsMu.Lock()
+	mgr, ok := m.llhlsManagers[streamKey]
+	m.llhlsMu.Unlock()
+
+	if !ok {
+		http.Error(w, "no LL-HLS session for this stream", http.StatusNotFound)
+		return
+	}
+
+	data, found := mgr.GetPartialSegment(msn, partIdx)
+	if !found {
+		http.Error(w, "partial segment not found", http.StatusNotFound)
+		return
+	}
+
+	contentType := "video/mp4"
+	if m.server.Config().HTTP.LLHLS.Container == "ts" {
+		contentType = "video/mp2t"
+	}
+
+	m.setCORSHeaders(w)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache")
+	_ = writeHTTPResponse(w, data, httpStreamWriteTimeout)
+}
+
+// serveLLHLSFullSegment serves a completed full segment by MSN.
+func (m *Module) serveLLHLSFullSegment(w http.ResponseWriter, _ *http.Request, streamKey string, msn int) {
+	m.llhlsMu.Lock()
+	mgr, ok := m.llhlsManagers[streamKey]
+	m.llhlsMu.Unlock()
+
+	if !ok {
+		http.Error(w, "no LL-HLS session for this stream", http.StatusNotFound)
+		return
+	}
+
+	data, found := mgr.GetFullSegment(msn)
+	if !found {
+		http.Error(w, "segment not found", http.StatusNotFound)
+		return
+	}
+
+	contentType := "video/mp4"
+	if m.server.Config().HTTP.LLHLS.Container == "ts" {
+		contentType = "video/mp2t"
+	}
+
+	m.setCORSHeaders(w)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=60")
+	_ = writeHTTPResponse(w, data, httpStreamWriteTimeout)
+}
+
+// serveLLHLSInit serves the fMP4 init segment from the LL-HLS manager.
+func (m *Module) serveLLHLSInit(w http.ResponseWriter, r *http.Request, streamKey string) {
+	m.llhlsMu.Lock()
+	mgr, ok := m.llhlsManagers[streamKey]
+	m.llhlsMu.Unlock()
+
+	if !ok {
+		http.Error(w, "no LL-HLS session for this stream", http.StatusNotFound)
+		return
+	}
+
+	version := r.URL.Query().Get("v")
+	data, found := mgr.GetInitSegmentVersion(version)
+	if !found && version == "" {
+		found = waitForCondition(r.Context(), 5*time.Second, 100*time.Millisecond, func() bool {
+			data, found = mgr.GetInitSegmentVersion("")
+			return found
+		})
+	}
+	if !found {
+		if r.Context().Err() != nil {
+			return
+		}
+		writeHTTPError(w, "init segment not ready", http.StatusNotFound)
+		return
+	}
+
+	m.setCORSHeaders(w)
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	_ = writeHTTPResponse(w, data, httpStreamWriteTimeout)
+}

@@ -1,0 +1,570 @@
+package cluster
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/im-pingo/liveforge/core"
+	"github.com/im-pingo/liveforge/module/rtmp"
+	"github.com/im-pingo/liveforge/pkg/avframe"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+// mockRTMPServer creates a TCP listener that performs a minimal RTMP handshake
+// and responds to connect/createStream/publish with _result/onStatus messages.
+func mockRTMPServer(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleMockRTMP(conn)
+		}
+	}()
+
+	return ln, ln.Addr().String()
+}
+
+// handleMockRTMP handles a single mock RTMP connection.
+func handleMockRTMP(conn net.Conn) {
+	defer conn.Close()
+
+	// Client handshake: read C0+C1, send S0+S1+S2, read C2
+	c0c1 := make([]byte, 1+handshakeSize)
+	if _, err := io.ReadFull(conn, c0c1); err != nil {
+		return
+	}
+
+	s0s1s2 := make([]byte, 1+handshakeSize+handshakeSize)
+	s0s1s2[0] = 3
+	if _, err := conn.Write(s0s1s2); err != nil {
+		return
+	}
+
+	c2 := make([]byte, handshakeSize)
+	if _, err := io.ReadFull(conn, c2); err != nil {
+		return
+	}
+
+	// Now read RTMP chunks and respond to commands
+	cr := rtmp.NewChunkReader(conn, rtmp.DefaultChunkSize)
+	cw := rtmp.NewChunkWriter(conn, 4096)
+
+	for {
+		msg, err := cr.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		switch msg.TypeID {
+		case rtmp.MsgSetChunkSize:
+			if len(msg.Payload) >= 4 {
+				size := int(binary.BigEndian.Uint32(msg.Payload))
+				cr.SetChunkSize(size)
+			}
+
+		case rtmp.MsgAMF0Command:
+			vals, err := rtmp.AMF0Decode(msg.Payload)
+			if err != nil || len(vals) < 2 {
+				continue
+			}
+			cmd, _ := vals[0].(string)
+			txnID, _ := vals[1].(float64)
+
+			switch cmd {
+			case "connect":
+				// Send Window Ack Size
+				wack := make([]byte, 4)
+				binary.BigEndian.PutUint32(wack, 2500000)
+				cw.WriteMessage(2, &rtmp.Message{
+					TypeID: rtmp.MsgWindowAckSize, Length: 4, Payload: wack,
+				})
+				// Send _result for connect
+				resp, _ := rtmp.AMF0Encode("_result", txnID,
+					map[string]any{"fmsVer": "FMS/3,0,1,123", "capabilities": float64(31)},
+					map[string]any{"level": "status", "code": "NetConnection.Connect.Success"},
+				)
+				cw.WriteMessage(3, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), Payload: resp,
+				})
+
+			case "createStream":
+				resp, _ := rtmp.AMF0Encode("_result", txnID, nil, float64(1))
+				cw.WriteMessage(3, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), Payload: resp,
+				})
+
+			case "publish":
+				resp, _ := rtmp.AMF0Encode("onStatus", float64(0), nil,
+					map[string]any{"level": "status", "code": "NetStream.Publish.Start"},
+				)
+				cw.WriteMessage(5, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), StreamID: 1, Payload: resp,
+				})
+
+			case "play":
+				resp, _ := rtmp.AMF0Encode("onStatus", float64(0), nil,
+					map[string]any{"level": "status", "code": "NetStream.Play.Start"},
+				)
+				cw.WriteMessage(5, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), StreamID: 1, Payload: resp,
+				})
+
+			case "releaseStream", "FCPublish":
+				// These don't need responses
+			}
+
+		case rtmp.MsgVideo, rtmp.MsgAudio:
+			// Silently consume media messages
+		}
+	}
+}
+
+// TestForwardToMockRTMPServer verifies forward target can connect, publish, and stream.
+func TestForwardToMockRTMPServer(t *testing.T) {
+	ln, addr := mockRTMPServer(t)
+	defer ln.Close()
+
+	hub, _ := newTestHub()
+	stream, _ := hub.GetOrCreate("live/fwdtest")
+
+	pub := &originPublisher{id: "test-pub", info: &avframe.MediaInfo{
+		VideoCodec: avframe.CodecH264,
+		AudioCodec: avframe.CodecAAC,
+	}}
+	stream.SetPublisher(pub)
+
+	// Write sequence headers
+	stream.WriteFrame(&avframe.AVFrame{
+		MediaType: avframe.MediaTypeVideo,
+		Codec:     avframe.CodecH264,
+		FrameType: avframe.FrameTypeSequenceHeader,
+		Payload:   []byte{0x01, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x28, 0x01, 0x00, 0x04, 0x68, 0xEE, 0x3C, 0x80},
+	})
+	stream.WriteFrame(&avframe.AVFrame{
+		MediaType: avframe.MediaTypeAudio,
+		Codec:     avframe.CodecAAC,
+		FrameType: avframe.FrameTypeSequenceHeader,
+		Payload:   []byte{0x12, 0x10},
+	})
+
+	metrics := newRelayMetrics()
+	ft := NewForwardTarget("live/fwdtest", "rtmp://"+addr+"/live/fwdtest", stream, NewRTMPTransport(), nil, nil, 1, time.Second, metrics)
+
+	done := make(chan struct{})
+	go func() {
+		ft.Run()
+		close(done)
+	}()
+
+	// Write keyframes
+	time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 5; i++ {
+		stream.WriteFrame(&avframe.AVFrame{
+			MediaType: avframe.MediaTypeVideo,
+			Codec:     avframe.CodecH264,
+			FrameType: avframe.FrameTypeKeyframe,
+			DTS:       int64((i + 1) * 33),
+			PTS:       int64((i + 1) * 33),
+			Payload:   []byte{0x65, 0x88, 0x00, 0x01},
+		})
+		time.Sleep(33 * time.Millisecond)
+	}
+	if got := testutil.ToFloat64(metrics.bytesTotal.WithLabelValues("forward", "rtmp")); got <= 0 {
+		t.Fatalf("live forward RTMP bytes = %v, want > 0", got)
+	}
+	if got := testutil.CollectAndCount(metrics.latency); got != 1 {
+		t.Fatalf("live forward RTMP connection latency series = %d, want 1", got)
+	}
+
+	ft.Close()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Error("forward target did not stop within timeout")
+	}
+}
+
+// TestOriginPullFromMockServer verifies origin pull can connect and receive media.
+func TestOriginPullFromMockServer(t *testing.T) {
+	// Create a mock server that sends media data after play
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleMockOriginServer(conn)
+		}
+	}()
+
+	hub, _ := newTestHub()
+	stream, _ := hub.GetOrCreate("live/pulltest")
+
+	metrics := newRelayMetrics()
+	op := NewOriginPull("live/pulltest", []string{"rtmp://" + addr + "/live"}, stream, newTestRegistry(), nil, nil, 1, 2*time.Second, 5*time.Second, metrics)
+
+	done := make(chan struct{})
+	go func() {
+		op.Run()
+		close(done)
+	}()
+
+	// Wait for some frames to be received
+	time.Sleep(500 * time.Millisecond)
+	if got := testutil.ToFloat64(metrics.bytesTotal.WithLabelValues("origin", "rtmp")); got <= 0 {
+		t.Fatalf("live origin RTMP bytes = %v, want > 0", got)
+	}
+	if got := testutil.CollectAndCount(metrics.latency); got != 1 {
+		t.Fatalf("live origin RTMP connection latency series = %d, want 1", got)
+	}
+	op.Close()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Error("origin pull did not stop within timeout")
+	}
+
+	// Check that frames were written to the stream
+	if stream.VideoSeqHeader() != nil {
+		t.Log("video sequence header received")
+	}
+}
+
+func TestClusterRTMPStalePublisherCallbackCannotWriteReplacementGeneration(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	playReady := make(chan struct{})
+	sendActive := make(chan struct{})
+	sendStale := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		serverErr <- serveControlledRTMPOrigin(conn, playReady, sendActive, sendStale)
+	}()
+
+	hub, _ := newTestHub()
+	stream, err := hub.GetOrCreate("live/stale-writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pullDone := make(chan error, 1)
+	go func() {
+		pullDone <- NewRTMPTransport().Pull(ctx, "rtmp://"+ln.Addr().String()+"/live/stale-writer", stream)
+	}()
+
+	select {
+	case <-playReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cluster RTMP pull did not reach play")
+	}
+	close(sendActive)
+	deadline := time.Now().Add(2 * time.Second)
+	for stream.RingBuffer().WriteCursor() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := stream.RingBuffer().WriteCursor(); got != 1 {
+		t.Fatalf("active cluster callback cursor = %d, want 1", got)
+	}
+	oldPublisher := stream.Publisher()
+	if oldPublisher == nil || !stream.RemovePublisherIf(oldPublisher) {
+		t.Fatal("old cluster publisher was not removed")
+	}
+	replacement := &originPublisher{id: "cluster-replacement", info: &avframe.MediaInfo{VideoCodec: avframe.CodecH264}}
+	if err := stream.SetPublisher(replacement); err != nil {
+		t.Fatal(err)
+	}
+	startCursor := stream.StartupSnapshot().GenerationStartCursor
+	close(sendStale)
+
+	select {
+	case pullErr := <-pullDone:
+		if pullErr != nil {
+			t.Fatalf("cluster RTMP pull: %v", pullErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cluster RTMP pull did not stop after stale publisher write")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if got := stream.RingBuffer().WriteCursor(); got != startCursor {
+		t.Fatalf("stale cluster callback advanced replacement cursor to %d, want %d", got, startCursor)
+	}
+}
+
+func serveControlledRTMPOrigin(conn net.Conn, playReady chan<- struct{}, sendActive, sendStale <-chan struct{}) error {
+	defer conn.Close()
+	c0c1 := make([]byte, 1+handshakeSize)
+	if _, err := io.ReadFull(conn, c0c1); err != nil {
+		return err
+	}
+	s0s1s2 := make([]byte, 1+2*handshakeSize)
+	s0s1s2[0] = 3
+	if _, err := conn.Write(s0s1s2); err != nil {
+		return err
+	}
+	c2 := make([]byte, handshakeSize)
+	if _, err := io.ReadFull(conn, c2); err != nil {
+		return err
+	}
+
+	cr := rtmp.NewChunkReader(conn, rtmp.DefaultChunkSize)
+	cw := rtmp.NewChunkWriter(conn, 4096)
+	for {
+		msg, err := cr.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if msg.TypeID == rtmp.MsgSetChunkSize && len(msg.Payload) >= 4 {
+			cr.SetChunkSize(int(binary.BigEndian.Uint32(msg.Payload)))
+			continue
+		}
+		if msg.TypeID != rtmp.MsgAMF0Command {
+			continue
+		}
+		values, err := rtmp.AMF0Decode(msg.Payload)
+		if err != nil || len(values) < 2 {
+			continue
+		}
+		command, _ := values[0].(string)
+		transactionID, _ := values[1].(float64)
+		switch command {
+		case "connect", "createStream":
+			payload, _ := rtmp.AMF0Encode("_result", transactionID, nil, float64(1))
+			if err := cw.WriteMessage(3, &rtmp.Message{TypeID: rtmp.MsgAMF0Command, Length: uint32(len(payload)), Payload: payload}); err != nil {
+				return err
+			}
+		case "play":
+			close(playReady)
+			<-sendActive
+			active := []byte{0x17, 0x01, 0x00, 0x00, 0x00, 0x65, 0x01}
+			if err := cw.WriteMessage(6, &rtmp.Message{TypeID: rtmp.MsgVideo, Length: uint32(len(active)), StreamID: 1, Payload: active}); err != nil {
+				return err
+			}
+			<-sendStale
+			stale := []byte{0x17, 0x01, 0x00, 0x00, 0x00, 0x65, 0x02}
+			if err := cw.WriteMessage(6, &rtmp.Message{TypeID: rtmp.MsgVideo, Length: uint32(len(stale)), Timestamp: 33, StreamID: 1, Payload: stale}); err != nil {
+				return err
+			}
+			status, _ := rtmp.AMF0Encode("onStatus", float64(0), nil, map[string]any{"code": "NetStream.Play.Stop"})
+			if err := cw.WriteMessage(6, &rtmp.Message{TypeID: rtmp.MsgAMF0Command, Length: uint32(len(status)), StreamID: 1, Payload: status}); err != nil {
+				return err
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected RTMP command %q", command)
+		}
+	}
+}
+
+// TestForwardManagerMultiProtocol verifies that the ForwardManager routes to
+// different transports based on URL scheme.
+func TestForwardManagerMultiProtocol(t *testing.T) {
+	hub, bus := newTestHub()
+
+	// Use real transports — targets will fail to connect but that's fine,
+	// we're testing that the registry resolves each URL to the correct transport.
+	registry := NewTransportRegistry()
+	registry.Register(NewRTMPTransport())
+	registry.Register(NewSRTTransport(defaultClusterSRTConfig()))
+
+	targets := []string{
+		"rtmp://127.0.0.1:19998/live/stream",
+		"srt://127.0.0.1:19997/live/stream",
+	}
+	scheduler := NewScheduler("", targets, "", 0)
+	fm := NewForwardManager(hub, bus, scheduler, registry, nil, nil, 1, time.Millisecond)
+
+	stream, _ := hub.GetOrCreate("live/multitest")
+	pub := &originPublisher{id: "test-pub", info: &avframe.MediaInfo{
+		VideoCodec: avframe.CodecH264,
+	}}
+	stream.SetPublisher(pub)
+
+	fm.onPublish(&core.EventContext{StreamKey: "live/multitest"})
+
+	if fm.ActiveCount() != 1 {
+		t.Errorf("ActiveCount = %d, want 1", fm.ActiveCount())
+	}
+
+	// Verify both targets were created (2 targets for this stream key).
+	fm.mu.Lock()
+	fts := fm.active["live/multitest"]
+	fm.mu.Unlock()
+
+	if len(fts) != 2 {
+		t.Fatalf("expected 2 forward targets, got %d", len(fts))
+	}
+
+	// Clean up.
+	fm.onPublishStop(&core.EventContext{StreamKey: "live/multitest"})
+	time.Sleep(50 * time.Millisecond)
+	fm.Close()
+
+	if fm.ActiveCount() != 0 {
+		t.Errorf("ActiveCount after stop = %d, want 0", fm.ActiveCount())
+	}
+}
+
+// TestTransportRegistryResolveMultiScheme verifies the registry resolves URLs
+// to the correct transport based on scheme.
+func TestTransportRegistryResolveMultiScheme(t *testing.T) {
+	registry := NewTransportRegistry()
+	registry.Register(NewRTMPTransport())
+	registry.Register(NewSRTTransport(defaultClusterSRTConfig()))
+	registry.Register(NewRTSPTransport(defaultClusterRTSPConfig()))
+
+	tests := []struct {
+		url    string
+		scheme string
+	}{
+		{"rtmp://host/live/stream", "rtmp"},
+		{"srt://host:6000/live/stream", "srt"},
+		{"rtsp://host:554/live/stream", "rtsp"},
+	}
+
+	for _, tt := range tests {
+		transport, err := registry.Resolve(tt.url)
+		if err != nil {
+			t.Errorf("Resolve(%q) error: %v", tt.url, err)
+			continue
+		}
+		if transport.Scheme() != tt.scheme {
+			t.Errorf("Resolve(%q).Scheme() = %q, want %q", tt.url, transport.Scheme(), tt.scheme)
+		}
+	}
+
+	// Unknown scheme should fail.
+	_, err := registry.Resolve("unknown://host/stream")
+	if err == nil {
+		t.Error("expected error for unknown scheme")
+	}
+}
+
+// handleMockOriginServer handles a mock origin that sends media data after play.
+func handleMockOriginServer(conn net.Conn) {
+	defer conn.Close()
+
+	// Handshake
+	c0c1 := make([]byte, 1+handshakeSize)
+	if _, err := io.ReadFull(conn, c0c1); err != nil {
+		return
+	}
+	s0s1s2 := make([]byte, 1+handshakeSize+handshakeSize)
+	s0s1s2[0] = 3
+	conn.Write(s0s1s2)
+
+	c2 := make([]byte, handshakeSize)
+	io.ReadFull(conn, c2)
+
+	cr := rtmp.NewChunkReader(conn, rtmp.DefaultChunkSize)
+	cw := rtmp.NewChunkWriter(conn, 4096)
+
+	playReceived := false
+
+	for {
+		msg, err := cr.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		switch msg.TypeID {
+		case rtmp.MsgSetChunkSize:
+			if len(msg.Payload) >= 4 {
+				size := int(binary.BigEndian.Uint32(msg.Payload))
+				cr.SetChunkSize(size)
+			}
+
+		case rtmp.MsgAMF0Command:
+			vals, _ := rtmp.AMF0Decode(msg.Payload)
+			if len(vals) < 2 {
+				continue
+			}
+			cmd, _ := vals[0].(string)
+			txnID, _ := vals[1].(float64)
+
+			switch cmd {
+			case "connect":
+				resp, _ := rtmp.AMF0Encode("_result", txnID,
+					map[string]any{"fmsVer": "FMS/3,0,1,123"},
+					map[string]any{"code": "NetConnection.Connect.Success"},
+				)
+				cw.WriteMessage(3, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), Payload: resp,
+				})
+
+			case "createStream":
+				resp, _ := rtmp.AMF0Encode("_result", txnID, nil, float64(1))
+				cw.WriteMessage(3, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), Payload: resp,
+				})
+
+			case "play":
+				resp, _ := rtmp.AMF0Encode("onStatus", float64(0), nil,
+					map[string]any{"code": "NetStream.Play.Start"},
+				)
+				cw.WriteMessage(5, &rtmp.Message{
+					TypeID: rtmp.MsgAMF0Command, Length: uint32(len(resp)), StreamID: 1, Payload: resp,
+				})
+				playReceived = true
+
+				// Send video sequence header + a few keyframes
+				go func() {
+					time.Sleep(50 * time.Millisecond)
+					if !playReceived {
+						return
+					}
+
+					// Video sequence header (H.264)
+					vsh := []byte{0x17, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x00, 0x28}
+					cw.WriteMessage(6, &rtmp.Message{
+						TypeID: rtmp.MsgVideo, Length: uint32(len(vsh)), StreamID: 1, Payload: vsh,
+					})
+
+					// A few keyframes
+					for i := 0; i < 3; i++ {
+						kf := []byte{0x17, 0x01, 0x00, 0x00, 0x00, 0x65, 0x88}
+						ts := uint32((i + 1) * 33)
+						cw.WriteMessage(6, &rtmp.Message{
+							TypeID: rtmp.MsgVideo, Length: uint32(len(kf)),
+							Timestamp: ts, StreamID: 1, Payload: kf,
+						})
+						time.Sleep(33 * time.Millisecond)
+					}
+
+				}()
+			}
+		}
+	}
+}

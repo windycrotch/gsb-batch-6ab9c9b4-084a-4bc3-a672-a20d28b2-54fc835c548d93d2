@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/im-pingo/liveforge/docs/config/config.schema.json",
+  "title": "LiveForge configuration",
+  "description": "Schema for bootstrap and runtime documents. x-liveforge-reload matches config/runtime: hot_reload applies in process, restart_required remains pending until restart, and immutable rejects the candidate.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "server": {"$ref": "#/$defs/server"},
+    "tls": {"$ref": "#/$defs/tls", "x-liveforge-reload": "restart_required"},
+    "limits": {"$ref": "#/$defs/limits", "x-liveforge-reload": "hot_reload"},
+    "rtmp": {"$ref": "#/$defs/rtmp", "x-liveforge-reload": "restart_required"},
+    "rtsp": {"$ref": "#/$defs/rtsp", "x-liveforge-reload": "restart_required"},
+    "http_stream": {"$ref": "#/$defs/http_stream"},
+    "websocket": {"$ref": "#/$defs/websocket", "x-liveforge-reload": "restart_required"},
+    "webrtc": {"$ref": "#/$defs/webrtc"},
+    "srt": {"$ref": "#/$defs/srt", "x-liveforge-reload": "restart_required"},
+    "sip": {"$ref": "#/$defs/sip", "x-liveforge-reload": "restart_required"},
+    "gb28181": {"$ref": "#/$defs/gb28181", "x-liveforge-reload": "restart_required"},
+    "audio_codec": {"$ref": "#/$defs/audio_codec", "x-liveforge-reload": "restart_required"},
+    "stream": {"$ref": "#/$defs/stream"},
+    "auth": {"$ref": "#/$defs/auth"},
+    "notify": {"$ref": "#/$defs/notify"},
+    "cluster": {"$ref": "#/$defs/cluster"},
+    "record": {"$ref": "#/$defs/record"},
+    "dvr": {"$ref": "#/$defs/dvr"},
+    "metrics": {"$ref": "#/$defs/metrics", "x-liveforge-reload": "restart_required"},
+    "api": {"$ref": "#/$defs/api"},
+    "runtime": {"$ref": "#/$defs/runtime", "x-liveforge-reload": "restart_required"}
+  },
+  "$defs": {
+    "duration": {"type": "string", "pattern": "^-?(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$", "description": "Go time.Duration, for example 200ms, 30s, or 1h30m."},
+    "nonnegative_duration": {"type": "string", "pattern": "^(0|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$", "description": "Non-negative Go time.Duration."},
+    "nullable_boolean": {"type": ["boolean", "null"]},
+    "port_range": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "prefixItems": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "integer", "minimum": 1, "maximum": 65535}],
+      "items": false,
+      "description": "Inclusive ordered [minimum, maximum] range; runtime validation also checks ordering."
+    },
+    "defaultable_port_range": {
+      "type": "array",
+      "prefixItems": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "integer", "minimum": 1, "maximum": 65535}],
+      "items": false,
+      "anyOf": [{"maxItems": 0}, {"minItems": 2, "maxItems": 2}],
+      "description": "Either an empty list to select the owning module's fallback behavior or an inclusive ordered [minimum, maximum] range; runtime validation also checks ordering."
+    },
+    "skip_tracker": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"max_count": {"type": "integer"}, "window": {"$ref": "#/$defs/duration"}}
+    },
+    "server": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "x-liveforge-reload": "immutable"},
+        "log_level": {"type": "string", "enum": ["debug", "info", "warn", "error"], "x-liveforge-reload": "hot_reload"},
+        "drain_timeout": {"$ref": "#/$defs/nonnegative_duration", "x-liveforge-reload": "hot_reload"}
+      }
+    },
+    "tls": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "cert_file": {"type": "string"},
+        "key_file": {"type": "string", "writeOnly": true, "x-liveforge-secret": true},
+        "auto": {"type": "boolean"}
+      }
+    },
+    "limits": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "max_streams": {"type": "integer", "minimum": 0},
+        "max_subscribers_per_stream": {"type": "integer", "minimum": 0},
+        "max_connections": {"type": "integer", "minimum": 0},
+        "max_bitrate_per_stream": {"type": "integer", "minimum": 0},
+        "rate_limit": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"enabled": {"type": "boolean"}, "rate": {"type": "number", "minimum": 0}, "burst": {"type": "integer", "minimum": 0}, "trusted_proxies": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "default": [], "description": "IP addresses or CIDR networks allowed to supply X-Forwarded-For or X-Real-IP. Forwarded headers are ignored for every other direct peer."}}
+        }
+      }
+    },
+    "rtmp": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}, "listen": {"type": "string"}, "chunk_size": {"type": "integer", "minimum": 1}, "tls": {"$ref": "#/$defs/nullable_boolean"}, "skip_tracker": {"$ref": "#/$defs/skip_tracker"}}
+    },
+    "rtsp": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"}, "listen": {"type": "string"}, "rtp_port_range": {"$ref": "#/$defs/defaultable_port_range", "description": "When omitted, the bootstrap default is 10000-20000. An explicit empty list selects the RTSP module fallback 30000-40000."}, "tls": {"$ref": "#/$defs/nullable_boolean"}, "skip_tracker": {"$ref": "#/$defs/skip_tracker"},
+        "multicast": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"enabled": {"type": "boolean"}, "address": {"type": "string"}, "base_port": {"type": "integer", "minimum": 1, "maximum": 65535}, "ttl": {"type": "integer", "minimum": 0, "maximum": 255}, "interface": {"type": "string"}}
+        }
+      }
+    },
+    "segment_playlist": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"segment_duration": {"type": "number", "exclusiveMinimum": 0}, "playlist_size": {"type": "integer", "minimum": 1}}
+    },
+    "http_stream": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"},
+        "listen": {"type": "string", "x-liveforge-reload": "restart_required"},
+        "cors": {"type": "boolean", "x-liveforge-reload": "restart_required"},
+        "tls": {"$ref": "#/$defs/nullable_boolean", "x-liveforge-reload": "restart_required"},
+        "hls": {"$ref": "#/$defs/segment_playlist", "x-liveforge-reload": "hot_reload"},
+        "dash": {"$ref": "#/$defs/segment_playlist", "x-liveforge-reload": "hot_reload"},
+        "llhls": {
+          "type": "object", "additionalProperties": false, "x-liveforge-reload": "hot_reload",
+          "properties": {"enabled": {"type": "boolean"}, "part_duration": {"type": "number", "exclusiveMinimum": 0}, "segment_duration": {"type": "number", "minimum": 0.1}, "segment_count": {"type": "integer", "minimum": 1}, "container": {"type": "string", "enum": ["fmp4", "ts"]}}
+        }
+      }
+    },
+    "websocket": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}, "listen": {"type": "string"}, "path": {"type": "string"}}
+    },
+    "webrtc": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "listen": {"type": "string", "x-liveforge-reload": "restart_required"}, "ice_lite": {"type": "boolean", "x-liveforge-reload": "restart_required"},
+        "ice_servers": {
+          "type": "array", "x-liveforge-reload": "restart_required",
+          "items": {"type": "object", "additionalProperties": false, "properties": {"urls": {"type": "array", "items": {"type": "string"}}, "username": {"type": "string"}, "credential": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}}}
+        },
+        "udp_port_range": {"$ref": "#/$defs/defaultable_port_range", "description": "When omitted, the bootstrap default is 20000-30000. An explicit empty list leaves ICE UDP port selection to Pion and the operating system.", "x-liveforge-reload": "restart_required"},
+        "candidates": {"type": "array", "items": {"type": "string"}, "x-liveforge-reload": "restart_required"},
+        "tls": {"$ref": "#/$defs/nullable_boolean", "x-liveforge-reload": "restart_required"},
+        "gcc": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "initial_bitrate": {"type": "integer", "minimum": 0, "x-liveforge-reload": "hot_reload"}, "min_bitrate": {"type": "integer", "minimum": 0, "x-liveforge-reload": "hot_reload"}, "max_bitrate": {"type": "integer", "minimum": 0, "x-liveforge-reload": "hot_reload"}}
+        }
+      }
+    },
+    "srt": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}, "listen": {"type": "string"}, "latency": {"type": "integer", "minimum": 0}, "passphrase": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "pbkeylen": {"type": "integer", "enum": [0, 16, 24, 32]}, "skip_tracker": {"$ref": "#/$defs/skip_tracker"}}
+    },
+    "sip": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"}, "listen": {"type": "string"}, "transport": {"type": "array", "items": {"type": "string", "enum": ["udp", "tcp"]}}, "server_id": {"type": "string"}, "domain": {"type": "string"},
+        "auth": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}, "password": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}}},
+        "gateway": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}, "stream_prefix": {"type": "string"}, "rtp_port_range": {"$ref": "#/$defs/port_range"}, "codecs": {"type": "array", "items": {"type": "string"}}, "max_calls": {"type": "integer", "description": "Maximum concurrent calls; any non-positive value selects the gateway default of 100."}, "max_lab_sessions": {"type": "integer", "minimum": 1, "description": "Maximum active persistent local SIP protocol-lab sessions; non-positive values use the default of 16.", "x-liveforge-reload": "restart_required"}}}
+      }
+    },
+    "gb28181": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"}, "stream_prefix": {"type": "string"}, "rtp_port_range": {"$ref": "#/$defs/defaultable_port_range", "description": "An empty list selects the GB28181 module fallback range 40000-50000."}, "max_lab_sessions": {"type": "integer", "minimum": 1, "description": "Maximum active persistent local GB28181 protocol-lab sessions; non-positive values use the default of 16.", "x-liveforge-reload": "restart_required"},
+        "ssrc": {"type": "object", "additionalProperties": false, "properties": {"prefix": {"type": "string"}}},
+        "keepalive": {"type": "object", "additionalProperties": false, "properties": {"interval": {"$ref": "#/$defs/duration"}, "timeout": {"$ref": "#/$defs/duration"}}},
+        "auto_invite": {"type": "boolean"}, "catalog_interval": {"$ref": "#/$defs/duration"}, "dump_file": {"type": "string"}
+      }
+    },
+    "audio_codec": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}}},
+    "slow_consumer": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean"}, "lag_warn_ratio": {"type": "number", "minimum": 0, "maximum": 1}, "lag_drop_ratio": {"type": "number", "minimum": 0, "maximum": 1}, "lag_critical_ratio": {"type": "number", "minimum": 0, "maximum": 1}, "lag_recover_ratio": {"type": "number", "minimum": 0, "maximum": 1}, "ewma_alpha": {"type": "number", "minimum": 0, "maximum": 1}, "send_time_ratio": {"type": "number", "minimum": 0}}
+    },
+    "feedback": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"default_mode": {"type": "string", "enum": ["auto", "passthrough", "aggregate", "drop"]}, "auto_thresholds": {"type": "object", "additionalProperties": false, "properties": {"passthrough_max": {"type": "integer", "minimum": 0}, "aggregate_max": {"type": "integer", "minimum": 0}}}}
+    },
+    "simulcast": {
+      "type": "object", "additionalProperties": false, "x-liveforge-reload": "restart_required", "x-liveforge-support": "available",
+      "description": "WHIP RID simulcast with up to three isolated encodings. WHEP selects one layer at session creation; other protocols use the highest-ranked offered layer. All settings require restart.",
+      "properties": {
+        "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"},
+        "auto_pause_layer": {"type": "boolean", "description": "Suspend server-local video processing for unused noncanonical layers while continuing RTP reads. Resume waits for fresh keyframes/headers; does not pause upstream encoding or promise bandwidth savings.", "x-liveforge-reload": "restart_required"},
+        "layers": {"type": "array", "maxItems": 3, "description": "RID values must be unique. Enabled simulcast requires at least one layer. Offered RIDs must match configured entries.", "x-liveforge-reload": "restart_required", "items": {"type": "object", "additionalProperties": false, "required": ["rid", "max_bitrate"], "properties": {"rid": {"type": "string", "minLength": 1, "maxLength": 16, "pattern": "^[A-Za-z0-9_-]+$", "not": {"enum": ["auto", "high", "low"]}, "x-liveforge-reload": "restart_required"}, "max_bitrate": {"type": "integer", "minimum": 1, "description": "Advisory ranking in bits per second, descending with lexical RID tie-break; not an encoder bitrate limit.", "x-liveforge-reload": "restart_required"}}}}
+      },
+      "allOf": [{"if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}, "then": {"required": ["layers"], "properties": {"layers": {"minItems": 1}}}}]
+    },
+    "stream": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "gop_cache": {"type": "boolean", "x-liveforge-reload": "hot_reload"}, "gop_cache_num": {"type": "integer", "minimum": 0, "x-liveforge-reload": "hot_reload"}, "gop_cache_max_frames": {"type": "integer", "minimum": 0, "description": "Maximum frames in one cached GOP; zero disables this bound. Hot reload recomputes the retained prefix; relaxation affects future frames only.", "x-liveforge-reload": "hot_reload"}, "gop_cache_max_duration": {"$ref": "#/$defs/duration", "description": "Maximum duration of one cached GOP; zero disables this bound. Hot reload recomputes the retained prefix; relaxation affects future frames only.", "x-liveforge-reload": "hot_reload"}, "gop_cache_max_bytes": {"type": "integer", "minimum": 0, "description": "Maximum payload bytes in one cached GOP; zero disables this bound. Hot reload recomputes the retained prefix; relaxation affects future frames only.", "x-liveforge-reload": "hot_reload"},
+        "ring_buffer_size": {"type": "integer", "minimum": 1, "x-liveforge-reload": "restart_required"}, "idle_timeout": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "no_publisher_timeout": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"},
+        "slow_consumer": {"$ref": "#/$defs/slow_consumer", "x-liveforge-reload": "hot_reload"}, "feedback": {"$ref": "#/$defs/feedback", "x-liveforge-reload": "hot_reload"},
+        "simulcast": {"$ref": "#/$defs/simulcast", "x-liveforge-reload": "restart_required", "x-liveforge-support": "available"}
+      },
+      "allOf": [{"if": {"properties": {"gop_cache": {"const": true}, "gop_cache_num": {"minimum": 1}}, "required": ["gop_cache", "gop_cache_num"]}, "then": {"anyOf": [{"required": ["gop_cache_max_frames"], "properties": {"gop_cache_max_frames": {"minimum": 1}}}, {"required": ["gop_cache_max_bytes"], "properties": {"gop_cache_max_bytes": {"minimum": 1}}}]}}]
+    },
+    "auth_rule": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "mode": {"type": "string", "enum": ["none", "token", "callback", "token+callback"]},
+        "token": {"type": "object", "additionalProperties": false, "properties": {"secret": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "algorithm": {"type": "string"}}},
+        "callback": {"type": "object", "additionalProperties": false, "properties": {"url": {"type": "string"}, "timeout": {"$ref": "#/$defs/duration"}}}
+      }
+    },
+    "auth": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"},
+        "publish": {"$ref": "#/$defs/auth_rule", "x-liveforge-reload": "hot_reload"},
+        "subscribe": {"$ref": "#/$defs/auth_rule", "x-liveforge-reload": "hot_reload"},
+        "api": {
+          "type": "object", "additionalProperties": false, "deprecated": true, "x-liveforge-reload": "hot_reload",
+          "description": "Deprecated. Move auth.api.bearer_token to api.auth.bearer_token; the current api.auth path wins when both exist.",
+          "properties": {"bearer_token": {"type": "string", "writeOnly": true, "deprecated": true, "x-liveforge-secret": true}}
+        }
+      }
+    },
+    "notify": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "http": {"type": "object", "additionalProperties": false, "properties": {
+          "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"},
+          "endpoints": {"type": "array", "x-liveforge-reload": "hot_reload", "items": {"type": "object", "additionalProperties": false, "properties": {"url": {"type": "string"}, "events": {"type": "array", "items": {"type": "string"}}, "secret": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "retry": {"type": "integer", "minimum": 0}, "timeout": {"$ref": "#/$defs/duration"}}}}
+        }},
+        "websocket": {"type": "object", "additionalProperties": false, "x-liveforge-reload": "restart_required", "properties": {"enabled": {"type": "boolean"}, "path": {"type": "string"}}},
+        "alive_interval": {"$ref": "#/$defs/duration", "x-liveforge-reload": "restart_required"}
+      }
+    },
+    "cluster_forward": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "targets": {"type": "array", "items": {"type": "string"}, "x-liveforge-reload": "hot_reload"}, "schedule_url": {"type": "string", "x-liveforge-reload": "hot_reload"}, "schedule_priority": {"type": "string", "x-liveforge-reload": "hot_reload"}, "schedule_timeout": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "retry_max": {"type": "integer", "minimum": 0, "x-liveforge-reload": "hot_reload"}, "retry_interval": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}}
+    },
+    "cluster_origin": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "servers": {"type": "array", "items": {"type": "string"}, "x-liveforge-reload": "hot_reload"}, "schedule_url": {"type": "string", "x-liveforge-reload": "hot_reload"}, "schedule_priority": {"type": "string", "x-liveforge-reload": "hot_reload"}, "schedule_timeout": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "idle_timeout": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "retry_max": {"type": "integer", "minimum": 0, "x-liveforge-reload": "hot_reload"}, "retry_delay": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}}
+    },
+    "cluster_health": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "interval": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "timeout": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "evict_threshold": {"type": "integer", "description": "Consecutive failures before eviction; any non-positive value selects the health tracker default of 3.", "x-liveforge-reload": "hot_reload"}}
+    },
+    "cluster_relay_pool": {"type": "object", "additionalProperties": false, "properties": {"max_per_host": {"type": "integer", "minimum": 1}}},
+    "cluster_srt": {"type": "object", "additionalProperties": false, "properties": {"latency": {"$ref": "#/$defs/duration"}, "passphrase": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "pbkeylen": {"type": "integer", "enum": [0, 16, 24, 32]}}},
+    "cluster_rtsp": {"type": "object", "additionalProperties": false, "properties": {"transport": {"type": "string", "enum": ["tcp", "udp"]}}},
+    "cluster_rtp": {"type": "object", "additionalProperties": false, "properties": {"port_range": {"type": "string"}, "signaling_path": {"type": "string"}, "rtcp_interval": {"$ref": "#/$defs/duration"}, "timeout": {"$ref": "#/$defs/duration"}}},
+    "cluster_gb": {"type": "object", "additionalProperties": false, "properties": {"port_range": {"$ref": "#/$defs/port_range"}, "signaling_path": {"type": "string"}, "rtcp_interval": {"$ref": "#/$defs/duration"}, "timeout": {"$ref": "#/$defs/duration"}}},
+    "cluster": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"forward": {"$ref": "#/$defs/cluster_forward"}, "origin": {"$ref": "#/$defs/cluster_origin"}, "health_check": {"$ref": "#/$defs/cluster_health"}, "relay_pool": {"$ref": "#/$defs/cluster_relay_pool", "x-liveforge-reload": "restart_required"}, "srt": {"$ref": "#/$defs/cluster_srt", "x-liveforge-reload": "restart_required"}, "rtsp": {"$ref": "#/$defs/cluster_rtsp", "x-liveforge-reload": "restart_required"}, "rtp": {"$ref": "#/$defs/cluster_rtp", "x-liveforge-reload": "restart_required"}, "gb28181": {"$ref": "#/$defs/cluster_gb", "x-liveforge-reload": "restart_required"}}
+    },
+    "record": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "stream_pattern": {"type": "string", "description": "Glob matched against the complete stream key. Ordinary GB28181 inbound streams use {gb28181.stream_prefix}/{channel_id}; use gb28181/* (or *) to include them.", "x-liveforge-reload": "hot_reload"}, "format": {"type": "string", "enum": ["flv", "fmp4", "mp4", "ts", "hls"], "default": "fmp4", "description": "Recording container. The default is fMP4 and the default extension is .mp4; fMP4/MP4 are browser-friendly unified recording formats. hls is an alias for TS storage and uses a .ts extension.", "x-liveforge-reload": "hot_reload"}, "path": {"type": "string", "description": "Recording path template. Supported placeholders are {stream_key}, {date}, {time}, and {ext}. A leading ~/ is expanded to the process user's home directory; ${HOME} is also expanded by trusted config loading. The resolved storage root is exposed by recording status.", "x-liveforge-reload": "restart_required"},
+        "segment": {"type": "object", "additionalProperties": false, "x-liveforge-reload": "hot_reload", "properties": {"mode": {"type": "string", "description": "Operator label; segmentation is activated by positive duration and/or max_size values."}, "duration": {"$ref": "#/$defs/duration"}, "max_size": {"type": "string", "pattern": "^\\s*(?:[0-9]+(?:[bB]|[kK][bB]|[mM][bB]|[gG][bB])?)?\\s*$", "description": "Optional non-negative decimal byte count with suffix B, KB, MB, or GB. Empty or zero disables size rotation; fractional, negative, unknown-suffix, and overflow values are invalid."}}},
+        "on_file_complete": {"type": "object", "additionalProperties": false, "x-liveforge-reload": "hot_reload", "properties": {"url": {"type": "string"}}}
+      }
+    },
+    "dvr": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "listen": {"type": "string", "x-liveforge-reload": "restart_required"}, "stream_pattern": {"type": "string", "x-liveforge-reload": "hot_reload"}, "path": {"type": "string", "x-liveforge-reload": "restart_required"}, "window": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "segment_duration": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}, "cleanup_interval": {"$ref": "#/$defs/duration", "x-liveforge-reload": "hot_reload"}}
+    },
+    "metrics": {"type": "object", "additionalProperties": false, "properties": {"enabled": {"type": "boolean"}, "listen": {"type": "string"}, "path": {"type": "string"}, "stream_detail": {"type": "boolean", "default": false, "description": "Opt in to per-stream Prometheus series carrying stream_key labels. Server-level aggregate metrics remain available when disabled."}, "stream_detail_limit": {"type": "integer", "minimum": 0, "default": 100, "description": "Without an allowlist, maximum distinct stream keys admitted for one Collector lifetime; admitted keys are not evicted or replaced after streams disappear. With an allowlist, maximum keys exported per scrape. Zero exports no per-stream series; negative values are invalid."}, "stream_detail_allowlist": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "default": [], "description": "Optional authoritative exact stream-key universe, deduplicated and sorted when the Collector is created, then subject to stream_detail_limit per scrape. When empty, lifetime creation-order admission applies."}}},
+    "api": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "x-liveforge-reload": "restart_required"}, "listen": {"type": "string", "x-liveforge-reload": "restart_required"}, "tls": {"$ref": "#/$defs/nullable_boolean", "x-liveforge-reload": "restart_required"},
+        "auth": {"type": "object", "additionalProperties": false, "x-liveforge-reload": "hot_reload", "properties": {
+          "bearer_token": {"type": "string", "writeOnly": true, "x-liveforge-secret": true, "description": "Current legacy-admin bearer path. It wins over deprecated auth.api.bearer_token when both exist."},
+          "tokens": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["token", "role"], "properties": {"name": {"type": "string"}, "token": {"type": "string", "minLength": 1, "writeOnly": true, "x-liveforge-secret": true}, "role": {"type": "string", "enum": ["viewer", "operator", "admin"]}}}}
+        }},
+        "console": {"type": "object", "additionalProperties": false, "x-liveforge-reload": "hot_reload", "properties": {"username": {"type": "string"}, "password": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "role": {"type": "string", "enum": ["viewer", "operator", "admin"]}}},
+        "audit": {"type": "object", "additionalProperties": false, "x-liveforge-reload": "restart_required", "properties": {"max_entries": {"type": "integer", "description": "Bounded in-memory audit capacity; any non-positive value selects the default of 1000 entries."}, "path": {"type": "string", "default": "", "description": "Optional Linux/macOS private NDJSON audit file; empty disables persistence. Trusted environment references and ~/ expand. Retains one rotated .1 file and an empty .lock file; requires regular single-link mode0600 files and one writer. Restart required."}, "max_bytes": {"type": "integer", "default": 8388608, "anyOf": [{"const": 0}, {"minimum": 65536, "maximum": 1073741824}], "description": "Maximum bytes per audit data file. Zero selects8MiB; retains at most two data files. Existing files above a tightened limit fail startup. Restart required."}}}
+      }
+    },
+    "runtime": {
+      "type": "object", "additionalProperties": false,
+      "description": "Bootstrap-controlled background source. Loads run on the manager worker; snapshot and typed-key reads are atomic and non-blocking. Config writes are serialized with loads and close, complete before Apply returns 202, and then schedule background parse/apply/publication. The Config API exposes the complete versioned JSON Schema, raw source document, redacted document, validation, and apply operations. Apply is writable for file, HTTP/HTTPS, Consul, and Redis sources when their backend accepts writes; other sources return a read-only conflict.",
+      "properties": {
+        "source": {"type": "string", "enum": ["file", "http", "https", "consul", "redis"]}, "poll_interval": {"$ref": "#/$defs/duration"}, "load_timeout": {"$ref": "#/$defs/duration"},
+        "file": {"type": "object", "additionalProperties": false, "description": "Writable by atomic replacement of the configured path. New targets use private mode 0600; an existing target's permission bits are preserved. Loading is capped by max_bytes.", "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer", "description": "Maximum file document bytes; any non-positive value selects the 4 MiB source default."}}},
+        "http": {"type": "object", "additionalProperties": false, "description": "HTTP configuration source. runtime.source=http requires an http:// URL and runtime.source=https requires an https:// URL. Scheme mismatches are rejected before dispatch, redirects are disabled, and ETag/Last-Modified validators advance only after a document is accepted. Apply uses authenticated PUT.", "properties": {"url": {"type": "string", "description": "Complete source URL whose scheme must exactly match the selected http or https runtime.source."}, "token": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "max_bytes": {"type": "integer", "description": "Maximum response bytes; any non-positive value selects the 4 MiB source default."}}},
+        "consul": {"type": "object", "additionalProperties": false, "description": "Apply writes the complete document to prefix/config.yaml through the Consul KV API. Flattened dotted/slashed keys are canonicalized and any duplicate path or scalar/container prefix collision is rejected deterministically before materialization.", "properties": {"address": {"type": "string"}, "prefix": {"type": "string", "minLength": 1}, "token": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "max_bytes": {"type": "integer", "description": "Maximum response bytes; any non-positive value selects the 4 MiB source default."}}},
+        "redis": {"type": "object", "additionalProperties": false, "description": "Apply writes config.yaml in hash or prefix mode and increments version_key when configured. The document write and optional version increment are queued in one MULTI/EXEC transaction; transaction and EXEC errors are returned to Apply. Flattened dotted/slashed keys reject duplicate paths and scalar/container prefix collisions deterministically. Hash field names prefer HSCAN NOVALUES and fall back to HKEYS only when that subcommand is unsupported; values are read in bounded HSTRLEN/HGET batches. Prefix keys use bounded SCAN batches and length preflight.", "properties": {"addr": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string", "writeOnly": true, "x-liveforge-secret": true}, "db": {"type": "integer", "minimum": 0}, "prefix": {"type": "string"}, "hash": {"type": "string"}, "version_key": {"type": "string"}, "tls": {"type": "boolean"}, "max_bytes": {"type": "integer", "description": "Maximum Redis configuration document/materialization bytes; any non-positive value selects the 4 MiB source default."}}}
+      }
+    }
+  }
+}

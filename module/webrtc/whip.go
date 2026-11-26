@@ -1,0 +1,489 @@
+package webrtc
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/im-pingo/liveforge/core"
+	"github.com/im-pingo/liveforge/pkg/avframe"
+	pkgrtp "github.com/im-pingo/liveforge/pkg/rtp"
+	"github.com/pion/rtcp"
+	pionrtp "github.com/pion/rtp/v2"
+	"github.com/pion/webrtc/v4"
+)
+
+// handleWHIP handles POST /webrtc/whip/{path...} for WHIP publish.
+func (m *Module) handleWHIP(w http.ResponseWriter, r *http.Request) {
+	if !m.beginSetup() {
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer m.endSetup()
+
+	streamKey := r.PathValue("path")
+	if streamKey == "" {
+		http.Error(w, "missing stream key", http.StatusBadRequest)
+		return
+	}
+	publishCtx := eventContextFromRequest(r, streamKey)
+	if err := m.server.Authorize(r.Context(), authorizationRequestFromEvent(
+		core.AuthorizationPublish,
+		core.AuthorizationPreSession,
+		publishCtx,
+	)); err != nil {
+		rejectUnauthorized(w)
+		return
+	}
+
+	if !m.server.AcquireConn() {
+		http.Error(w, "max connections reached", http.StatusServiceUnavailable)
+		return
+	}
+	var releaseConnOnce sync.Once
+	releaseConn := func() {
+		releaseConnOnce.Do(m.server.ReleaseConn)
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if !strings.Contains(contentType, "application/sdp") {
+		releaseConn()
+		http.Error(w, "Content-Type must be application/sdp", http.StatusUnsupportedMediaType)
+		return
+	}
+
+	offerBytes, ok := readSDPOffer(w, r)
+	if !ok {
+		releaseConn()
+		return
+	}
+	if m.isClosing() {
+		releaseConn()
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  string(offerBytes),
+	}
+	simulcastPlan, err := parseWHIPSimulcastOffer(offer.SDP, m.server.Config().Stream.Simulcast)
+	if err != nil {
+		releaseConn()
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	pc, _, _, err := m.newPeerConnection(webrtc.Configuration{
+		ICEServers: m.iceServersFromConfig(),
+	}, 0)
+	if err != nil {
+		releaseConn()
+		http.Error(w, "failed to create peer connection", http.StatusInternalServerError)
+		return
+	}
+
+	sessionID := uuid.New().String()
+
+	stream, err := m.server.StreamHub().GetOrCreate(streamKey)
+	if err != nil {
+		pc.Close()
+		releaseConn()
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	pub := &WHIPPublisher{
+		id:   sessionID,
+		pc:   pc,
+		done: make(chan struct{}),
+	}
+	pub.info.Store(&avframe.MediaInfo{})
+
+	sess := newSession(sessionID, pc, streamKey, "whip", m)
+	var simulcast *whipSimulcastIngest
+	if simulcastPlan != nil {
+		simulcast = newWHIPSimulcastIngest(stream, pub, sess, simulcastPlan, publishCtx)
+	}
+
+	var (
+		videoDetected       bool
+		audioDetected       bool
+		publisherSet        bool
+		publisherInstanceID uint64
+		publisherGeneration uint64
+		pubMu               sync.Mutex
+	)
+	mediaClock := newWHIPMediaClock()
+	sess.setCleanup(func() {
+		if simulcast != nil {
+			simulcast.close()
+			releaseConn()
+			return
+		}
+		pubMu.Lock()
+		wasPublisher := publisherSet
+		instanceID := publisherInstanceID
+		generation := publisherGeneration
+		pubMu.Unlock()
+		if wasPublisher {
+			stream.RemovePublisherIf(pub)
+		}
+		lifecycleCtx := *publishCtx
+		lifecycleCtx.PublisherID = pub.ID()
+		lifecycleCtx.StreamInstanceID = instanceID
+		lifecycleCtx.PublisherGeneration = generation
+		sess.stopLifecycle(m.server.GetEventBus(), core.EventPublishStop, &lifecycleCtx)
+		releaseConn()
+	})
+	if !m.storeSession(sess) {
+		sess.Close()
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
+	setPublisherOnce := func() {
+		pubMu.Lock()
+		if publisherSet || (!videoDetected && !audioDetected) || sess.isClosed() {
+			pubMu.Unlock()
+			return
+		}
+		if err := stream.SetPublisher(pub); err != nil {
+			pubMu.Unlock()
+			slog.Error("WHIP set publisher failed", "module", "webrtc", "error", err)
+			return
+		}
+		startup := stream.StartupSnapshot()
+		publisherInstanceID = startup.StreamInstanceID
+		publisherGeneration = startup.Generation
+		lifecycleCtx := *publishCtx
+		lifecycleCtx.PublisherID = pub.ID()
+		lifecycleCtx.StreamInstanceID = publisherInstanceID
+		lifecycleCtx.PublisherGeneration = publisherGeneration
+		if !sess.startLifecycle(m.server.GetEventBus(), core.EventPublish, &lifecycleCtx) {
+			stream.RemovePublisherIf(pub)
+			pubMu.Unlock()
+			slog.Error("WHIP publish lifecycle admission failed", "module", "webrtc", "stream", streamKey)
+			sess.Close()
+			return
+		}
+		publisherSet = true
+		pubMu.Unlock()
+	}
+
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		if simulcast != nil {
+			simulcast.onTrack(track)
+			return
+		}
+		codec := track.Codec()
+		avCodec := mimeToCodecType(codec.MimeType)
+		if avCodec == 0 {
+			slog.Warn("WHIP unsupported codec", "module", "webrtc", "mime", codec.MimeType)
+			return
+		}
+
+		pubMu.Lock()
+		// Copy-on-write under pubMu (serializes concurrent OnTrack callbacks);
+		// readers load the snapshot atomically without the lock.
+		mi := *pub.info.Load()
+		if avCodec.IsVideo() {
+			mi.VideoCodec = avCodec
+			videoDetected = true
+		} else {
+			mi.AudioCodec = avCodec
+			mi.SampleRate = int(codec.ClockRate)
+			mi.Channels = int(codec.Channels)
+			audioDetected = true
+		}
+		pub.info.Store(&mi)
+		pubMu.Unlock()
+
+		setPublisherOnce()
+
+		dp, err := pkgrtp.NewDepacketizer(avCodec)
+		if err != nil {
+			slog.Error("WHIP depacketizer error", "module", "webrtc", "error", err)
+			return
+		}
+		if avCodec.IsVideo() {
+			go requestWHIPKeyframes(pc, uint32(track.SSRC()), sess.done, 2*time.Second)
+		}
+
+		readTrackLoop(track, dp, stream, pub, pub.done, avCodec, mediaClock)
+	})
+
+	// Cleanup on ICE disconnect.
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateClosed {
+			sess.Close()
+		}
+	})
+
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		sess.Close()
+		http.Error(w, fmt.Sprintf("set remote description: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		sess.Close()
+		http.Error(w, fmt.Sprintf("create answer: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if err := pc.SetLocalDescription(answer); err != nil {
+		sess.Close()
+		http.Error(w, fmt.Sprintf("set local description: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Wait for at least one ICE candidate or gathering complete,
+	// whichever comes first. Avoids blocking on slow STUN/TURN timeouts.
+	gatherDone := make(chan struct{})
+	var gatherOnce sync.Once
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			gatherOnce.Do(func() { close(gatherDone) })
+		}
+	})
+	pc.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
+		if state == webrtc.ICEGatheringStateComplete {
+			gatherOnce.Do(func() { close(gatherDone) })
+		}
+	})
+	select {
+	case <-gatherDone:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	w.Header().Set("Content-Type", "application/sdp")
+	w.Header().Set("Location", "/webrtc/session/"+sessionID)
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte(pc.LocalDescription().SDP))
+
+	slog.Info("WHIP session started", "module", "webrtc", "session", sessionID, "stream", streamKey)
+}
+
+func requestWHIPKeyframes(pc *webrtc.PeerConnection, mediaSSRC uint32, done <-chan struct{}, interval time.Duration) {
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	request := func() bool {
+		if err := pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: mediaSSRC}}); err != nil {
+			return false
+		}
+		return true
+	}
+	if !request() {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if !request() {
+				return
+			}
+		}
+	}
+}
+
+// readTrackLoop reads RTP packets from a WebRTC track, depacketizes them,
+// and writes AVFrames to the stream.
+//
+// Key invariant for H.264/H.265: parameter sets may be interleaved with IDR
+// NALs in the same Marker-delimited window. We handle them as separate
+// AVFrames so the ring buffer and GOP cache stay consistent:
+//   - SequenceHeader (SPS/PPS): emitted before associated media.
+//   - Keyframe/Interframe: bounded assembly, emitted only on an intact Marker.
+func readTrackLoop(track *webrtc.TrackRemote, dp pkgrtp.Depacketizer, stream *core.Stream, pub *WHIPPublisher, _ <-chan struct{}, codec avframe.CodecType, mediaClock *whipMediaClock) {
+	readTrackLoopWithOptions(track, dp, stream, pub, codec, mediaClock, nil)
+}
+
+type whipTrackReadOptions struct {
+	processing func() (bool, uint64)
+	write      func(*avframe.AVFrame, uint64) bool
+	active     func() bool
+	resume     func()
+}
+
+func readTrackLoopWithOptions(track *webrtc.TrackRemote, dp pkgrtp.Depacketizer, stream *core.Stream, pub *WHIPPublisher, codec avframe.CodecType, mediaClock *whipMediaClock, options *whipTrackReadOptions) {
+	var video *pkgrtp.AccessUnitAssembler
+	if codec.IsVideo() {
+		video = pkgrtp.NewAccessUnitAssembler(codec, dp)
+	}
+
+	clockRate := int64(90000)
+	if codec.IsAudio() {
+		clockRate = int64(track.Codec().ClockRate)
+	}
+	if mediaClock == nil {
+		mediaClock = newWHIPMediaClock()
+	}
+	var processingEpoch uint64
+	waitKeyframe, haveHeader := false, false
+	writeFrame := func(frame *avframe.AVFrame) bool {
+		if options != nil {
+			if codec.IsVideo() && waitKeyframe {
+				if frame.FrameType == avframe.FrameTypeSequenceHeader {
+					haveHeader = true
+				} else if frame.FrameType == avframe.FrameTypeKeyframe && haveHeader {
+					waitKeyframe = false
+				} else {
+					return options.active()
+				}
+			}
+			return options.write(frame, processingEpoch) || options.active()
+		}
+		if stream.WriteFrameForPublisher(pub, frame) {
+			return true
+		}
+		if stream.Publisher() == pub {
+			return true
+		}
+		_ = pub.Close()
+		return false
+	}
+
+	buf := make([]byte, 1500)
+	for {
+		n, _, readErr := track.Read(buf)
+		if readErr != nil {
+			return
+		}
+		packetArrival := time.Now()
+		if options != nil {
+			if !options.active() {
+				return
+			}
+			if options.processing != nil {
+				active, epoch := options.processing()
+				if !active {
+					continue
+				}
+				if processingEpoch != epoch {
+					processingEpoch = epoch
+					dp, _ = pkgrtp.NewDepacketizer(codec)
+					if codec.IsVideo() {
+						video = pkgrtp.NewAccessUnitAssembler(codec, dp)
+					}
+					waitKeyframe = true
+					haveHeader = codec != avframe.CodecH264 && codec != avframe.CodecH265
+					if options.resume != nil {
+						options.resume()
+					}
+				}
+			}
+		}
+
+		// Parse raw bytes into pion/rtp/v2 Packet (our depacketizers' expected type).
+		var pkt pionrtp.Packet
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			if video != nil {
+				video.Discard()
+			}
+			continue
+		}
+
+		var frames []*avframe.AVFrame
+		var err error
+		if video != nil {
+			frames, err = video.Push(&pkt)
+		} else {
+			frames, err = pkgrtp.DepacketizeFrames(dp, &pkt)
+		}
+		if err != nil {
+			continue
+		}
+
+		for _, frame := range frames {
+			if frame == nil {
+				continue
+			}
+			if !codec.IsVideo() {
+				dts := mediaClock.DTS(uint32(track.SSRC()), pkt.Timestamp, clockRate, packetArrival)
+				frameType := frame.FrameType
+				if frameType == 0 {
+					frameType = avframe.FrameTypeInterframe
+				}
+				if !writeFrame(avframe.NewAVFrame(
+					avframe.MediaTypeAudio,
+					codec,
+					frameType,
+					dts,
+					dts,
+					frame.Payload,
+				)) {
+					return
+				}
+				continue
+			}
+			dts := mediaClock.DTS(uint32(track.SSRC()), pkt.Timestamp, clockRate, packetArrival)
+			if !writeFrame(avframe.NewAVFrame(avframe.MediaTypeVideo, codec, frame.FrameType, dts, dts, frame.Payload)) {
+				return
+			}
+		}
+	}
+}
+
+// mimeToCodecType maps WebRTC MIME types to avframe CodecType.
+func mimeToCodecType(mime string) avframe.CodecType {
+	mime = strings.ToLower(mime)
+	switch {
+	case strings.Contains(mime, "h264"):
+		return avframe.CodecH264
+	case strings.Contains(mime, "h265") || strings.Contains(mime, "hevc"):
+		return avframe.CodecH265
+	case strings.Contains(mime, "vp8"):
+		return avframe.CodecVP8
+	case strings.Contains(mime, "vp9"):
+		return avframe.CodecVP9
+	case strings.Contains(mime, "av1"):
+		return avframe.CodecAV1
+	case strings.Contains(mime, "opus"):
+		return avframe.CodecOpus
+	case strings.Contains(mime, "pcmu"):
+		return avframe.CodecG711U
+	case strings.Contains(mime, "pcma"):
+		return avframe.CodecG711A
+	default:
+		return 0
+	}
+}
+
+// WHIPPublisher implements core.Publisher for WebRTC WHIP ingest.
+//
+// MediaInfo is stored behind an atomic pointer: OnTrack callbacks publish
+// updated snapshots while subscriber goroutines read concurrently.
+type WHIPPublisher struct {
+	id        string
+	info      atomic.Pointer[avframe.MediaInfo]
+	pc        *webrtc.PeerConnection
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+}
+
+var _ core.Publisher = (*WHIPPublisher)(nil)
+
+func (p *WHIPPublisher) ID() string                    { return p.id }
+func (p *WHIPPublisher) MediaInfo() *avframe.MediaInfo { return p.info.Load() }
+func (p *WHIPPublisher) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.done)
+		if p.pc != nil {
+			p.closeErr = p.pc.Close()
+		}
+	})
+	return p.closeErr
+}

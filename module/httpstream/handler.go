@@ -1,0 +1,490 @@
+package httpstream
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/im-pingo/liveforge/core"
+)
+
+var subscriberSequence atomic.Uint64
+
+func nextSubscriberID(protocol, streamKey string) string {
+	return fmt.Sprintf("%s-sub-%s-%d", protocol, streamKey, subscriberSequence.Add(1))
+}
+
+// parseStreamPath parses "/app/key.format" or "/key.format" from the URL path.
+// Returns app, key, format, and whether the parse succeeded.
+func parseStreamPath(urlPath string) (app, key, format string, ok bool) {
+	// Clean the path
+	urlPath = path.Clean(urlPath)
+	urlPath = strings.TrimPrefix(urlPath, "/")
+
+	// Split into segments: app/key.format
+	parts := strings.SplitN(urlPath, "/", 2)
+	var rest string
+	if len(parts) == 1 {
+		rest = parts[0]
+	} else {
+		app = parts[0]
+		rest = parts[1]
+	}
+
+	// Extract format extension
+	dotIdx := strings.LastIndex(rest, ".")
+	if dotIdx < 0 {
+		return "", "", "", false
+	}
+
+	key = rest[:dotIdx]
+	format = rest[dotIdx+1:]
+
+	if key == "" || format == "" {
+		return "", "", "", false
+	}
+
+	return app, key, format, true
+}
+
+// parseSegmentPath treats the final path component as the segment filename and
+// preserves every preceding component as the stream key.
+func parseSegmentPath(urlPath string) (app, key, segName, ext string, ok bool) {
+	urlPath = path.Clean(urlPath)
+	urlPath = strings.TrimPrefix(urlPath, "/")
+	parts := strings.Split(urlPath, "/")
+	if len(parts) < 2 {
+		return "", "", "", "", false
+	}
+
+	seg := parts[len(parts)-1]
+	dotIdx := strings.LastIndex(seg, ".")
+	if dotIdx < 0 {
+		return "", "", "", "", false
+	}
+
+	segName = seg[:dotIdx]
+	ext = seg[dotIdx+1:]
+
+	keyParts := parts[:len(parts)-1]
+	for _, part := range keyParts {
+		if part == "" {
+			return "", "", "", "", false
+		}
+	}
+	if segName == "" || ext == "" {
+		return "", "", "", "", false
+	}
+	if len(keyParts) == 1 {
+		if !isUnprefixedSegmentName(segName, ext) {
+			return "", "", "", "", false
+		}
+		return "", keyParts[0], segName, ext, true
+	}
+
+	app = keyParts[0]
+	key = strings.Join(keyParts[1:], "/")
+
+	return app, key, segName, ext, true
+}
+
+func isUnprefixedSegmentName(segName, ext string) bool {
+	switch ext {
+	case "ts":
+		parts := strings.Split(segName, ".")
+		for _, part := range parts {
+			if _, err := strconv.Atoi(part); err != nil {
+				return false
+			}
+		}
+		return len(parts) <= 2
+	case "m4s":
+		parts := strings.Split(segName, ".")
+		if len(parts) == 2 {
+			_, err1 := strconv.Atoi(parts[0])
+			_, err2 := strconv.Atoi(parts[1])
+			return err1 == nil && err2 == nil
+		}
+		if len(parts) != 1 || len(segName) < 1 {
+			return false
+		}
+		if _, err := strconv.Atoi(segName); err == nil {
+			return true
+		}
+		if len(segName) > 1 && (segName[0] == 'v' || segName[0] == 'a') {
+			_, err := strconv.Atoi(segName[1:])
+			return err == nil
+		}
+	case "mp4":
+		return segName == "init" || segName == "vinit" || segName == "audio_init"
+	}
+	return false
+}
+
+func escapeStreamKeyPath(streamKey string) string {
+	segments := strings.Split(streamKey, "/")
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+	return strings.Join(segments, "/")
+}
+
+func streamKeyFromPath(app, key string) string {
+	if app == "" {
+		return key
+	}
+	return app + "/" + key
+}
+
+func (m *Module) handleStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		m.setCORSHeaders(w)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !m.server.AcquireConn() {
+		http.Error(w, "max connections reached", http.StatusServiceUnavailable)
+		return
+	}
+	defer m.server.ReleaseConn()
+
+	slog.Debug("request", "module", "httpstream", "path", r.URL.Path)
+
+	// Try segment path first: /app/key/seg.ext
+	if app, key, segName, ext, ok := parseSegmentPath(r.URL.Path); ok {
+		switch ext {
+		case "ts":
+			streamKey := streamKeyFromPath(app, key)
+			if err := m.authorizeSubscribe(r, streamKey, "hls"); err != nil {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			// LL-HLS TS partial segment: segName = "MSN.partIdx"
+			if m.server.Config().HTTP.LLHLS.Enabled && m.server.Config().HTTP.LLHLS.Container == "ts" {
+				if strings.Contains(segName, ".") {
+					tsParts := strings.SplitN(segName, ".", 2)
+					msn, err1 := strconv.Atoi(tsParts[0])
+					partIdx, err2 := strconv.Atoi(tsParts[1])
+					if err1 != nil || err2 != nil {
+						http.Error(w, "invalid partial segment path", http.StatusBadRequest)
+						return
+					}
+					m.serveLLHLSPartialSegment(w, r, streamKey, msn, partIdx)
+					return
+				}
+				if msn, err := strconv.Atoi(segName); err == nil {
+					m.llhlsMu.Lock()
+					_, hasLLHLS := m.llhlsManagers[streamKey]
+					m.llhlsMu.Unlock()
+					if hasLLHLS {
+						m.serveLLHLSFullSegment(w, r, streamKey, msn)
+						return
+					}
+				}
+			}
+			// Regular HLS segment: /app/key/N.ts
+			seqNum, err := strconv.Atoi(segName)
+			if err != nil {
+				http.Error(w, "invalid segment number", http.StatusBadRequest)
+				return
+			}
+			m.serveHLSSegment(w, r, streamKey, seqNum)
+			return
+		case "m4s":
+			streamKey := streamKeyFromPath(app, key)
+			protocol := "dash"
+			m.llhlsMu.Lock()
+			_, hasLLHLS := m.llhlsManagers[streamKey]
+			m.llhlsMu.Unlock()
+			if hasLLHLS {
+				protocol = "hls"
+			}
+			if err := m.authorizeSubscribe(r, streamKey, protocol); err != nil {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			// LL-HLS partial segment: segName = "MSN.partIdx"
+			if strings.Contains(segName, ".") {
+				m4sParts := strings.SplitN(segName, ".", 2)
+				msn, err1 := strconv.Atoi(m4sParts[0])
+				partIdx, err2 := strconv.Atoi(m4sParts[1])
+				if err1 != nil || err2 != nil {
+					http.Error(w, "invalid partial segment path", http.StatusBadRequest)
+					return
+				}
+				m.serveLLHLSPartialSegment(w, r, streamKey, msn, partIdx)
+				return
+			}
+			// LL-HLS full segment: segName is numeric with no prefix
+			m.llhlsMu.Lock()
+			_, hasLLHLS = m.llhlsManagers[streamKey]
+			m.llhlsMu.Unlock()
+			if hasLLHLS {
+				if msn, err := strconv.Atoi(segName); err == nil {
+					m.serveLLHLSFullSegment(w, r, streamKey, msn)
+					return
+				}
+			}
+			// DASH media segments:
+			//   /app/key/v$Number$.m4s (video)
+			//   /app/key/a$Number$.m4s (audio)
+			// MPD uses 1-based numbering; internal SeqNum is 0-based
+			if len(segName) > 1 && segName[0] == 'v' {
+				num, err := strconv.Atoi(segName[1:])
+				if err != nil {
+					http.Error(w, "invalid segment number", http.StatusBadRequest)
+					return
+				}
+				m.serveDASHSegment(w, r, streamKey, num-1)
+				return
+			}
+			if len(segName) > 1 && segName[0] == 'a' {
+				num, err := strconv.Atoi(segName[1:])
+				if err != nil {
+					http.Error(w, "invalid segment number", http.StatusBadRequest)
+					return
+				}
+				m.serveDASHAudioSegment(w, r, streamKey, num-1)
+				return
+			}
+			http.Error(w, "invalid segment path", http.StatusBadRequest)
+			return
+		case "mp4":
+			// Init segments:
+			//   /app/key/init.mp4       — LL-HLS combined (video+audio) init, or DASH video-only fallback
+			//   /app/key/vinit.mp4      — DASH video-only init
+			//   /app/key/audio_init.mp4 — DASH audio-only init
+			streamKey := streamKeyFromPath(app, key)
+			if err := m.authorizeSubscribe(r, streamKey, "dash"); err != nil {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			if segName == "vinit" {
+				m.serveDASHInit(w, r, streamKey)
+				return
+			}
+			if segName == "init" {
+				// LL-HLS init segment takes precedence if manager exists
+				m.llhlsMu.Lock()
+				_, hasLLHLS := m.llhlsManagers[streamKey]
+				m.llhlsMu.Unlock()
+				if hasLLHLS && m.server.Config().HTTP.LLHLS.Container == "fmp4" {
+					m.serveLLHLSInit(w, r, streamKey)
+					return
+				}
+				m.serveDASHInit(w, r, streamKey)
+				return
+			}
+			if segName == "audio_init" {
+				m.serveDASHAudioInit(w, r, streamKey)
+				return
+			}
+		}
+	}
+
+	// Standard path: /app/key.format
+	app, key, format, ok := parseStreamPath(r.URL.Path)
+	if !ok {
+		http.Error(w, "invalid path, expected /app/key.{flv,ts,mp4,m3u8,mpd}", http.StatusBadRequest)
+		return
+	}
+
+	streamKey := streamKeyFromPath(app, key)
+
+	switch format {
+	case "m3u8":
+		if err := m.authorizeSubscribe(r, streamKey, "hls"); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		m.serveHLSPlaylist(w, r, streamKey)
+		return
+	case "mpd":
+		if err := m.authorizeSubscribe(r, streamKey, "dash"); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		m.serveDASHManifest(w, r, streamKey)
+		return
+	case "flv", "ts", "mp4":
+		// Continue to chunked streaming below
+	default:
+		http.Error(w, "unsupported format: "+format, http.StatusBadRequest)
+		return
+	}
+
+	// Run authorization before admitting the subscriber. Lifecycle delivery is
+	// emitted separately only after the stream has been found.
+	subscribeCtx := &core.EventContext{
+		StreamKey:  streamKey,
+		Protocol:   "http-" + format,
+		RemoteAddr: r.RemoteAddr,
+		Params:     queryToMap(r.URL.Query()),
+	}
+	if err := m.authorizeSubscribe(r, streamKey, subscribeCtx.Protocol); err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Look up stream
+	stream, found := m.server.StreamHub().Find(streamKey)
+	if !found || stream.State() != core.StreamStatePublishing {
+		http.Error(w, "stream not found or not publishing", http.StatusNotFound)
+		return
+	}
+	startup := stream.StartupSnapshot()
+	releaseSubscriber, err := stream.AddSubscriberForGeneration(subscribeCtx.Protocol, startup.Generation)
+	if err != nil {
+		http.Error(w, "publisher generation is no longer available", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseSubscriber()
+
+	lifecycleCtx := *subscribeCtx
+	lifecycleCtx.SubscriberID = nextSubscriberID(lifecycleCtx.Protocol, streamKey)
+	lifecycleCtx.StreamInstanceID = startup.StreamInstanceID
+	lifecycleCtx.PublisherGeneration = startup.Generation
+	lifecycleCtx.PublisherID = startup.PublisherID
+	if err := m.server.GetEventBus().EmitAsync(core.EventSubscribe, &lifecycleCtx); err != nil {
+		http.Error(w, "subscriber lifecycle capacity exceeded", http.StatusServiceUnavailable)
+		return
+	}
+	defer func() {
+		if err := m.server.GetEventBus().EmitAsync(core.EventSubscribeStop, &lifecycleCtx); err != nil {
+			slog.Error("subscriber terminal lifecycle admission failed", "module", "httpstream", "format", format, "stream", streamKey, "error", err)
+		}
+	}()
+
+	slog.Info("subscriber connected", "module", "httpstream", "format", format, "stream", streamKey, "remote", r.RemoteAddr)
+	m.serveStream(w, r, format, stream, startup.Generation)
+}
+
+func (m *Module) authorizeSubscribe(r *http.Request, streamKey, protocol string) error {
+	return m.server.Authorize(r.Context(), core.AuthorizationRequest{
+		Action:     core.AuthorizationSubscribe,
+		Stage:      core.AuthorizationPreSession,
+		StreamKey:  streamKey,
+		Protocol:   protocol,
+		RemoteAddr: r.RemoteAddr,
+		Params:     queryToMap(r.URL.Query()),
+	})
+}
+
+// queryToMap converts url.Values to a flat map (first value wins).
+func queryToMap(vals map[string][]string) map[string]string {
+	if len(vals) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(vals))
+	for k, v := range vals {
+		if len(v) > 0 {
+			m[k] = v[0]
+		}
+	}
+	return m
+}
+
+func (m *Module) serveStream(w http.ResponseWriter, r *http.Request, format string, stream *core.Stream, generation uint64) {
+	_, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Register muxer callbacks for this stream if not already done
+	m.ensureMuxerCallbacks(stream)
+
+	mm := stream.MuxerManager()
+	reader, inst := mm.GetOrCreateMuxerForGeneration(format, generation)
+	if reader == nil || inst == nil {
+		http.Error(w, "stream not publishing", http.StatusNotFound)
+		return
+	}
+	defer mm.ReleaseMuxer(format, inst)
+
+	// Set response headers
+	switch format {
+	case "flv":
+		w.Header().Set("Content-Type", "video/x-flv")
+	case "ts":
+		w.Header().Set("Content-Type", "video/mp2t")
+	case "mp4":
+		w.Header().Set("Content-Type", "video/mp4")
+	}
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Connection", "close")
+	m.setCORSHeaders(w)
+
+	// Wait for init data (FLV header, FMP4 init segment)
+	// TS format doesn't need init data.
+	if format == "flv" || format == "mp4" {
+		var initData []byte
+		if waitForCondition(r.Context(), time.Second, 10*time.Millisecond, func() bool {
+			initData = inst.InitData()
+			return initData != nil
+		}) {
+			if err := writeHTTPStreamChunk(w, initData, httpStreamWriteTimeout); err != nil {
+				return
+			}
+		} else {
+			if r.Context().Err() == nil {
+				http.Error(w, "initial stream data not ready", http.StatusServiceUnavailable)
+			}
+			return
+		}
+	}
+
+	serveHTTPStreamReader(w, r, format, stream.Key(), reader)
+}
+
+func serveHTTPStreamReader(w http.ResponseWriter, r *http.Request, format, streamKey string, reader *core.SharedBufferReader) {
+	// Close and join the reader watcher on every handler exit, including a
+	// response writer failure.
+	stopReaderWatch := watchReaderContext(r.Context(), reader)
+	defer stopReaderWatch()
+
+	for {
+		result := reader.ReadResult()
+		if result.Overwritten > 0 {
+			logContinuousOutputOverwrite("http", format, streamKey, result.Overwritten)
+			return
+		}
+		if !result.OK {
+			return
+		}
+		if err := writeHTTPStreamChunk(w, result.Data, httpStreamWriteTimeout); err != nil {
+			return
+		}
+	}
+}
+
+func logContinuousOutputOverwrite(transport, format, streamKey string, overwritten int64) {
+	slog.Warn("continuous stream continuity lost",
+		"module", "httpstream",
+		"transport", transport,
+		"format", format,
+		"stream", streamKey,
+		"input", "shared_output",
+		"overwritten", overwritten,
+	)
+}
+
+func (m *Module) setCORSHeaders(w http.ResponseWriter) {
+	if m.server.Config().HTTP.CORS {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	}
+}

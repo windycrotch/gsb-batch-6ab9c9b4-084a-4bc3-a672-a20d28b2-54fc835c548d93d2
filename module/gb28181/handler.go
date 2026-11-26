@@ -1,0 +1,545 @@
+package gb28181
+
+import (
+	"context"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/emiago/sipgo/sip"
+	"github.com/im-pingo/liveforge/core"
+	sipmod "github.com/im-pingo/liveforge/module/sip"
+	"github.com/im-pingo/liveforge/pkg/avframe"
+	"github.com/im-pingo/liveforge/pkg/portalloc"
+	"github.com/im-pingo/liveforge/pkg/sdp"
+)
+
+// handler processes SIP requests for the GB28181 module.
+type handler struct {
+	registry *DeviceRegistry
+	sessions *SessionManager
+	hub      *core.StreamHub
+	bus      *core.EventBus
+	ports    *portalloc.PortAllocator
+	prefix   string
+	auth     *sipmod.DigestAuth
+}
+
+const labStreamKeyHeader = "X-LiveForge-Lab-Stream-Key"
+
+func (h *handler) handleRegister(req *sip.Request, tx sip.ServerTransaction) {
+	from := req.From()
+	if from == nil {
+		resp := sip.NewResponseFromRequest(req, 400, "Bad Request", nil)
+		tx.Respond(resp)
+		return
+	}
+	if h.auth != nil {
+		switch h.auth.Verify(req, from.Address.User) {
+		case sipmod.DigestValid:
+		case sipmod.DigestStale:
+			_ = tx.Respond(h.auth.Challenge(req, true))
+			return
+		default:
+			if req.GetHeader("Authorization") == nil {
+				_ = tx.Respond(h.auth.Challenge(req))
+			} else {
+				_ = tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
+			}
+			return
+		}
+	}
+
+	deviceID := from.Address.User
+	remoteAddr := req.Source()
+	if contact := req.GetHeader("Contact"); contact != nil {
+		if address, ok := sipContactAddress(contact.Value()); ok {
+			remoteAddr = address
+		}
+	}
+	transport := "udp"
+	if via := req.Via(); via != nil {
+		transport = strings.ToLower(via.Transport)
+	}
+
+	// Check for Expires: 0 (unregister)
+	expires := req.GetHeader("Expires")
+	if expires != nil && expires.Value() == "0" {
+		h.registry.Unregister(deviceID)
+		resp := sip.NewResponseFromRequest(req, 200, "OK", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	h.registry.Register(deviceID, remoteAddr, transport)
+
+	resp := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	resp.AppendHeader(sip.NewHeader("Expires", "3600"))
+	tx.Respond(resp)
+}
+
+func sipContactAddress(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "<") {
+		end := strings.IndexByte(value, '>')
+		if end <= 1 {
+			return "", false
+		}
+		value = value[1:end]
+	} else if end := strings.IndexByte(value, ';'); end >= 0 {
+		value = value[:end]
+	}
+	var uri sip.Uri
+	if err := sip.ParseUri(value, &uri); err != nil || uri.Host == "" {
+		return "", false
+	}
+	port := uri.Port
+	if port <= 0 {
+		port = 5060
+	}
+	return net.JoinHostPort(strings.Trim(uri.Host, "[]"), fmt.Sprint(port)), true
+}
+
+func (h *handler) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
+	// SIP and GB28181 share one transport. Only claim video PS offers; audio
+	// INVITEs must remain available for the SIP gateway handler registered after
+	// this module.
+	if !isGB28181VideoInvite(req) {
+		return
+	}
+
+	from := req.From()
+	if from == nil {
+		resp := sip.NewResponseFromRequest(req, 400, "Bad Request", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	deviceID := from.Address.User
+	to := req.To()
+	if to == nil {
+		resp := sip.NewResponseFromRequest(req, 400, "Bad Request", nil)
+		tx.Respond(resp)
+		return
+	}
+	channelID := to.Address.User
+
+	// Parse SDP from INVITE body to get remote RTP info
+	body := req.Body()
+	if len(body) == 0 {
+		resp := sip.NewResponseFromRequest(req, 400, "Missing SDP", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	remotePort := parseSDPPort(string(body))
+	remoteIP := extractIP(req.Source())
+	streamKey := inboundStreamKey(req, h.prefix, channelID)
+	publishCtx := sipPublishContext(req, streamKey, "")
+	if err := h.bus.EmitSync(core.EventPublish, publishCtx); err != nil {
+		resp := sip.NewResponseFromRequest(req, 403, "Forbidden", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	// Reserve and bind both media sockets before exposing the RTP port in SDP.
+	pair, err := h.ports.AllocateBoundUDPPair("udp", nil)
+	if err != nil {
+		slog.Error("port allocation failed", "module", "gb28181", "error", err)
+		resp := sip.NewResponseFromRequest(req, 500, "Internal Server Error", nil)
+		tx.Respond(resp)
+		return
+	}
+	rtpPort := pair.RTPPort
+
+	// Create or get stream.
+	_, streamExisted := h.hub.Find(streamKey)
+	stream, err := h.hub.GetOrCreate(streamKey)
+	if err != nil {
+		closeBoundUDPPair(pair)
+		h.ports.Free(rtpPort, rtpPort+1)
+		resp := sip.NewResponseFromRequest(req, 500, "Internal Server Error", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	// Create publisher
+	var pub *Publisher
+	pub = NewPublisher(
+		newPublisherID("live", channelID),
+		func(frame *avframe.AVFrame) {
+			stream.WriteFrameForPublisher(pub, frame)
+		},
+	)
+
+	receiver, err := newBoundRTPReceiver(pair, pub)
+	if err != nil {
+		slog.Error("rtp receiver creation failed", "module", "gb28181", "error", err)
+		_ = pub.Close()
+		closeBoundUDPPair(pair)
+		h.ports.Free(rtpPort, rtpPort+1)
+		if !streamExisted {
+			h.hub.Remove(streamKey)
+		}
+		resp := sip.NewResponseFromRequest(req, 500, "Internal Server Error", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	session := &MediaSession{
+		ID:         getCallID(req),
+		DeviceID:   deviceID,
+		ChannelID:  channelID,
+		StreamKey:  streamKey,
+		Direction:  SessionDirectionInbound,
+		LocalPort:  rtpPort,
+		RemoteAddr: &net.UDPAddr{IP: net.ParseIP(remoteIP), Port: remotePort},
+		Transport:  "udp",
+		State:      SessionStateStreaming,
+		Publisher:  pub,
+		Receiver:   receiver,
+		Stream:     stream,
+	}
+
+	if err := stream.SetPublisher(pub); err != nil {
+		slog.Warn("set publisher failed", "module", "gb28181", "error", err)
+		session.Close()
+		h.ports.Free(rtpPort, rtpPort+1)
+		if !streamExisted {
+			h.hub.Remove(streamKey)
+		}
+		resp := sip.NewResponseFromRequest(req, 500, "Internal Server Error", nil)
+		tx.Respond(resp)
+		return
+	}
+	startup := stream.StartupSnapshot()
+	session.StreamInstanceID = startup.StreamInstanceID
+	session.PublisherGeneration = startup.Generation
+	h.sessions.Add(session)
+
+	// Build SDP answer
+	localIP := getLocalIP()
+	sdpAnswer := fmt.Sprintf(
+		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=LiveForge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=video %d RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\n",
+		localIP, localIP, rtpPort,
+	)
+
+	resp := sip.NewResponseFromRequest(req, 200, "OK", []byte(sdpAnswer))
+	resp.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	// Admission and the final response are one session-owned transition so
+	// teardown cannot overtake an accepted publish-start or expose 200 after
+	// the session has already been rejected.
+	publishCtx.PublisherID = pub.ID()
+	publishCtx.StreamInstanceID = startup.StreamInstanceID
+	publishCtx.PublisherGeneration = startup.Generation
+	publishCtx.Extra = map[string]any{
+		"gb28181_device_id":  deviceID,
+		"gb28181_channel_id": channelID,
+	}
+	var lifecycleErr, responseErr error
+	if !session.startPublishLifecycle(func() error {
+		lifecycleErr = h.bus.EmitAsync(core.EventPublish, publishCtx)
+		if lifecycleErr != nil {
+			return lifecycleErr
+		}
+		responseErr = tx.Respond(resp)
+		return nil
+	}) {
+		slog.Warn("publish lifecycle admission failed", "module", "gb28181", "session", session.ID, "error", lifecycleErr)
+		h.rollbackSession(session, !streamExisted)
+		status, reason := 500, "Internal Server Error"
+		if errors.Is(lifecycleErr, core.ErrAsyncBackpressure) {
+			status, reason = 503, "Service Unavailable"
+		}
+		_ = tx.Respond(sip.NewResponseFromRequest(req, status, reason, nil))
+		return
+	}
+	if responseErr != nil {
+		slog.Warn("failed to send INVITE final response", "module", "gb28181", "error", responseErr)
+		h.rollbackSession(session, !streamExisted)
+		return
+	}
+	h.runReceiver(session, receiver)
+
+	slog.Info("invite accepted", "module", "gb28181",
+		"device", deviceID, "channel", channelID,
+		"stream", streamKey, "local_port", rtpPort)
+}
+
+func closeBoundUDPPair(pair *portalloc.BoundUDPPair) {
+	if pair == nil {
+		return
+	}
+	if pair.RTPConn != nil {
+		_ = pair.RTPConn.Close()
+	}
+	if pair.RTCPConn != nil {
+		_ = pair.RTCPConn.Close()
+	}
+}
+
+func isGB28181VideoInvite(req *sip.Request) bool {
+	if req == nil || len(req.Body()) == 0 {
+		return false
+	}
+	offer, err := sdp.Parse(req.Body())
+	if err != nil {
+		return false
+	}
+	for _, media := range offer.Media {
+		if media == nil || !strings.EqualFold(media.Type, "video") || !strings.EqualFold(media.Proto, "RTP/AVP") {
+			continue
+		}
+		for _, payloadType := range media.Formats {
+			if payloadType != 96 {
+				continue
+			}
+			mapping := media.RTPMap(payloadType)
+			// Some older devices omit rtpmap for the GB28181 static lab-style
+			// offer. Keep accepting that established shape while rejecting an
+			// explicitly announced non-PS video codec.
+			if mapping == nil || (strings.EqualFold(mapping.EncodingName, "PS") && mapping.ClockRate == 90000) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func inboundStreamKey(req *sip.Request, prefix, channelID string) string {
+	defaultKey := fmt.Sprintf("%s/%s", prefix, channelID)
+	if req == nil || !isLoopbackSIPSource(req.Source()) {
+		return defaultKey
+	}
+	header := req.GetHeader(labStreamKeyHeader)
+	if header == nil || !validGBLabStreamKey(header.Value()) {
+		return defaultKey
+	}
+	return header.Value()
+}
+
+func isLoopbackSIPSource(source string) bool {
+	host := source
+	if parsedHost, _, err := net.SplitHostPort(source); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (h *handler) handleBye(req *sip.Request, tx sip.ServerTransaction) {
+	callID := getCallID(req)
+	session := h.sessions.Get(callID)
+	if session != nil {
+		snapshot := session.Snapshot()
+		h.closeSession(session, req.Source())
+
+		slog.Info("session closed by BYE", "module", "gb28181",
+			"session", callID, "stream", snapshot.StreamKey)
+	}
+
+	resp := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	tx.Respond(resp)
+}
+
+func (h *handler) closeSession(session *MediaSession, remoteAddr string) bool {
+	if session == nil {
+		return false
+	}
+	// A competing Lab cleanup must wait for signaling and registry removal
+	// before closing its peer. Keep this separate from the media-only Close
+	// path, which can run while SessionManager holds its own lock.
+	session.cleanupMu.Lock()
+	defer session.cleanupMu.Unlock()
+	snapshot, closed := session.closeSnapshot()
+	if !closed {
+		return false
+	}
+	if snapshot.LocalPort > 0 && h.ports != nil {
+		h.ports.Free(snapshot.LocalPort, snapshot.LocalPort+1)
+	}
+	if snapshot.Stream != nil && snapshot.Publisher != nil {
+		snapshot.Stream.RemovePublisherIf(snapshot.Publisher)
+	}
+	if snapshot.InviteTx != nil {
+		if remoteAddr == "" {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			if err := snapshot.InviteTx.SendBYE(ctx); err != nil {
+				slog.Debug("failed to send session BYE", "module", "gb28181", "session", snapshot.ID, "error", err)
+			}
+			cancel()
+		}
+		snapshot.InviteTx.Close()
+	}
+	if snapshot.ID != "" && h.sessions != nil {
+		h.sessions.RemoveIf(snapshot.ID, session)
+	}
+	if snapshot.Published {
+		if remoteAddr == "" && snapshot.RemoteAddr != nil {
+			remoteAddr = snapshot.RemoteAddr.String()
+		}
+		if err := h.bus.EmitAsync(core.EventPublishStop, &core.EventContext{
+			StreamKey:           snapshot.StreamKey,
+			StreamInstanceID:    snapshot.StreamInstanceID,
+			PublisherGeneration: snapshot.PublisherGeneration,
+			PublisherID:         snapshot.PublisherID,
+			Protocol:            "gb28181",
+			RemoteAddr:          remoteAddr,
+			Extra: map[string]any{
+				"gb28181_device_id":  snapshot.DeviceID,
+				"gb28181_channel_id": snapshot.ChannelID,
+				"gb28181_playback":   snapshot.Playback,
+			},
+		}); err != nil {
+			slog.Error("publisher terminal lifecycle admission failed", "module", "gb28181", "session", snapshot.ID, "error", err)
+		}
+	}
+	return true
+}
+
+func (h *handler) runReceiver(session *MediaSession, receiver *RTPReceiver) {
+	go func() {
+		receiver.Run()
+		if err := receiver.Err(); err != nil {
+			slog.Warn("media receiver terminated", "module", "gb28181", "session", session.Snapshot().ID, "error", err)
+			h.closeSession(session, "")
+		}
+	}()
+}
+
+func (h *handler) rollbackSession(session *MediaSession, removeStream bool) {
+	snapshot := session.Snapshot()
+	if !h.closeSession(session, "") {
+		return
+	}
+	if removeStream && snapshot.Stream != nil && snapshot.Stream.Publisher() == nil {
+		h.hub.Remove(snapshot.StreamKey)
+	}
+}
+
+func (h *handler) closeSessionsByDevice(deviceID string) {
+	for _, session := range h.sessions.All() {
+		if session.Snapshot().DeviceID == deviceID {
+			h.closeSession(session, "")
+		}
+	}
+}
+
+func (h *handler) closeSessionsByChannel(channelID string) int {
+	closed := 0
+	for _, session := range h.sessions.GetByChannel(channelID) {
+		if h.closeSession(session, "") {
+			closed++
+		}
+	}
+	return closed
+}
+
+func (h *handler) handleMessage(req *sip.Request, tx sip.ServerTransaction) {
+	body := req.Body()
+	if len(body) == 0 {
+		resp := sip.NewResponseFromRequest(req, 200, "OK", nil)
+		tx.Respond(resp)
+		return
+	}
+
+	cmdType := ParseMessageType(body)
+	switch cmdType {
+	case "Keepalive":
+		msg, err := ParseKeepalive(body)
+		if err == nil {
+			h.registry.Keepalive(msg.DeviceID)
+		}
+	case "Catalog":
+		resp, err := ParseCatalogResponse(body)
+		if err == nil {
+			h.handleCatalogResponse(resp)
+		}
+	case "Alarm":
+		alarm, err := ParseAlarmNotify(body)
+		if err == nil {
+			slog.Info("alarm received", "module", "gb28181",
+				"device", alarm.DeviceID, "method", alarm.AlarmMethod,
+				"type", alarm.AlarmType)
+		}
+	default:
+		slog.Debug("unhandled message type", "module", "gb28181", "type", cmdType)
+	}
+
+	resp := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	tx.Respond(resp)
+}
+
+func (h *handler) handleCatalogResponse(resp *CatalogResponse) {
+	channels := make(map[string]*Channel)
+	for _, item := range resp.DeviceList.Items {
+		channels[item.DeviceID] = &Channel{
+			ChannelID:    item.DeviceID,
+			Name:         item.Name,
+			Manufacturer: item.Manufacturer,
+			Status:       item.Status,
+			PTZType:      item.PTZType,
+			Latitude:     item.Latitude,
+			Longitude:    item.Longitude,
+		}
+	}
+	h.registry.UpdateChannels(resp.DeviceID, channels)
+}
+
+// --- Helpers ---
+
+func getCallID(req *sip.Request) string {
+	if h := req.CallID(); h != nil {
+		return h.Value()
+	}
+	return ""
+}
+
+func extractIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
+}
+
+func parseSDPPort(sdp string) int {
+	// Simple parser: find "m=video <port>" or "m=audio <port>"
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "m=") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				port := 0
+				fmt.Sscanf(parts[1], "%d", &port)
+				return port
+			}
+		}
+	}
+	return 0
+}
+
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "0.0.0.0"
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return "0.0.0.0"
+}
+
+// XMLResponse is a minimal wrapper for checking XML root element name.
+type XMLResponse struct {
+	XMLName xml.Name
+}

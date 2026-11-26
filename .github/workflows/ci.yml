@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  agent-docs:
+    name: Agent Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check Agent documentation
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHECK_AGENT_DOCS_DIFF=1 BASE_REF="origin/${{ github.base_ref }}" tools/check-agent-docs.sh
+          else
+            CHECK_AGENT_DOCS_DIFF=1 BASE_REF=HEAD^ tools/check-agent-docs.sh
+          fi
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install FFmpeg dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libavcodec-dev libswresample-dev libavutil-dev
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+          # The GitHub PR diff API rejects reviews larger than 20,000 lines.
+          # Keep the new-code gate independent of that API limit.
+          args: >-
+            --new-from-rev=${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD^' }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      # chromedp otherwise prefers the runner's Chromium without H.264.
+      CHROME_BIN: /usr/bin/google-chrome
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install FFmpeg dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libavcodec-dev libswresample-dev libavutil-dev
+
+      - name: Build
+        run: CGO_ENABLED=1 go build -tags audiocodec ./cmd/liveforge
+
+      - name: Verify browser executable
+        run: |
+          printf 'Browser executable: %s\n' "$CHROME_BIN"
+          "$CHROME_BIN" --version
+
+      - name: Test
+        env:
+          LIVEFORGE_REQUIRE_BROWSER: "1"
+          LIVEFORGE_PROTOCOL_MATRIX_SOAK: "15s"
+          LF_BINARY: ${{ github.workspace }}/liveforge
+        run: CGO_ENABLED=1 go test -tags audiocodec -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec
+        # High-severity/high-confidence gate. G104 (unhandled errors) and
+        # G304 (file path from variable) are excluded to match .golangci.yml;
+        # tools/ is local test tooling excluded from lint as well.
+        run: gosec -exclude-generated -severity high -confidence high -exclude G104,G304 -exclude-dir tools ./...
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [lint, test, security]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract version
+        id: version
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          build-args: VERSION=${{ steps.version.outputs.sha_short }}
+          tags: |
+            liveforge:ci-${{ steps.version.outputs.sha_short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
