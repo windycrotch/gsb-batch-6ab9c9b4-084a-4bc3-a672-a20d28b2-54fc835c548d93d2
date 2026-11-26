@@ -1,0 +1,12 @@
+.idea/
+.virtualgo
+*.ppm
+*.png
+GoTracer
+dist/
+main
+vendor
+*.prof
+profile*.pdf
+.DS_Store
+dolly/dolly
