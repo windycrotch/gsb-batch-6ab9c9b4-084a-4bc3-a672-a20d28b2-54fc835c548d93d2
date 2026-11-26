@@ -27,6 +27,7 @@ type handlers struct {
 	closeHandler             closeFunc
 	connectHandler           sessionFunc
 	disconnectHandler        sessionFunc
+	disconnectHooks          []sessionFunc
 	pongHandler              sessionFunc
 	onRoomLeave              roomSessionFunc
 	onRoomJoin               roomSessionFunc
@@ -40,6 +41,7 @@ type Adler struct {
 	serializer Serializer
 	core       *core
 	handlers   handlers
+	hooksMu    sync.RWMutex
 	rooms      map[string]*Room
 	roomsMu    sync.RWMutex
 	upgrader   *gws.Upgrader
@@ -127,8 +129,18 @@ func (a *Adler) HandleRequest(w http.ResponseWriter, r *http.Request) error {
 	a.core.unregister(session)
 
 	session.close()
-	if a.handlers.disconnectHandler != nil {
-		a.handlers.disconnectHandler(session)
+
+	a.hooksMu.RLock()
+	hooks := a.handlers.disconnectHooks
+	handler := a.handlers.disconnectHandler
+	a.hooksMu.RUnlock()
+
+	for _, hook := range hooks {
+		hook(session)
+	}
+
+	if handler != nil {
+		handler(session)
 	}
 	return nil
 }
@@ -328,8 +340,28 @@ func (a *Adler) HandleClose(fn func(*Session, int, string)) {
 }
 
 // HandleDisconnect registers a callback triggered when a websocket session ends.
+// It replaces any previously registered disconnect callback.
 func (a *Adler) HandleDisconnect(fn func(*Session)) {
+	a.hooksMu.Lock()
+	defer a.hooksMu.Unlock()
 	a.handlers.disconnectHandler = fn
+}
+
+// AddDisconnectHook registers an additional callback triggered when a websocket
+// session ends, without replacing handlers registered through HandleDisconnect.
+//
+// Hooks run after the session is unregistered and closed, in registration order,
+// and before the HandleDisconnect callback. Use it for infrastructure cleanup
+// (for example, removing a session from matchmaking queues) that must not be
+// lost when an application also registers its own disconnect handler.
+func (a *Adler) AddDisconnectHook(fn func(*Session)) {
+	if fn == nil {
+		return
+	}
+
+	a.hooksMu.Lock()
+	defer a.hooksMu.Unlock()
+	a.handlers.disconnectHooks = append(a.handlers.disconnectHooks, fn)
 }
 
 // HandlePong registers a callback for pong events.

@@ -133,6 +133,14 @@ func (s *Session) isClosed() bool {
 	return s.closed
 }
 
+// IsClosed reports whether the session has been closed.
+//
+// The flag is set once the connection is finished, before the disconnect
+// handlers run, so cleanup hooks can use it to reject closed sessions.
+func (s *Session) IsClosed() bool {
+	return s.isClosed()
+}
+
 // close marks the session as closed and releases connection resources once.
 func (s *Session) close() {
 	s.mu.Lock()

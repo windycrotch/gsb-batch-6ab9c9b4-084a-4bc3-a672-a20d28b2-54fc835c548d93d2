@@ -63,6 +63,14 @@ func NewMatchmaker(a *adler.Adler, opts ...MatchmakingOption) *Matchmaker {
 		roomSize:           cfg.RoomSize,
 		minRoomSize:        cfg.MinRoomSize,
 		partialRoomTimeout: cfg.PartialRoomTimeout,
+		pendingRemovals:    map[*adler.Session]struct{}{},
+		retrySignal:        make(chan struct{}, 1),
+	}
+
+	if a != nil {
+		// Disconnect cleanup must survive an application also calling
+		// HandleDisconnect, so it is registered as an additive hook.
+		a.AddDisconnectHook(m.handleDisconnect)
 	}
 
 	go m.run()

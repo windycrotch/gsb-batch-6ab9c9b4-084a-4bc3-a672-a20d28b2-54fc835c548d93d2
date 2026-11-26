@@ -96,6 +96,8 @@ Handlers are set on the `Adler` instance and are called during the session lifec
 - `HandleSentMessage` and `HandleSentMessageBinary` run after server writes succeed.
 - `HandleError` receives runtime errors from the session loop.
 - `OnRoomJoin` and `OnRoomLeave` receive room membership events.
+- `HandleDisconnect` runs after a session is unregistered, closed and removed from its room.
+- `AddDisconnectHook` registers an additional disconnect callback that `HandleDisconnect` does not replace (see below).
 
 Example:
 
@@ -108,6 +110,29 @@ a.HandleClose(func(s *adler.Session, code int, reason string) {
     log.Printf("client closed: code=%d reason=%q", code, reason)
 })
 ```
+
+#### Additive disconnect hooks
+
+`HandleDisconnect` stores a single callback, so calling it twice replaces the
+previous one. Library modules that need reliable cleanup on disconnect use
+`AddDisconnectHook` instead: hooks accumulate, run in registration order, and run
+before the `HandleDisconnect` callback. That lets application code own
+`HandleDisconnect` without silently disabling module cleanup (for example, the
+matchmaker removing a disconnected session from its queues).
+
+```go
+a.AddDisconnectHook(func(s *adler.Session) {
+    // always runs, even when the application later calls HandleDisconnect
+})
+
+a.HandleDisconnect(func(s *adler.Session) {
+    // application-level disconnect handling
+})
+```
+
+`Session.IsClosed()` reports whether the session has already been marked closed.
+The flag is set before disconnect callbacks run, so cleanup code can use it to
+reject work for a connection that is already gone.
 
 ### 3. Serve the websocket endpoint
 
@@ -302,6 +327,22 @@ not that the worker has completed it. A busy error means the command was not acc
 logging it reports the failure but does not complete cleanup. Applications requiring
 guaranteed removal must arrange a later retry. Do not wait for buffer space from a
 callback running on the matchmaker worker, since that worker drains the same buffer.
+
+`NewMatchmaker` also registers an additive disconnect hook on the Adler instance
+(see `AddDisconnectHook`). When a session disconnects it is removed from the main
+or waiting queue automatically, whether or not the application calls
+`RemoveFromQueue`. If the shared command buffer is full at that moment, the
+matchmaker keeps the removal in an internal retry set and applies it on the worker
+goroutine, so a rejected command cannot leave a closed session in a queue. Repeated
+cleanup and a cancel that races with the disconnect both end with the session
+removed and its status set to left.
+
+Queued sessions that have already disconnected are never promoted to the main
+queue, never occupy a main-queue slot, and never join a room. Rooms are only built
+from sessions that are still connected and still tracked by the queue, and the
+`players` count in `match_found` always matches the number of sessions added to the
+room. Removing a session preserves the relative order of the remaining players in
+both queues.
 
 `WithCommandBuffer(size)` configures the capacity of pending add/remove commands
 (default: 1024). This is separate from `WithQueueLength(size)`, which limits players

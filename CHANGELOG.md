@@ -7,6 +7,23 @@ All notable changes for this project are documented here.
 - [x] Replace gobwas/ws with gws for ~2x throughput improvement and lower memory footprint
 - [ ] Implement matchmaking based on ELO ranking, including configurable ranking buckets and match quality rules.
 
+## 1.7.0
+
+### Added
+
+- `Session.IsClosed()` to report whether a session has been closed. The flag is set before disconnect callbacks run.
+- `Adler.AddDisconnectHook(func(*Session))` to register additive disconnect callbacks that `HandleDisconnect` does not replace, so module cleanup survives application-level disconnect handlers.
+- Regression tests for matchmaker queue lifecycle: disconnect cleanup from both queues, promotion of disconnected waiters, room creation with disconnected sessions, cancel/disconnect races, saturated command buffers, duplicate and stale index entries, and additive disconnect hooks.
+
+### Fixed
+
+- Remove a disconnected session from the main or waiting queue in the matchmaker, keeping the relative order of the remaining players. Cleanup runs idempotently and also runs when the application registers its own `HandleDisconnect` callback.
+- Never promote a disconnected waiting session into the main queue, and never let it consume a main-queue slot; the freed slot goes to the next live waiter.
+- Build rooms only from sessions that are still connected and still tracked by the queue. If too few live sessions survive, the room is rolled back and the survivors are requeued in their original order. The `players` count in `match_found` now always matches the actual room size.
+- Keep a failed removal when the shared command buffer is full: the matchmaker records it for retry on the worker goroutine instead of dropping it, so a closed session cannot remain queued.
+- Do not enqueue a session that has already disconnected, and prune stale list/index entries before promotion and room creation.
+- Only set the queue status to `left` when a session is tracked by neither queue, so a session cannot be both removed and marked as queued.
+
 ## 1.6.0
 
 ### Added
