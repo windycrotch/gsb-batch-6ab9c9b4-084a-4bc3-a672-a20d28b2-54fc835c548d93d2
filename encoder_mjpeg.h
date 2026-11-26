@@ -16,4 +16,5 @@ void encoder_mjpeg_encode(encoder_mjpeg_t *enc, uint8_t *buffer_mapped,
                           int buffer_fd, uint64_t dts, uint64_t ntp);
 void encoder_mjpeg_reload_params(encoder_mjpeg_t *enc,
                                  const parameters_t *params);
+void encoder_mjpeg_destroy(encoder_mjpeg_t *enc);
 #endif

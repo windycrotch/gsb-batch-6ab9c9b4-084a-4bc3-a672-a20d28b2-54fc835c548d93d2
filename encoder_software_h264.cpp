@@ -29,8 +29,11 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_mutex_t queue_mutex;
     pthread_cond_t queue_cond;
+    pthread_cond_t done_cond;
     pthread_t thread;
+    bool stopping;
     bool data_queued;
+    bool busy;
     uint8_t *data_buffer;
     uint64_t data_dts;
     uint64_t data_ntp;
@@ -83,20 +86,34 @@ static void *thread_main(void *userdata) {
     while (true) {
         pthread_mutex_lock(&encp->queue_mutex);
 
-        while (!encp->data_queued) {
+        while (!encp->data_queued && !encp->stopping) {
             pthread_cond_wait(&encp->queue_cond, &encp->queue_mutex);
+        }
+
+        if (!encp->data_queued) {
+            // Stopping with no queued frame left: finish the thread.
+            pthread_mutex_unlock(&encp->queue_mutex);
+            break;
         }
 
         uint8_t *buffer = encp->data_buffer;
         uint64_t dts = encp->data_dts;
         uint64_t ntp = encp->data_ntp;
         encp->data_queued = false;
+        encp->busy = true;
 
         pthread_cond_signal(&encp->queue_cond);
 
         pthread_mutex_unlock(&encp->queue_mutex);
 
         encode(encp, buffer, dts, ntp);
+
+        pthread_mutex_lock(&encp->queue_mutex);
+        encp->busy = false;
+        // Wake a reload waiting for the in-flight old-generation frame to
+        // finish, and a destroy joining through the same condition.
+        pthread_cond_broadcast(&encp->done_cond);
+        pthread_mutex_unlock(&encp->queue_mutex);
     }
 
     return NULL;
@@ -215,6 +232,7 @@ bool encoder_software_h264_create(bool is_secondary, const parameters_t *params,
 
     pthread_mutex_init(&encp->queue_mutex, NULL);
     pthread_cond_init(&encp->queue_cond, NULL);
+    pthread_cond_init(&encp->done_cond, NULL);
     pthread_create(&encp->thread, NULL, thread_main, encp);
 
     return true;
@@ -231,8 +249,13 @@ void encoder_software_h264_encode(encoder_software_h264_t *enc,
 
     pthread_mutex_lock(&encp->queue_mutex);
 
-    while (encp->data_queued) {
+    while (encp->data_queued && !encp->stopping) {
         pthread_cond_wait(&encp->queue_cond, &encp->queue_mutex);
+    }
+
+    if (encp->stopping) {
+        pthread_mutex_unlock(&encp->queue_mutex);
+        return;
     }
 
     encp->data_queued = true;
@@ -248,6 +271,15 @@ void encoder_software_h264_encode(encoder_software_h264_t *enc,
 void encoder_software_h264_reload_params(encoder_software_h264_t *enc,
                                          const parameters_t *params) {
     encoder_software_h264_priv_t *encp = (encoder_software_h264_priv_t *)enc;
+
+    // Wait for an already queued/encoding frame to finish with the old
+    // parameters before swapping settings. Together with the generation lock
+    // in main this prevents one frame from mixing two parameter generations.
+    pthread_mutex_lock(&encp->queue_mutex);
+    while (encp->data_queued || encp->busy) {
+        pthread_cond_wait(&encp->done_cond, &encp->queue_mutex);
+    }
+    pthread_mutex_unlock(&encp->queue_mutex);
 
     pthread_mutex_lock(&encp->mutex);
 
@@ -291,4 +323,35 @@ void encoder_software_h264_reload_params(encoder_software_h264_t *enc,
     encp->params = params;
 
     pthread_mutex_unlock(&encp->mutex);
+}
+
+void encoder_software_h264_destroy(encoder_software_h264_t *enc) {
+    if (enc == NULL) {
+        return;
+    }
+
+    encoder_software_h264_priv_t *encp = (encoder_software_h264_priv_t *)enc;
+
+    // Ask the queue thread to stop. A queued job is still drained by the
+    // thread before it exits, so join below waits for in-flight encoding.
+    pthread_mutex_lock(&encp->queue_mutex);
+    encp->stopping = true;
+    pthread_cond_broadcast(&encp->queue_cond);
+    pthread_cond_broadcast(&encp->done_cond);
+    pthread_mutex_unlock(&encp->queue_mutex);
+
+    pthread_join(encp->thread, NULL);
+
+    if (encp->encoder != NULL) {
+        encp->encoder->Uninitialize();
+        WelsDestroySVCEncoder(encp->encoder);
+        encp->encoder = NULL;
+    }
+
+    pthread_cond_destroy(&encp->done_cond);
+    pthread_cond_destroy(&encp->queue_cond);
+    pthread_mutex_destroy(&encp->queue_mutex);
+    pthread_mutex_destroy(&encp->mutex);
+
+    free(encp);
 }

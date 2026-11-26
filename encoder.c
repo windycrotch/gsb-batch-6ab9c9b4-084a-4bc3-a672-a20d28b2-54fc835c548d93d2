@@ -92,6 +92,7 @@ bool encoder_create(bool is_secondary, const parameters_t *params,
         encp->implementation = software_h264;
         encp->encode = encoder_software_h264_encode;
         encp->reload_params = encoder_software_h264_reload_params;
+        encp->destroy = encoder_software_h264_destroy;
 
     } else {
         fprintf(stderr, "using MJPEG encoder\n");
@@ -107,12 +108,14 @@ bool encoder_create(bool is_secondary, const parameters_t *params,
         encp->implementation = mjpeg;
         encp->encode = encoder_mjpeg_encode;
         encp->reload_params = encoder_mjpeg_reload_params;
+        encp->destroy = encoder_mjpeg_destroy;
     }
 
     return true;
 
 failed:
     free(*enc);
+    *enc = NULL;
     return false;
 }
 

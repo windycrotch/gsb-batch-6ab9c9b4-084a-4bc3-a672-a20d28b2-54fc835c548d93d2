@@ -23,6 +23,7 @@ void encoder_software_h264_encode(encoder_software_h264_t *enc,
                                   uint64_t dts, uint64_t ntp);
 void encoder_software_h264_reload_params(encoder_software_h264_t *enc,
                                          const parameters_t *params);
+void encoder_software_h264_destroy(encoder_software_h264_t *enc);
 
 #ifdef __cplusplus
 }

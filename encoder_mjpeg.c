@@ -22,8 +22,11 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     pthread_t thread;
+    bool stopping;
     bool data_queued;
+    bool is_secondary;
     uint8_t *data_buffer;
+    int data_quality;
     uint64_t data_dts;
     uint64_t data_ntp;
     encoder_mjpeg_output_cb output_cb;
@@ -82,27 +85,37 @@ static void *thread_main(void *userdata) {
     while (true) {
         pthread_mutex_lock(&encp->mutex);
 
-        while (!encp->data_queued) {
+        while (!encp->data_queued && !encp->stopping) {
             pthread_cond_wait(&encp->cond, &encp->mutex);
         }
 
+        if (!encp->data_queued) {
+            // Stopping with no queued frame left: finish the thread.
+            pthread_mutex_unlock(&encp->mutex);
+            break;
+        }
+
         uint8_t *buffer = encp->data_buffer;
+        int quality = encp->data_quality;
         uint64_t dts = encp->data_dts;
         uint64_t ntp = encp->data_ntp;
         encp->data_queued = false;
 
+        // Unblock a possible producer; the copied job values keep this frame
+        // on its own parameter generation even if reload runs meanwhile.
         pthread_cond_signal(&encp->cond);
 
         pthread_mutex_unlock(&encp->mutex);
 
-        uint8_t *out_buf;
+        uint8_t *out_buf = NULL;
         unsigned long out_size = 0;
-        save_as_jpeg(encp->width, encp->height, encp->quality, encp->stride,
-                     buffer, &out_buf, &out_size);
+        save_as_jpeg(encp->width, encp->height, quality, encp->stride, buffer,
+                     &out_buf, &out_size);
 
-        encp->output_cb(out_buf, out_size, dts, ntp);
-
-        free(out_buf);
+        if (out_buf != NULL) {
+            encp->output_cb(out_buf, out_size, dts, ntp);
+            free(out_buf);
+        }
     }
 
     return NULL;
@@ -120,10 +133,11 @@ bool encoder_mjpeg_create(bool is_secondary, const parameters_t *params,
     encp->quality = (!is_secondary) ? params->mjpeg_quality
                                     : params->secondary_mjpeg_quality;
     encp->stride = stride;
+    encp->output_cb = output_cb;
+    encp->is_secondary = is_secondary;
     pthread_mutex_init(&encp->mutex, NULL);
     pthread_cond_init(&encp->cond, NULL);
     pthread_create(&encp->thread, NULL, thread_main, encp);
-    encp->output_cb = output_cb;
 
     return true;
 }
@@ -134,12 +148,18 @@ void encoder_mjpeg_encode(encoder_mjpeg_t *enc, uint8_t *buffer_mapped,
 
     pthread_mutex_lock(&encp->mutex);
 
-    while (encp->data_queued) {
+    while (encp->data_queued && !encp->stopping) {
         pthread_cond_wait(&encp->cond, &encp->mutex);
+    }
+
+    if (encp->stopping) {
+        pthread_mutex_unlock(&encp->mutex);
+        return;
     }
 
     encp->data_queued = true;
     encp->data_buffer = buffer_mapped;
+    encp->data_quality = encp->quality;
     encp->data_dts = dts;
     encp->data_ntp = ntp;
 
@@ -149,4 +169,32 @@ void encoder_mjpeg_encode(encoder_mjpeg_t *enc, uint8_t *buffer_mapped,
 }
 
 void encoder_mjpeg_reload_params(encoder_mjpeg_t *enc,
-                                 const parameters_t *params) {}
+                                 const parameters_t *params) {
+    encoder_mjpeg_priv_t *encp = (encoder_mjpeg_priv_t *)enc;
+
+    pthread_mutex_lock(&encp->mutex);
+    encp->quality = (!encp->is_secondary) ? params->mjpeg_quality
+                                          : params->secondary_mjpeg_quality;
+    pthread_mutex_unlock(&encp->mutex);
+}
+
+void encoder_mjpeg_destroy(encoder_mjpeg_t *enc) {
+    if (enc == NULL) {
+        return;
+    }
+
+    encoder_mjpeg_priv_t *encp = (encoder_mjpeg_priv_t *)enc;
+
+    pthread_mutex_lock(&encp->mutex);
+    encp->stopping = true;
+    pthread_cond_broadcast(&encp->cond);
+    pthread_mutex_unlock(&encp->mutex);
+
+    // Joining lets a queued in-flight frame finish before the structure goes
+    // away; its output callback is silenced at the pipe boundary by main.
+    pthread_join(encp->thread, NULL);
+
+    pthread_cond_destroy(&encp->cond);
+    pthread_mutex_destroy(&encp->mutex);
+    free(encp);
+}

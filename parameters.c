@@ -168,11 +168,19 @@ bool parameters_unserialize(const uint8_t *buf, size_t buf_size,
 failed:
     free(copy);
     parameters_destroy(*params);
+    *params = NULL;
 
     return false;
 }
 
 void parameters_destroy(parameters_t *params) {
+    if (params == NULL) {
+        return;
+    }
+
+    if (params->log_level != NULL) {
+        free(params->log_level);
+    }
     if (params->exposure != NULL) {
         free(params->exposure);
     }
@@ -211,6 +219,12 @@ void parameters_destroy(parameters_t *params) {
     }
     if (params->codec != NULL) {
         free(params->codec);
+    }
+    if (params->h264_profile != NULL) {
+        free(params->h264_profile);
+    }
+    if (params->h264_level != NULL) {
+        free(params->h264_level);
     }
     if (params->secondary_codec != NULL) {
         free(params->secondary_codec);

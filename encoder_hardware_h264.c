@@ -30,6 +30,8 @@ const char *encoder_hardware_h264_get_error() { return errbuf; }
 typedef struct {
     int fd;
     void **capture_buffers;
+    size_t *capture_buffer_sizes;
+    int capture_buffer_count;
     uint64_t *ntp_timestamps;
     int frame_size;
     int buffer_count;
@@ -252,7 +254,9 @@ bool encoder_hardware_h264_create(bool is_secondary, const parameters_t *params,
         goto failed;
     }
 
-    encp->capture_buffers = malloc(sizeof(void *) * reqbufs.count);
+    encp->capture_buffers = calloc(reqbufs.count, sizeof(void *));
+    encp->capture_buffer_sizes = calloc(reqbufs.count, sizeof(size_t));
+    encp->capture_buffer_count = (int)reqbufs.count;
     encp->ntp_timestamps = malloc(sizeof(uint64_t) * reqbufs.count);
 
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
@@ -270,10 +274,12 @@ bool encoder_hardware_h264_create(bool is_secondary, const parameters_t *params,
             goto failed;
         }
 
+        encp->capture_buffer_sizes[i] = buffer.m.planes[0].length;
         encp->capture_buffers[i] =
             mmap(0, buffer.m.planes[0].length, PROT_READ | PROT_WRITE,
                  MAP_SHARED, encp->fd, buffer.m.planes[0].m.mem_offset);
         if (encp->capture_buffers[i] == MAP_FAILED) {
+            encp->capture_buffers[i] = NULL;
             set_error("mmap() failed");
             goto failed;
         }
@@ -312,7 +318,21 @@ bool encoder_hardware_h264_create(bool is_secondary, const parameters_t *params,
 
 failed:
     if (encp->capture_buffers != NULL) {
+        for (int i = 0; i < encp->capture_buffer_count; i++) {
+            if (encp->capture_buffers[i] != NULL) {
+                munmap(encp->capture_buffers[i],
+                       encp->capture_buffer_sizes != NULL
+                           ? encp->capture_buffer_sizes[i]
+                           : 0);
+            }
+        }
         free(encp->capture_buffers);
+    }
+    if (encp->capture_buffer_sizes != NULL) {
+        free(encp->capture_buffer_sizes);
+    }
+    if (encp->ntp_timestamps != NULL) {
+        free(encp->ntp_timestamps);
     }
     if (encp->fd >= 0) {
         close(encp->fd);
@@ -386,9 +406,19 @@ void encoder_hardware_h264_destroy(encoder_hardware_h264_t *enc) {
     reqbufs.memory = V4L2_MEMORY_MMAP;
     ioctl(encp->fd, VIDIOC_REQBUFS, &reqbufs);
 
+    for (int i = 0; i < encp->capture_buffer_count; i++) {
+        if (encp->capture_buffers != NULL && encp->capture_buffers[i] != NULL &&
+            encp->capture_buffer_sizes != NULL) {
+            munmap(encp->capture_buffers[i], encp->capture_buffer_sizes[i]);
+            encp->capture_buffers[i] = NULL;
+        }
+    }
+
     close(encp->fd);
+    encp->fd = -1;
 
     free(encp->capture_buffers);
+    free(encp->capture_buffer_sizes);
     free(encp->ntp_timestamps);
     free(encp);
 }
