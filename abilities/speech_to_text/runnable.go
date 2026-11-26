@@ -52,19 +52,103 @@ type Progress struct {
 
 type ProgressJSON struct {
 	Progress
-	Error string `json:"error,omitempty"`
+	Done    bool   `json:"done,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Session uint64 `json:"session,omitempty"`
 }
 
-func newProgressJSON(p Progress) (pj *ProgressJSON) {
-	pj = &ProgressJSON{Progress: p}
+func newProgressJSON(p Progress, session uint64, done bool) (pj *ProgressJSON) {
+	pj = &ProgressJSON{
+		Progress: p,
+		Done:     done,
+		Session:  session,
+	}
 	if p.Error != nil {
 		pj.Error = astikit.ErrorCause(p.Error).Error()
 	}
 	return
 }
 
+// rootCtx returns ctx or a background context when ctx is nil
+func rootCtx(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// clone returns a deep copy of the progress so that the parser can't mutate the state we store afterwards
+func (p Progress) clone() Progress {
+	o := p
+	if p.Steps != nil {
+		o.Steps = make([]string, len(p.Steps))
+		copy(o.Steps, p.Steps)
+	}
+	return o
+}
+
+// done indicates whether the progress marks the end of a training session. A progress is only done once the last step
+// has reached 100% so that intermediate steps (for instance a preparing step reaching 100%) don't end the session.
 func (p *Progress) done() bool {
-	return p.Error != nil || len(p.Steps) == 0 || (p.CurrentStep == p.Steps[len(p.Steps)-1] && p.Progress == 100)
+	if p.Error != nil {
+		return true
+	}
+	if p.Progress < 100 {
+		return false
+	}
+	return len(p.Steps) == 0 || p.CurrentStep == p.Steps[len(p.Steps)-1]
+}
+
+// position returns the position of the progress in its steps: the index of the current step and the percentage
+// within that step
+func (p *Progress) position() (idx int, pct float64) {
+	idx = -1
+	for i, s := range p.Steps {
+		if s == p.CurrentStep {
+			idx = i
+			break
+		}
+	}
+	return idx, p.Progress
+}
+
+// trainingSession represents a single training session. A runnable can have at most one at a time. Each session has
+// its own context and progress so that late callbacks from a previous session can never leak into the current one.
+type trainingSession struct {
+	cancel     context.CancelFunc
+	ctx        context.Context
+	id         uint64
+	lastIdx    int
+	lastPct    float64
+	progress   *Progress
+	started    bool
+	terminated bool
+}
+
+// accept makes sure the progress is monotonous within the session and records it if it is. It returns false when the
+// progress would make the session go backwards.
+func (s *trainingSession) accept(p Progress) bool {
+	// Errors are always accepted since they mark the end of the session
+	if p.Error != nil {
+		return true
+	}
+
+	// Get position
+	idx, pct := p.position()
+
+	// First progress of the session
+	if !s.started {
+		s.started = true
+		s.lastIdx, s.lastPct = idx, pct
+		return true
+	}
+
+	// Progress must never go backwards within a session
+	if idx > s.lastIdx || (idx == s.lastIdx && pct >= s.lastPct) {
+		s.lastIdx, s.lastPct = idx, pct
+		return true
+	}
+	return false
 }
 
 type Speech struct {
@@ -82,20 +166,19 @@ type SpeechFile struct {
 type Runnable struct {
 	*astibob.BaseOperatable
 	*astibob.BaseRunnable
-	b      *astikit.LimiterBucket
-	c      *astikit.Chan
-	cancel context.CancelFunc
-	ctx    context.Context
-	i      *os.File
-	l      astikit.SeverityLogger
-	mp     *sync.Mutex // Locks pg and ctx
-	ms     *sync.Mutex // Locks ss
-	msd    *sync.Mutex // Locks sds
-	o      RunnableOptions
-	p      Parser
-	pg     *Progress
-	sds    map[string]*astikit.PCMSilenceDetector
-	ss     map[string]*Speech
+	b       *astikit.LimiterBucket
+	c       *astikit.Chan
+	i       *os.File
+	l       astikit.SeverityLogger
+	mp      *sync.Mutex // Locks session and sid
+	ms      *sync.Mutex // Locks ss
+	msd     *sync.Mutex // Locks sds
+	o       RunnableOptions
+	p       Parser
+	sds     map[string]*astikit.PCMSilenceDetector
+	session *trainingSession // Current training session, nil when no training is in progress
+	sid     uint64           // Last training session id
+	ss      map[string]*Speech
 }
 
 type RunnableOptions struct {
@@ -739,8 +822,8 @@ func (r *Runnable) trainReferences(rw http.ResponseWriter, req *http.Request, p 
 
 	// Add progress
 	r.mp.Lock()
-	if r.pg != nil {
-		rf.Progress = newProgressJSON(*r.pg)
+	if r.session != nil {
+		rf.Progress = newProgressJSON(*r.session.progress, r.session.id, false)
 	}
 	r.mp.Unlock()
 
@@ -748,7 +831,7 @@ func (r *Runnable) trainReferences(rw http.ResponseWriter, req *http.Request, p 
 	astibob.WriteHTTPData(r.l, rw, rf)
 }
 
-func (r *Runnable) newProgressMessage(p Progress) (m *astibob.Message, err error) {
+func (r *Runnable) newProgressMessage(p Progress, session uint64, done bool) (m *astibob.Message, err error) {
 	// Create message
 	m = astibob.NewMessage()
 
@@ -758,12 +841,35 @@ func (r *Runnable) newProgressMessage(p Progress) (m *astibob.Message, err error
 	// Make sure the message is sent to the UI
 	m.To = &astibob.Identifier{Type: astibob.UIIdentifierType}
 
+	// Clone steps so that the dispatched payload can't be mutated by the parser afterwards
+	p = p.clone()
+
 	// Marshal
-	if m.Payload, err = json.Marshal(newProgressJSON(p)); err != nil {
+	if m.Payload, err = json.Marshal(newProgressJSON(p, session, done)); err != nil {
 		err = fmt.Errorf("speech_to_text: marshaling payload failed: %w", err)
 		return
 	}
 	return
+}
+
+// emitProgress dispatches the progress of the session to the UI. The last message of a session is never rate limited.
+// r.mp must be held so that no progress message can be dispatched once the session has been terminated, which
+// guarantees that the terminal message is always the last one delivered for a given session.
+func (r *Runnable) emitProgress(session uint64, p Progress, done bool) {
+	// Rate limit here in case Parser is spamming
+	if !done && !r.b.Inc() {
+		return
+	}
+
+	// Create message
+	m, err := r.newProgressMessage(p, session, done)
+	if err != nil {
+		r.l.Error(fmt.Errorf("speech_to_text: creating progress message failed: %w", err))
+		return
+	}
+
+	// Dispatch
+	r.Dispatch(m)
 }
 
 func (r *Runnable) train(rw http.ResponseWriter, req *http.Request, p httprouter.Params) {
@@ -779,17 +885,20 @@ func (r *Runnable) train(rw http.ResponseWriter, req *http.Request, p httprouter
 	r.mp.Lock()
 
 	// Training in progress
-	if r.ctx != nil {
+	if r.session != nil {
 		r.mp.Unlock()
 		astibob.WriteHTTPError(r.l, rw, http.StatusBadRequest, errors.New("speech_to_text: training in progress"))
 		return
 	}
 
-	// Create progress
-	r.pg = &Progress{}
-
-	// Create context
-	r.ctx, r.cancel = context.WithCancel(r.RootCtx())
+	// Create session
+	r.sid++
+	s := &trainingSession{
+		id:       r.sid,
+		progress: &Progress{},
+	}
+	s.ctx, s.cancel = context.WithCancel(rootCtx(r.RootCtx()))
+	r.session = s
 
 	// Unlock
 	r.mp.Unlock()
@@ -814,49 +923,82 @@ func (r *Runnable) train(rw http.ResponseWriter, req *http.Request, p httprouter
 		defer t.Done()
 
 		// Train
-		r.p.Train(r.ctx, fs, r.progressFunc)
+		r.p.Train(s.ctx, fs, r.progressFunc(s))
+
+		// Make sure a parser returning without a terminal progress doesn't leave the session hanging
+		r.finishSession(s)
 	}()
 }
 
-func (r *Runnable) progressFunc(p Progress) {
+// finishSession terminates the session if it's still the current one. It makes sure the UI always converges to a
+// restartable state even when the parser returns without emitting a terminal progress.
+func (r *Runnable) finishSession(s *trainingSession) {
 	// Lock
 	r.mp.Lock()
+	defer r.mp.Unlock()
 
-	// Update progress
-	*r.pg = p
+	// Session has already ended
+	if s.terminated || r.session != s {
+		return
+	}
 
-	// Progress is done
-	if p.done() {
-		// Log error
-		if p.Error != nil {
-			r.l.Error(fmt.Errorf("speech_to_text: training failed: %w", p.Error))
+	// Terminate session
+	s.terminated = true
+	r.session = nil
+
+	// Snapshot progress
+	pg := Progress{}
+	if s.progress != nil {
+		pg = *s.progress
+	}
+
+	// Release resources
+	s.cancel()
+
+	// Dispatch terminal progress
+	r.emitProgress(s.id, pg, true)
+}
+
+// progressFunc returns a progress callback bound to the provided session. Callbacks coming from a session that is not
+// the current one are ignored so that late callbacks can never leak into a new session.
+func (r *Runnable) progressFunc(s *trainingSession) func(Progress) {
+	return func(p Progress) {
+		// Lock
+		r.mp.Lock()
+		defer r.mp.Unlock()
+
+		// Session has already ended: ignore anything coming from it
+		if s.terminated || r.session != s {
+			return
 		}
 
-		// Cancel context
-		r.cancel()
+		// Ignore non monotonic progress
+		if !s.accept(p) {
+			return
+		}
 
-		// Reset context
-		r.cancel = nil
-		r.ctx = nil
+		// Update progress
+		*s.progress = p.clone()
+
+		// Progress is done
+		done := p.done()
+		if done {
+			// Log error
+			if p.Error != nil {
+				r.l.Error(fmt.Errorf("speech_to_text: training failed: %w", p.Error))
+			}
+
+			// Terminate session
+			s.terminated = true
+			r.session = nil
+
+			// Release resources
+			s.cancel()
+		}
+
+		// Dispatch
+		r.emitProgress(s.id, p, done)
 	}
-
-	// Unlock
-	r.mp.Unlock()
-
-	// Rate limit here in case Parser is spamming
-	if !r.b.Inc() {
-		return
-	}
-
-	// Create message
-	m, err := r.newProgressMessage(p)
-	if err != nil {
-		r.l.Error(fmt.Errorf("speech_to_text: creating progress message failed: %w", err))
-		return
-	}
-
-	// Dispatch
-	r.Dispatch(m)
 }
 
 func (r *Runnable) cancelTraining(rw http.ResponseWriter, req *http.Request, p httprouter.Params) {
@@ -865,16 +1007,27 @@ func (r *Runnable) cancelTraining(rw http.ResponseWriter, req *http.Request, p h
 
 	// Lock
 	r.mp.Lock()
+	defer r.mp.Unlock()
 
-	// No training in progress
-	if r.ctx == nil {
-		r.mp.Unlock()
+	// No training in progress: succeed without side effect
+	if r.session == nil {
 		return
 	}
 
-	// Cancel context
-	r.cancel()
+	// Terminate session
+	s := r.session
+	s.terminated = true
+	r.session = nil
 
-	// Unlock
-	r.mp.Unlock()
+	// Keep a snapshot of the session's progress for the terminal message
+	pg := Progress{}
+	if s.progress != nil {
+		pg = *s.progress
+	}
+
+	// Cancel context
+	s.cancel()
+
+	// Make sure the end of the session reaches the UI and that it converges to a restartable state
+	r.emitProgress(s.id, pg, true)
 }
