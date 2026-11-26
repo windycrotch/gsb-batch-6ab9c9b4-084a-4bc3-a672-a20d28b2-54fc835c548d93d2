@@ -282,6 +282,10 @@ const (
 )
 
 type playerImpl struct {
+	// ctrlArrival assigns arrival tickets to control calls before they acquire m.
+	// It must stay 64-bit aligned for atomic access.
+	ctrlArrival atomic.Uint64
+
 	mux        *Mux
 	src        io.Reader
 	prevVolume float64
@@ -309,8 +313,14 @@ type playerImpl struct {
 	// seeks wait for it to finish.
 	seeking bool
 
-	// readCond is signaled when reading or seeking becomes false.
+	// readCond is signaled when reading or seeking becomes false, and when the
+	// serialized control turn is handed to the next control call.
 	readCond *sync.Cond
+
+	// ctrlServed is the arrival ticket of the next control call allowed to run.
+	// Control calls serialize through beginControl/endControl in arrival order.
+	// Guarded by m.
+	ctrlServed uint64
 
 	// srcGen is a generation counter of the source position.
 	// The result of a read that started at an older generation is stale and must be discarded.
@@ -366,10 +376,9 @@ func (p *Player) Play() {
 func (p *playerImpl) Play() {
 	defer p.mux.signal()
 
-	p.m.Lock()
+	ticket := p.beginControl()
 	defer p.m.Unlock()
-
-	p.waitForSeekImpl()
+	defer p.endControl(ticket)
 
 	p.playImpl()
 }
@@ -431,10 +440,9 @@ func (p *Player) Pause() {
 }
 
 func (p *playerImpl) Pause() {
-	p.m.Lock()
+	ticket := p.beginControl()
 	defer p.m.Unlock()
-
-	p.waitForSeekImpl()
+	defer p.endControl(ticket)
 
 	if p.state != playerPlay {
 		return
@@ -447,10 +455,9 @@ func (p *Player) PauseAndStopReading() {
 }
 
 func (p *playerImpl) PauseAndStopReading() {
-	p.m.Lock()
+	ticket := p.beginControl()
 	defer p.m.Unlock()
-
-	p.waitForSeekImpl()
+	defer p.endControl(ticket)
 
 	p.pauseAndStopReadingImpl()
 }
@@ -492,8 +499,37 @@ func (p *playerImpl) waitForSeekImpl() {
 	}
 }
 
+// beginControl serializes the player's control calls in the order they arrive.
+//
+// An arrival ticket is taken before m is acquired, so a control call that
+// reached the player first cannot be overtaken by a later call that happens to
+// lock m first. beginControl returns with m locked and the caller's turn
+// active. The caller must end the turn with endControl and then unlock m, for
+// example with paired defers:
+//
+//	ticket := p.beginControl()
+//	defer p.m.Unlock()
+//	defer p.endControl(ticket)
+func (p *playerImpl) beginControl() uint64 {
+	ticket := p.ctrlArrival.Add(1) - 1
+
+	p.m.Lock()
+	for p.ctrlServed != ticket {
+		p.readCond.Wait()
+	}
+	return ticket
+}
+
+// endControl hands the serialized control turn to the next control call.
+// When endControl is called, the mutex m must be locked.
+func (p *playerImpl) endControl(ticket uint64) {
+	p.ctrlServed = ticket + 1
+	p.readCond.Broadcast()
+}
+
 func (p *playerImpl) Seek(offset int64, whence int) (int64, error) {
-	// Check if the source implements io.Seeker.
+	// Check if the source implements io.Seeker before taking an arrival ticket,
+	// so an unsupported Seek neither waits behind nor blocks later controls.
 	s, ok := p.src.(io.Seeker)
 	if !ok {
 		return 0, errors.New("mux: the source must implement io.Seeker")
@@ -501,11 +537,40 @@ func (p *playerImpl) Seek(offset int64, whence int) (int64, error) {
 
 	defer p.mux.signal()
 
-	p.prepareSeek()
-	defer p.finishSeek()
+	ticket := p.beginControl()
+	defer p.m.Unlock()
+	defer p.endControl(ticket)
+
+	p.prepareSeekImpl()
 
 	// A source may block in Seek. Do not hold the player lock needed by the mixer.
-	return s.Seek(offset, whence)
+	// The control ticket stays active, so later controls wait their turn rather
+	// than overtaking this Seek.
+	p.m.Unlock()
+	pos, err, panicked := callSourceSeek(s, offset, whence)
+	p.m.Lock()
+
+	p.finishSeekImpl()
+
+	// Re-propagate a source panic only after the seek and the control turn were
+	// released, so later controls cannot block forever.
+	if panicked != nil {
+		panic(panicked)
+	}
+	return pos, err
+}
+
+// callSourceSeek invokes the source Seek without the player lock and turns a
+// panic into a value so the caller can release the seek state and control turn
+// before the panic propagates again.
+func callSourceSeek(s io.Seeker, offset int64, whence int) (pos int64, err error, panicked any) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = r
+		}
+	}()
+	pos, err = s.Seek(offset, whence)
+	return
 }
 
 // prepareSeek discards buffered data and waits for an ongoing Read without
@@ -514,6 +579,12 @@ func (p *playerImpl) prepareSeek() {
 	p.m.Lock()
 	defer p.m.Unlock()
 
+	p.prepareSeekImpl()
+}
+
+// prepareSeekImpl is the locked implementation of prepareSeek.
+// When prepareSeekImpl is called, the mutex m must be locked.
+func (p *playerImpl) prepareSeekImpl() {
 	p.waitForSeekImpl()
 	// Prevent new reads and other seeks, including while waiting for an ongoing read.
 	p.seeking = true
@@ -547,6 +618,12 @@ func (p *playerImpl) finishSeek() {
 	p.m.Lock()
 	defer p.m.Unlock()
 
+	p.finishSeekImpl()
+}
+
+// finishSeekImpl is the locked implementation of finishSeek.
+// When finishSeekImpl is called, the mutex m must be locked.
+func (p *playerImpl) finishSeekImpl() {
 	p.seeking = false
 	p.readCond.Broadcast()
 }
@@ -556,10 +633,9 @@ func (p *Player) Reset() {
 }
 
 func (p *playerImpl) Reset() {
-	p.m.Lock()
+	ticket := p.beginControl()
 	defer p.m.Unlock()
-
-	p.waitForSeekImpl()
+	defer p.endControl(ticket)
 
 	p.pauseAndStopReadingImpl()
 
@@ -684,10 +760,10 @@ func (p *Player) Close() error {
 }
 
 func (p *playerImpl) Close() error {
-	p.m.Lock()
+	ticket := p.beginControl()
 	defer p.m.Unlock()
+	defer p.endControl(ticket)
 
-	p.waitForSeekImpl()
 	return p.closeImpl()
 }
 
