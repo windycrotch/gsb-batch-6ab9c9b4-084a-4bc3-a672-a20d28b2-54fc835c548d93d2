@@ -406,6 +406,31 @@ struct snd_usb_babyface {
 	unsigned int urb_frames;	/* this session's URB size */
 	unsigned int urbs_active;	/* this session's URBs in flight */
 	int session_dir;		/* the direction that chose them */
+	/* The parameter contract the two directions share.  Changing the
+	 * rate, the frame size or the URB geometry publishes a new
+	 * generation: a substream is runnable only while the generation it
+	 * negotiated in hw_params() (subs_gen[], 0 = not set up) is still
+	 * the session's (session_gen).  The other direction is therefore
+	 * invalid from the change until it negotiates again, whatever the
+	 * owner.  Both live under ->lock; hw_params() writes them under
+	 * that lock together with the parameters they describe, so a
+	 * reader holding it never sees one part of a change without the
+	 * other.
+	 *
+	 * subs_pub_gen[] is the generation the substream's published
+	 * parameters (subs_rate[], subs_frame_bytes[], subs_urb_frames[],
+	 * subs_urbs_active[]) belong to; the runnable check reads those,
+	 * not the session's live fields.  That way a START is judged
+	 * against the session as it was when this substream negotiated
+	 * it, even if another direction has published since.
+	 */
+	unsigned int session_gen;
+	unsigned int subs_gen[2];
+	unsigned int subs_pub_gen[2];
+	unsigned int subs_rate[2];
+	unsigned int subs_frame_bytes[2];
+	unsigned int subs_urb_frames[2];
+	unsigned int subs_urbs_active[2];
 	unsigned int frame_bytes;	/* 56/40/32 for alt 1/2/3 */
 	unsigned int rate;
 	unsigned int alt;
@@ -415,7 +440,9 @@ struct snd_usb_babyface {
 	pid_t owner[2];			/* per direction: tgid that opened it */
 	bool streaming;			/* URBs actually in flight */
 	ktime_t stream_stopped;		/* when the last session's URBs stopped */
-	bool shutdown;
+	bool shutdown;			/* disconnected: no new session, ever */
+	bool suspended;			/* S3: no new session until resume */
+	atomic_t torn_down;		/* one-shot guard for the final teardown */
 	unsigned int slot;		/* index[]/id[] entry, see probe() */
 	atomic_t urb_err;		/* consecutive bad URBs (stops the stream) */
 	struct work_struct stream_work;
@@ -586,6 +613,15 @@ void babyface_stream_kill(struct snd_usb_babyface *chip);
 void babyface_pcm_stop_both(struct snd_usb_babyface *chip, snd_pcm_state_t state);
 void babyface_stream_work(struct work_struct *work);
 extern const struct snd_pcm_hw_constraint_list bf_rates_constraint;
+
+/* The parameter contract the two directions share, and the teardown the
+ * disconnect and suspend paths run.
+ */
+bool bf_subs_session_current(struct snd_usb_babyface *chip,
+			     struct snd_pcm_substream *subs);
+bool bf_teardown_once(struct snd_usb_babyface *chip);
+void bf_session_suspend(struct snd_usb_babyface *chip);
+void bf_session_stop_both(struct snd_usb_babyface *chip, snd_pcm_state_t state);
 
 /* Mixer-state persistence across interface re-probes/resume. */
 int babyface_restore_state(struct snd_usb_babyface *chip);

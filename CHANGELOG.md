@@ -2,7 +2,40 @@
 
 ## Unreleased
 
+### Fixed
+- The two directions of the shared USB session now agree on the
+  parameters they share. Changing the rate, the frame size or the URB
+  geometry stops the session and publishes a new generation; the other
+  direction is not runnable (prepare `-EINVAL`, START `-EPIPE`) until it
+  renegotiates, whichever application owns it. This closes a substream
+  starting on a session whose frame size it never negotiated (detuned
+  audio, a pointer past the ring) after a rate round trip 48 → 96 → 48
+  kHz, and a change racing the other side's START — the generation is
+  published with the parameters under `chip->lock`, so a START sees one
+  contract whole or the other. The sequential and same-process duplex
+  cases still work; a repeated hw_params with the same values is not a
+  change. A rate change whose `SET_INTERFACE` fails now leaves the
+  running session intact instead of tearing it down first.
+- Disconnect and suspend share one teardown. A mid-stream unplug wakes
+  blocked read/write with `-ENODEV` (`DISCONNECTED`), distinct from the
+  `-EPIPE` of a stream error; suspend wakes them with `-ESTRPIPE`
+  (`SUSPENDED`), and after resume the application's `hw_params` +
+  `prepare` builds a new session. A disconnect racing a re-probe tears
+  the card down once: the URBs and DMA buffers are freed exactly once,
+  and nothing is submitted after the free.
+- `tools/kernel/extract_laws.py` finds table and variable definitions
+  whose type spans several lines and reads the sources as UTF-8, so the
+  law selftests run on a machine with a non-UTF-8 locale too.
+
 ### Added
+- `tools/kernel/pcm_session_test.c`: the shared-session contract in user
+  space against the driver's own code — change invalidates the other
+  direction (rate and geometry), rate round trip, refused change keeps
+  the session, sequential and same-process duplex, START versus change in
+  both orders, disconnect wake + double-teardown, suspend/recover. It
+  runs from `selftests.sh` with no card and no kernel tree.
+- `docs/pcm-session-contract.md`: what each direction may assume of the
+  other, and how disconnect and suspend differ.
 - The PCMs have 14 channels: capture channels 13/14 carry the FX bus (the
   sum of the FX sends), and playback channels 13/14 the FX return. TotalMix
   FX computes its reverb and echo on the host in the same way: measured with

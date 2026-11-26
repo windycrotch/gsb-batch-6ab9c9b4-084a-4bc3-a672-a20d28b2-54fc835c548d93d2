@@ -72,9 +72,15 @@ def index(src):
             out.setdefault(m.group(1), (offs[i], "\n".join(lines[i:j + 1])))
             i = j + 1
             continue
-        # a column-0 line naming a function or an array, not a prototype
-        m = re.match(r"(?:\}\s*)?(?:[A-Za-z_][\w\s\*]*?\s\**)?(\w+)\s*([\(\[])",
-                     ln)
+        # A column-0 definition, not a prototype: a function, a table or
+        # a plain variable.  The type prefix ("static const struct foo")
+        # is skipped and the first parenthesised / bracketed / assigned
+        # name after it is taken, so "int f(void)", "static const struct
+        # x t[] = {" and "static int urb_split;" are all found.  A
+        # prototype (a "(" name ending in ";") is skipped.
+        m = re.match(
+            r"(?:\}\s*)?(?:[A-Za-z_][\w\s\*]*?\s\**)?(\w+)\s*"
+            r"([\(\[]|=[^;]*|;)", ln)
         if m and ln[:1] not in (" ", "\t", "#", "") and \
            not re.match(r"(if|for|while|switch|return)\b", ln):
             name = m.group(1)
@@ -94,18 +100,66 @@ def index(src):
                     continue
                 while j < len(lines) and lines[j] != "}":
                     j += 1
+            elif m.group(2).startswith("="):
+                # An initialised definition: one line for a scalar, up to
+                # the closing brace for a table.
+                if "{" not in ln:
+                    j = i
+                else:
+                    j = i
+                    depth = 0
+                    while j < len(lines):
+                        depth += lines[j].count("{") - lines[j].count("}")
+                        if depth <= 0 and strip_comments(lines[j]).rstrip(
+                                ).endswith(";"):
+                            break
+                        j += 1
+            elif m.group(2) == ";":
+                j = i                 # an uninitialised variable
             else:
                 while j < len(lines) and not strip_comments(lines[j]).rstrip().endswith(";"):
                     j += 1
             out.setdefault(name, (offs[start], "\n".join(lines[start:j + 1])))
             i = j + 1
             continue
+        # A definition whose name is not on its first line (a multi-line
+        # type prefix); back up over the leading type lines and take the
+        # first line that assigns.
+        m = re.match(r"(?:static\s+)?(?:const\s+)?struct\s+\w+\s*$",
+                     strip_comments(ln).rstrip())
+        if m:
+            k = i + 1
+            while k < len(lines) and not re.search(
+                    r"\b(\w+)\s*(\[[^\]]*\])?\s*=", lines[k]):
+                if not lines[k].strip():
+                    k += 1
+                    continue
+                if "{" in lines[k] or ";" in lines[k]:
+                    break
+                k += 1
+            else:
+                k = -1
+            if 0 < k < len(lines) and "=" in lines[k]:
+                nm = re.search(r"\b(\w+)\s*(\[[^\]]*\])?\s*=", lines[k])
+                if nm:
+                    j = k
+                    depth = 0
+                    while j < len(lines):
+                        depth += lines[j].count("{") - lines[j].count("}")
+                        if depth <= 0 and strip_comments(lines[j]).rstrip(
+                                ).endswith(";"):
+                            break
+                        j += 1
+                    out.setdefault(nm.group(1),
+                                   (offs[i], "\n".join(lines[i:j + 1])))
+                    i = j + 1
+                    continue
         i += 1
     return out
 
 
 def main():
-    test = open(sys.argv[1]).read()
+    test = open(sys.argv[1], encoding="utf-8").read()
     m = re.search(r"\blaws:(.*?)\*/", test, re.S)
     if not m:
         sys.exit("%s: no \"laws: ...\" marker comment" % sys.argv[1])
@@ -113,7 +167,8 @@ def main():
 
     defs = {}
     for n, f in enumerate(DRIVER):
-        for name, (pos, text) in index(open(os.path.join(HERE, f)).read()).items():
+        for name, (pos, text) in index(
+                open(os.path.join(HERE, f), encoding="utf-8").read()).items():
             defs.setdefault(name, ((n, pos), text))
 
     done, order = set(), []

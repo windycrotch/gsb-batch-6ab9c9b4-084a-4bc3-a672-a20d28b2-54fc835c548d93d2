@@ -7,6 +7,7 @@
 | See what it **supports** | [`features.md`](features.md) |
 | **Build, load and test** on real hardware | [`LINUX-TEST.md`](../LINUX-TEST.md) |
 | Understand the **driver architecture and current gaps** | [`KERNEL-DRIVER.md`](../KERNEL-DRIVER.md) |
+| Read the **shared-session contract** (rate/format changes, disconnect, suspend) | [`pcm-session-contract.md`](pcm-session-contract.md) |
 | See the **hardware validation log** | [`LINUX-VALIDATION.md`](../LINUX-VALIDATION.md) |
 | Read the **protocol reference** (register maps, requests, stream layout) | [`tools/usbdump/PROTOCOL.md`](../tools/usbdump/PROTOCOL.md) |
 | Read the **calibrated laws** (fader/master curves, gains, EQ) | [`tools/usbdump/CALIBRATION.md`](../tools/usbdump/CALIBRATION.md) |

@@ -13,3 +13,6 @@ modules.order
 
 # front-panel probe helper (built from usbwrite.c)
 usbwrite
+
+# Python bytecode from extract_laws.py / the RE scripts
+__pycache__/

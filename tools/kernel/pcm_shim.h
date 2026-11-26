@@ -12,6 +12,17 @@
 #include <stdint.h>
 #include <string.h>
 
+/* The driver's killed-URB statuses.  All three are in <errno.h> on
+ * Linux; the -ESHUTDOWN one is missing on some non-glibc hosts (MinGW),
+ * so define the driver's value when the C library has none.
+ */
+#ifndef ESHUTDOWN
+#define ESHUTDOWN	108
+#endif
+#ifndef ECONNRESET
+#define ECONNRESET	104
+#endif
+
 typedef uint8_t u8;
 
 #define min(a, b)		((a) < (b) ? (a) : (b))

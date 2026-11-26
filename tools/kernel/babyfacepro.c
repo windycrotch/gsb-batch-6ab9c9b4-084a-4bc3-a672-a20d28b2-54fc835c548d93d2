@@ -769,6 +769,15 @@ static int babyface_stream_start(struct snd_usb_babyface *chip)
 	s64 since;
 	int i, ret;
 
+	/* The URBs and their buffers are freed at disconnect() (and only
+	 * once).  prepare() already refuses with -ENODEV under this mutex,
+	 * but keep a belt-and-braces check here: a start must never touch
+	 * a freed buffer or submit a freed URB.
+	 */
+	if (chip->shutdown || !chip->urbs_in || !chip->urbs_out ||
+	    !chip->buf_out || !chip->dma_in || !chip->dma_out)
+		return -ENODEV;
+
 	/* A session triggered right after the previous one stopped starts
 	 * with the outputs silent: give the device BF_SESSION_GAP_MS.
 	 * Only a stop followed at once by a new setup waits (an application
@@ -1177,8 +1186,14 @@ static int babyface_pcm_open(struct snd_pcm_substream *subs)
 	if (ret < 0)
 		return ret;
 
-	scoped_guard(spinlock_irqsave, &chip->lock)
+	scoped_guard(spinlock_irqsave, &chip->lock) {
+		/* A (re-)opened substream starts unnegotiated: its previous
+		 * generation, if any, belongs to a runtime the core has
+		 * thrown away.
+		 */
+		chip->subs_gen[subs->stream] = 0;
 		rcu_assign_pointer(chip->subs[subs->stream], subs);
+	}
 	return 0;
 }
 
@@ -1189,8 +1204,10 @@ static int babyface_pcm_close(struct snd_pcm_substream *subs)
 	flush_work(&chip->stream_work);
 	scoped_guard(mutex, &chip->mutex)
 		chip->owner[subs->stream] = 0;
-	scoped_guard(spinlock_irqsave, &chip->lock)
+	scoped_guard(spinlock_irqsave, &chip->lock) {
+		chip->subs_gen[subs->stream] = 0;
 		RCU_INIT_POINTER(chip->subs[subs->stream], NULL);
+	}
 	/* The session keeps running while the other direction is set up,
 	 * so a URB handler may still hold this substream: wait for it
 	 * before the core frees the runtime.
@@ -1205,6 +1222,7 @@ static int babyface_pcm_hw_params(struct snd_pcm_substream *subs,
 	struct snd_usb_babyface *chip = snd_pcm_substream_chip(subs);
 	const struct bf_rate *r;
 	unsigned int urb, n;
+	unsigned int old_urb, old_n;
 	bool new_rate = false;
 	int ret = 0;
 
@@ -1232,6 +1250,14 @@ static int babyface_pcm_hw_params(struct snd_pcm_substream *subs,
 	/* disconnect() has let go of the interface: do not re-point it. */
 	if (chip->shutdown)
 		return -ENODEV;
+	/* A suspended device has no session to negotiate with; the core
+	 * wakes suspended substreams and the application re-opens them
+	 * after resume.
+	 */
+	if (chip->suspended)
+		return -ESTRPIPE;
+	old_urb = chip->urb_frames;
+	old_n = chip->urbs_active;
 	if (r->rate != chip->rate) {
 		/* The rule in open() normally means no other application
 		 * asks for a rate other than the running one.  It can still
@@ -1247,20 +1273,23 @@ static int babyface_pcm_hw_params(struct snd_pcm_substream *subs,
 				r->rate, chip->rate);
 			return -EBUSY;
 		}
-		/* Nothing else holds the clock.  Stop the session and
-		 * re-point the bandwidth class; prepare starts a new session
-		 * at the new rate.  If this application's other direction is
-		 * still running, stop it with an xrun rather than let it
-		 * change pitch; prepare() then refuses it until it is set up
-		 * again at the new rate.
+		/* Nothing else holds the clock.  Re-point the bandwidth class
+		 * first: if the control transfer fails, the running session is
+		 * untouched and the other direction keeps streaming on its
+		 * negotiated parameters - a failed change leaves no half-applied
+		 * contract.  Only once the interface moved is the old session
+		 * stopped; prepare starts the new one at the new rate.  If this
+		 * application's other direction is still running, stop it with
+		 * an xrun rather than let it change pitch; prepare() then
+		 * refuses it until it is set up again at the new rate.
 		 */
+		ret = usb_set_interface(chip->dev, BF_IFACE, r->alt);
+		if (ret < 0)
+			return ret;
 		if (chip->streaming) {
 			babyface_stream_kill(chip);
 			babyface_pcm_stop_both(chip, SNDRV_PCM_STATE_XRUN);
 		}
-		ret = usb_set_interface(chip->dev, BF_IFACE, r->alt);
-		if (ret < 0)
-			return ret;
 		chip->rate = r->rate;
 		new_rate = true;
 		chip->alt = r->alt;
@@ -1301,7 +1330,8 @@ static int babyface_pcm_hw_params(struct snd_pcm_substream *subs,
 		if (urb != chip->urb_frames || n != chip->urbs_active) {
 			/* This application's other direction may still
 			 * run: stop it with an xrun, prepare() refuses it
-			 * until it fits the new session.
+			 * until it fits the new session.  (The generation
+			 * bump below invalidates it either way.)
 			 */
 			if (chip->streaming) {
 				babyface_stream_kill(chip);
@@ -1316,6 +1346,39 @@ static int babyface_pcm_hw_params(struct snd_pcm_substream *subs,
 				params_buffer_size(params));
 		}
 		chip->session_dir = subs->stream;
+	}
+	/* Publish this substream's parameters as the contract it
+	 * negotiated, and the generation they belong to.  The session's
+	 * generation moves whenever anything the two directions share
+	 * changes: the rate, the frame size, or the URB geometry.  Every
+	 * other substream - the other direction and, when the same
+	 * application reconfigures one direction, its own other one - is
+	 * stale from here until it calls hw_params() again, so neither
+	 * prepare() nor START can revive it on a session whose frame size
+	 * it never saw.
+	 *
+	 * Everything goes in under chip->lock, the lock trigger() takes:
+	 * a START either reads the whole old contract or the whole new
+	 * one.  The substream's own parameters are published even when
+	 * they did not change, because the generation they are stamped
+	 * with does.  A repeat of the same parameters is not a new
+	 * contract: a sound server that re-runs hw_params() with the same
+	 * values keeps its own other direction valid.
+	 */
+	{
+		bool changed = new_rate ||
+			chip->urb_frames != old_urb ||
+			chip->urbs_active != old_n;
+
+		guard(spinlock_irqsave)(&chip->lock);
+		if (chip->session_gen == 0 || changed)
+			chip->session_gen++;
+		chip->subs_gen[subs->stream] = chip->session_gen;
+		chip->subs_pub_gen[subs->stream] = chip->session_gen;
+		chip->subs_rate[subs->stream] = chip->rate;
+		chip->subs_frame_bytes[subs->stream] = chip->frame_bytes;
+		chip->subs_urb_frames[subs->stream] = chip->urb_frames;
+		chip->subs_urbs_active[subs->stream] = chip->urbs_active;
 	}
 	/* hw_params can repeat without an hw_free in between: count the
 	 * substream once.
@@ -1336,12 +1399,77 @@ static int babyface_pcm_hw_free(struct snd_pcm_substream *subs)
 	guard(mutex)(&chip->mutex);
 	if (chip->stream_setup[subs->stream]) {
 		chip->stream_setup[subs->stream] = false;
+		scoped_guard(spinlock_irqsave, &chip->lock)
+			chip->subs_gen[subs->stream] = 0;
 		if (--chip->stream_users == 0 && chip->streaming) {
 			babyface_stream_kill(chip);
 			dev_dbg(&chip->dev->dev, "stream stopped\n");
 		}
 	}
 	return 0;
+}
+
+/* Does this substream's negotiated parameters still describe the
+ * session?  The rate, the frame size and the URB geometry are one
+ * contract for both directions: an application that changes any of
+ * them stops the session, and every other substream - including the
+ * changing application's own other direction - is stale until it calls
+ * hw_params() again and lands in the new generation.
+ *
+ * Called with chip->lock held: trigger() only takes that lock, and
+ * hw_params() publishes the generation together with the parameters it
+ * describes, so a START either sees the old contract whole or the new
+ * one whole - never a session whose frame size and generation disagree.
+ */
+static bool bf_subs_current(struct snd_usb_babyface *chip,
+			    struct snd_pcm_substream *subs)
+{
+	return chip->subs_gen[subs->stream] != 0 &&
+	       chip->subs_gen[subs->stream] == chip->session_gen;
+}
+
+/* Can this substream run right now?  It must have been set up in the
+ * session's current generation, and its published parameters must be the
+ * ones the session is running with - same rate and frame size, and a
+ * period that spans the URBs it chose.  The published values, not the
+ * live session fields, are what the substream would actually run with;
+ * comparing against them is what keeps an old-parameter stream from
+ * starting after a change.
+ *
+ * Caller holds chip->lock.
+ */
+static bool bf_subs_runnable_locked(struct snd_usb_babyface *chip,
+				    struct snd_pcm_substream *subs)
+{
+	unsigned int s = subs->stream;
+
+	if (!bf_subs_current(chip, subs))
+		return false;
+	if (chip->subs_pub_gen[s] != chip->session_gen)
+		return false;
+	if (subs->runtime->rate != chip->subs_rate[s])
+		return false;
+	if (subs->runtime->period_size <
+	    chip->subs_urb_frames[s] *
+	    DIV_ROUND_UP(chip->subs_urbs_active[s], 2))
+		return false;
+	/* The frame size is part of the contract too: a substream that
+	 * published under another one streams a different number of bytes
+	 * per frame than the session moves.  It is not a runtime field (the
+	 * application does not choose it), so it is checked against the
+	 * published copy.
+	 */
+	return chip->subs_frame_bytes[s] == chip->frame_bytes;
+}
+
+/* The same, for callers that do not already hold chip->lock: prepare()
+ * (process context) and the selftest.
+ */
+bool bf_subs_session_current(struct snd_usb_babyface *chip,
+			     struct snd_pcm_substream *subs)
+{
+	guard(spinlock_irqsave)(&chip->lock);
+	return bf_subs_runnable_locked(chip, subs);
 }
 
 /* Start the session unless it already runs - after an xrun the app
@@ -1355,8 +1483,14 @@ static int babyface_pcm_prepare(struct snd_pcm_substream *subs)
 	scoped_guard(mutex, &chip->mutex) {
 		if (chip->shutdown)
 			ret = -ENODEV;
-		else if (subs->runtime->rate != chip->rate ||
-			 subs->runtime->period_size < bf_session_period(chip))
+		else if (chip->suspended)
+			/* The device lost its state and the session; the core
+			 * wakes suspended substreams with -ESTRPIPE, and an
+			 * application that reaches prepare() directly gets the
+			 * same recoverable answer instead of a bare EIO.
+			 */
+			ret = -ESTRPIPE;
+		else if (!bf_subs_session_current(chip, subs))
 			/* The other direction changed the rate or the URBs since
 			 * this one was set up: it has to be set up again.
 			 */
@@ -1383,22 +1517,25 @@ static int babyface_pcm_trigger(struct snd_pcm_substream *subs, int cmd)
 	 * decide whether the URB handlers move this substream's audio.
 	 */
 	case SNDRV_PCM_TRIGGER_START:
-		/* A URB error may have stopped the session since prepare. */
+		guard(spinlock_irqsave)(&chip->lock);
+		/* A URB error or a disconnect may have stopped the session
+		 * since prepare.
+		 */
 		if (!READ_ONCE(chip->streaming))
 			return -EPIPE;
 		/* The other direction may have changed the rate or the
 		 * URB geometry since this substream was prepared, and
 		 * START bypasses prepare()'s check.  Starting with a
 		 * runtime that no longer matches the session would make
-		 * an URB completion wrap the ring.
+		 * an URB completion wrap the ring.  Checked under the
+		 * chip->lock already held here: a concurrent change either
+		 * published before this lock was taken (this START fails)
+		 * or waits for it (the change then stops the substream below).
 		 */
-		if (subs->runtime->rate != chip->rate ||
-		    subs->runtime->period_size < bf_session_period(chip))
+		if (!bf_subs_runnable_locked(chip, subs))
 			return -EPIPE;
-		scoped_guard(spinlock_irqsave, &chip->lock) {
-			chip->hw_ptr[subs->stream] = 0;
-			chip->prev_period[subs->stream] = 0;
-		}
+		chip->hw_ptr[subs->stream] = 0;
+		chip->prev_period[subs->stream] = 0;
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		return 0;
@@ -1514,11 +1651,20 @@ MODULE_PARM_DESC(panel_poll_ms, "Front-panel poll interval in ms, 10..1000 (20 =
  * disconnect() calls this once the session is down instead of leaving
  * it to private_free().  private_free() calls it too, for a probe that
  * failed, and then finds nothing left after a disconnect.
+ *
+ * Every pointer is cleared as it is freed, so a second call - the
+ * private_free() after disconnect() already ran this, or the other way
+ * round - releases nothing twice and submits nothing afterwards: the
+ * arrays are NULL and the per-URB slots are NULL.
  */
 static void bf_free_urbs(struct snd_usb_babyface *chip)
 {
 	unsigned int urbsize;
 	int i;
+
+	if (!chip->urbs_in && !chip->urbs_out && !chip->buf_in &&
+	    !chip->buf_out && !chip->dma_in && !chip->dma_out)
+		return;
 
 	/* The URB arrays are NULL when the probe failed before allocating
 	 * them (snd_card_free runs private_free on any probe error).
@@ -1529,21 +1675,27 @@ static void bf_free_urbs(struct snd_usb_babyface *chip)
 			if (chip->urbs_in[i]) {
 				usb_kill_urb(chip->urbs_in[i]);
 				usb_free_urb(chip->urbs_in[i]);
+				chip->urbs_in[i] = NULL;
 			}
 			if (chip->urbs_out && chip->urbs_out[i]) {
 				usb_kill_urb(chip->urbs_out[i]);
 				usb_free_urb(chip->urbs_out[i]);
+				chip->urbs_out[i] = NULL;
 			}
 			/* probe() allocates the six arrays separately and can
 			 * fail between them, so each may be NULL here - this runs
 			 * on the probe error path via snd_card_free().
 			 */
-			if (chip->buf_in && chip->dma_in)
+			if (chip->buf_in && chip->dma_in && chip->buf_in[i]) {
 				usb_free_coherent(chip->dev, urbsize,
 						  chip->buf_in[i], chip->dma_in[i]);
-			if (chip->buf_out && chip->dma_out)
+				chip->buf_in[i] = NULL;
+			}
+			if (chip->buf_out && chip->dma_out && chip->buf_out[i]) {
 				usb_free_coherent(chip->dev, urbsize,
 						  chip->buf_out[i], chip->dma_out[i]);
+				chip->buf_out[i] = NULL;
+			}
 		}
 	}
 	kfree(chip->urbs_in);
@@ -1733,6 +1885,7 @@ static int babyface_probe(struct usb_interface *intf,
 	mutex_init(&chip->mutex);
 	spin_lock_init(&chip->lock);
 	atomic_set(&chip->urb_err, 0);
+	atomic_set(&chip->torn_down, 0);
 	INIT_WORK(&chip->stream_work, babyface_stream_work);
 	INIT_DELAYED_WORK(&chip->panel_work, babyface_panel_work);
 
@@ -1975,6 +2128,63 @@ error:
 	return err;
 }
 
+/* The final teardown, shared by disconnect() and the (testable) path the
+ * selftest drives.  Marking the card dead is one shot: a disconnect that
+ * races a re-probe, or a second interface's disconnect, calls this and
+ * gets false without touching the URBs or the buffers again.
+ */
+bool bf_teardown_once(struct snd_usb_babyface *chip)
+{
+	if (atomic_xchg(&chip->torn_down, 1))
+		return false;
+	chip->shutdown = true;
+	/* Stop the session and free the URBs in one locked step: the
+	 * handlers queue stream_work, and the mutex also waits out a
+	 * prepare() or hw_params() that was already past its ->shutdown
+	 * check.  bf_free_urbs() kills each URB before freeing it, and
+	 * ->streaming is already clear, so no completion resubmits into a
+	 * buffer that is about to go.
+	 */
+	scoped_guard(mutex, &chip->mutex) {
+		if (chip->streaming)
+			babyface_stream_kill(chip);
+		bf_free_urbs(chip);
+	}
+	cancel_work_sync(&chip->stream_work);
+	return true;
+}
+
+/* The session half of suspend: publish ->suspended, kill the URBs, and
+ * leave the buffers in place for the resume.  The caller runs the PM
+ * housekeeping (core suspend, panel, MIDI) around it.
+ */
+void bf_session_suspend(struct snd_usb_babyface *chip)
+{
+	/* From here on no new session may start: prepare() and hw_params()
+	 * return -ESTRPIPE under the mutex until resume() clears the flag.
+	 * Set before the substreams are woken so that a wake-up racing this
+	 * suspend cannot start a session against a device going away.
+	 */
+	chip->suspended = true;
+	scoped_guard(mutex, &chip->mutex) {
+		if (chip->streaming)
+			babyface_stream_kill(chip);
+	}
+	cancel_work_sync(&chip->stream_work);
+}
+
+/* The last teardown both paths share: wake blocked apps with a class of
+ * error they can tell apart.  DISCONNECTED is final, XRUN after a stream
+ * error, SUSPENDED (-ESTRPIPE) recoverable by a prepare after resume.
+ */
+void bf_session_stop_both(struct snd_usb_babyface *chip,
+			  snd_pcm_state_t state)
+{
+	dev_info(&chip->dev->dev, "stopping PCM substreams, state %d\n",
+		 (int)state);
+	babyface_pcm_stop_both(chip, state);
+}
+
 static void babyface_disconnect(struct usb_interface *intf)
 {
 	struct snd_usb_babyface *chip = usb_get_intfdata(intf);
@@ -1982,42 +2192,29 @@ static void babyface_disconnect(struct usb_interface *intf)
 	if (!chip)
 		return;
 
-	/* Idempotence guard: a disconnect can race a re-probe (usbfs
-	 * detach/re-attach) - tear the card down exactly once.
+	/* A connect/disconnect race can deliver this twice (usbfs detach /
+	 * re-attach, a failed probe's cleanup, the MIDI interface's own
+	 * disconnect): tear the card down exactly once, and never let a
+	 * second pass free URBs or buffers again.
 	 */
 	usb_set_intfdata(intf, NULL);
-	if (chip->shutdown)
+	if (!bf_teardown_once(chip))
 		return;
 
-	chip->shutdown = true;
-	/* Kill the session before cancelling the work: the URB handlers
-	 * queue it, and an unplug is exactly when they see errors.  Taking
-	 * the mutex also waits out a prepare that was already past its
-	 * ->shutdown check.
-	 */
-	scoped_guard(mutex, &chip->mutex) {
-		if (chip->streaming)
-			babyface_stream_kill(chip);
-	}
-	cancel_work_sync(&chip->stream_work);
 	babyface_panel_stop(chip);
-	/* Wake apps blocked in read/write: the card is going away. */
-	dev_info(&chip->dev->dev, "disconnect: stopping PCM substreams\n");
-	babyface_pcm_stop_both(chip, SNDRV_PCM_STATE_DISCONNECTED);
+	/* Wake apps blocked in read/write: the card is going away.  The
+	 * core leaves a DISCONNECTED substream stopped, and read/write
+	 * return -ENODEV, distinct from the -EPIPE of a stream error.
+	 */
+	bf_session_stop_both(chip, SNDRV_PCM_STATE_DISCONNECTED);
 
 	snd_card_disconnect(chip->card);
 	bf_midi_disconnect(chip);
-	/* The session is down and stays down: prepare() and hw_params()
-	 * see ->shutdown under the mutex.  Free the URBs and their buffers
-	 * now, while the host controller that allocated them is still
-	 * there; an application may keep the card open long after.
-	 */
-	scoped_guard(mutex, &chip->mutex)
-		bf_free_urbs(chip);
 	/* NEVER snd_card_free() here: it blocks until the last user
 	 * closes the card, and an open client (e.g. PipeWire) deadlocks
 	 * the disconnect (seen live: pipewire stuck in snd_card_free,
-	 * D state).  free_when_closed frees on the last close.
+	 * D state).  free_when_closed frees on the last close; its
+	 * private_free() runs bf_free_urbs() again and finds nothing.
 	 */
 	snd_card_free_when_closed(chip->card);
 }
@@ -2030,17 +2227,19 @@ static int babyface_suspend(struct usb_interface *intf, pm_message_t message)
 
 	if (!chip)
 		return 0;
+
+	bf_session_suspend(chip);
 	list_for_each_entry(sdev, &chip->card->devices, list) {
 		if (sdev->type == SNDRV_DEV_PCM)
 			snd_pcm_suspend_all(sdev->device_data);
 	}
-	/* The URB handlers queue the work: kill them first. */
-	scoped_guard(mutex, &chip->mutex) {
-		if (chip->streaming)
-			babyface_stream_kill(chip);
-	}
-	cancel_work_sync(&chip->stream_work);
+	/* The URBs are dead now, but the buffers stay allocated: the device
+	 * and its host controller come back on resume, and prepare() after
+	 * a -ESTRPIPE needs them.  A disconnect while suspended takes the
+	 * full teardown path instead.
+	 */
 	babyface_panel_stop(chip);
+	bf_session_stop_both(chip, SNDRV_PCM_STATE_SUSPENDED);
 	list_for_each(p, &chip->midi_list)
 		snd_usbmidi_suspend(p);
 	return 0;
@@ -2051,6 +2250,12 @@ static int bf_resume_locked(struct snd_usb_babyface *chip)
 {
 	int err;
 
+	/* The session is gone, but the parameters are not: the substreams
+	 * were suspended, not freed, so their runtimes still hold what they
+	 * negotiated.  Bring the interface back to the session's rate and
+	 * let prepare() start a new session with the same contract - that is
+	 * the recovery the applications run after -ESTRPIPE.
+	 */
 	err = usb_set_interface(chip->dev, BF_IFACE, chip->alt);
 	if (err < 0)
 		return err;
@@ -2081,8 +2286,10 @@ static int babyface_resume(struct usb_interface *intf)
 
 	/* The device lost its state across the suspend; re-run the cold
 	 * init and re-apply the cached mixer state.  Suspended PCM
-	 * substreams are woken by the core - apps get -ESTRPIPE and
-	 * restart (prepare starts a new session).
+	 * substreams were woken with -ESTRPIPE; the application's recovery
+	 * (hw_params + prepare) then negotiates a fresh generation.  hw_params
+	 * is refused with -ESTRPIPE until ->suspended is cleared below, so
+	 * clear it only once the device is live again.
 	 *
 	 * This is also the reset_resume handler.  Some hosts reset the
 	 * device on resume; that needs nothing more than the cold init
@@ -2091,8 +2298,11 @@ static int babyface_resume(struct usb_interface *intf)
 	 * fail, and udev's alsactl restore then loads the mixer state
 	 * stored at the last shutdown over the current one.
 	 */
-	scoped_guard(mutex, &chip->mutex)
+	scoped_guard(mutex, &chip->mutex) {
 		err = bf_resume_locked(chip);
+		if (!err)
+			chip->suspended = false;
+	}
 	if (!err) {
 		struct list_head *p;
 
