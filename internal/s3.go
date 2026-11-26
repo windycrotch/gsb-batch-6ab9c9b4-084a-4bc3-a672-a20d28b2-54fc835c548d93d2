@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
@@ -42,13 +41,7 @@ func DownloadFromS3(ctx context.Context, client *s3.Client, s3url, dest string) 
 	}
 	defer out.Body.Close()
 
-	file, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = io.Copy(file, out.Body)
-	return err
+	return WriteReaderToFile(ctx, dest, out.Body)
 }
 
 func UploadToS3(ctx context.Context, client *s3.Client, baseURL, path, name string) (string, error) {

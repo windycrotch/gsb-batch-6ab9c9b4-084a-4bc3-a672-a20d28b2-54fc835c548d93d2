@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added a per-request lifecycle that ties input downloads, FFmpeg processes, and temporary-directory cleanup to a single cancellation context.
+- Added process-tree termination so FFmpeg workers that inherit stdout are stopped together with the request.
+- Added end-to-end tests that drive the real `/v1/process` entry point with a fake download source and a controllable FFmpeg.
+
+### Changed
+
+- Streaming failures now report `X-Ffmpeg-Status: error` with `X-Ffmpeg-Bytes` counting only bytes actually written, and a broken response writer stops FFmpeg instead of being treated as success.
+- Concurrent input failures cancel the remaining downloads and produce a single response.
+- Job-directory cleanup is idempotent, so repeated cancellation does not delete twice or panic.
+
 ## [1.1.0] - 2026-09-02
 
 ### Added

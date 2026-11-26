@@ -56,7 +56,7 @@ Unknown fields and multiple JSON values in one request body are rejected.
 }
 ```
 
-Independent inputs are fetched concurrently. If the client disconnects, active HTTP downloads, S3 transfers, and FFmpeg processes are canceled.
+Independent inputs are fetched concurrently. If one download fails, the other in-flight transfers are canceled and the request returns a single failure. If the client disconnects, active HTTP downloads, S3 transfers, and FFmpeg processes are canceled, and no further response is written.
 
 ## Commands
 
@@ -144,7 +144,7 @@ The body begins as FFmpeg produces bytes and is not written to a temporary outpu
 | `X-Ffmpeg-Status` | `ok` when FFmpeg exits successfully, otherwise `error`. |
 | `X-Ffmpeg-Bytes`  | Number of media bytes written to the response.          |
 
-The initial status is `200 OK` before FFmpeg completes. A later FFmpeg failure therefore produces a truncated body with an `error` trailer rather than a different HTTP status. Clients and reverse proxies used for this mode must preserve HTTP trailers.
+The initial status is `200 OK` before FFmpeg completes. A later FFmpeg failure therefore produces a truncated body with an `error` trailer rather than a different HTTP status. `X-Ffmpeg-Bytes` always counts only the bytes actually written to the response, including in the failure case; it is never treated as success on a partial transfer. Clients and reverse proxies used for this mode must preserve HTTP trailers.
 
 ## S3 configuration
 
@@ -187,7 +187,7 @@ docker build --tag ffmpeg-api .
 
 ## Operations
 
-Each request gets its own temporary directory and FFmpeg process. Job files are removed when the response finishes. The container runs as an unprivileged user. The service keeps no session state and can be scaled horizontally behind a load balancer.
+Each request gets its own temporary directory and FFmpeg process. Job files are removed when the request ends, whether it succeeds, fails, or is canceled; repeated cancellation cannot delete the directory twice. A canceled request also stops its active downloads and terminates the FFmpeg process together with any worker processes it spawned. The container runs as an unprivileged user. The service keeps no session state and can be scaled horizontally behind a load balancer.
 
 FFmpeg controls its own worker threads. Supply `-threads 0` for automatic selection or a fixed value such as `-threads 4` in the relevant command.
 
