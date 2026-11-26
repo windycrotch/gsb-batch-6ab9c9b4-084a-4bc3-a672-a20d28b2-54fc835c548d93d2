@@ -1,0 +1,430 @@
+// Command hi264-mp4-extend extends a fragmented MP4 (CMAF) media segment
+// with empty frames — either all P_Skip frames (a freeze on the source's
+// last picture), or a black IDR followed by P_Skip copies. The output is
+// a self-contained media segment that plays alongside the input init:
+//
+//	cat init.mp4 out.m4s | ffplay -i -
+//
+// Usage:
+//
+//	hi264-mp4-extend -frames N [-black-idr] <init.mp4> <in.m4s> <out.m4s>
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"os"
+
+	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/mp4"
+
+	"github.com/Eyevinn/hi264/pkg/encode"
+	"github.com/Eyevinn/hi264/pkg/yuv"
+)
+
+func main() {
+	if err := run(os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet("hi264-mp4-extend", flag.ContinueOnError)
+	frames := fs.Uint("frames", 0, "number of frames to append (required)")
+	blackIDR := fs.Bool("black-idr", false, "start the appended span with a black IDR (default: all P_Skip)")
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(),
+			`hi264-mp4-extend — extend a fragmented MP4 (CMAF) media segment with empty frames.
+
+Reads <init.mp4> for SPS/PPS and frame dimensions, reads <in.m4s> for the
+existing samples and timing, and writes <out.m4s> as a single fragment
+containing all the input samples followed by N appended frames at the
+same per-sample duration. By default the appended frames are P_Skip
+copies of the source's last reference picture (a freeze). With
+-black-idr the first appended frame is a black IDR (POC reset) and the
+rest are P_Skip copies of that IDR.
+
+The output is a self-contained media segment to be played alongside the
+init segment, e.g.
+
+    cat init.mp4 out.m4s | ffplay -i -
+
+Constraints: the init segment has exactly one track, as in CMAF; SPS
+pic_order_cnt_type must be 0 or 2 (type 1 unsupported); 8-bit 4:2:0;
+progressive only.
+
+Usage:
+  hi264-mp4-extend -frames N [-black-idr] <init.mp4> <in.m4s> <out.m4s>
+
+Flags:`)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 3 {
+		fs.Usage()
+		return fmt.Errorf("expected 3 positional arguments, got %d", fs.NArg())
+	}
+	if *frames == 0 {
+		return fmt.Errorf("-frames must be a positive integer")
+	}
+	return extendSegment(fs.Arg(0), fs.Arg(1), fs.Arg(2), uint32(*frames), *blackIDR)
+}
+
+// extendSegment is the core operation. It is exported package-internal so
+// tests can drive it without going through the flag parser.
+func extendSegment(initPath, inSegPath, outSegPath string, count uint32, blackIDR bool) error {
+	initParsed, err := decodeFile(initPath)
+	if err != nil {
+		return fmt.Errorf("read init segment: %w", err)
+	}
+	if initParsed.Init == nil {
+		return fmt.Errorf("init segment missing (no ftyp+moov)")
+	}
+	trak, err := onlyTrack(initParsed.Init)
+	if err != nil {
+		return fmt.Errorf("read init segment: %w", err)
+	}
+	sps, pps, err := extractSPSPPS(trak)
+	if err != nil {
+		return fmt.Errorf("read SPS/PPS from init: %w", err)
+	}
+
+	segParsed, err := decodeFile(inSegPath)
+	if err != nil {
+		return fmt.Errorf("read media segment: %w", err)
+	}
+	if len(segParsed.Segments) == 0 {
+		return fmt.Errorf("input segment has no fragments (no moof+mdat)")
+	}
+
+	sampleDur := lastSampleDuration(segParsed)
+	if sampleDur == 0 {
+		return fmt.Errorf("could not determine sample duration from input segment")
+	}
+
+	ext, err := encode.NewPSkipExtender(sps, pps)
+	if err != nil {
+		return fmt.Errorf("prepare extension: %w", err)
+	}
+	// Every parameter set in the init segment, so that slices referencing any of them parse.
+	for _, nalu := range parameterSets(trak) {
+		if err := ext.ObserveNALU(nalu); err != nil {
+			return fmt.Errorf("inspect init segment: %w", err)
+		}
+	}
+
+	var inputSamples []mp4.FullSample
+	for _, seg := range segParsed.Segments {
+		for _, frag := range seg.Fragments {
+			samples, err := frag.GetFullSamples(nil)
+			if err != nil {
+				return fmt.Errorf("read input samples: %w", err)
+			}
+			for _, s := range samples {
+				if err := ext.ObserveAVCCSample(s.Data); err != nil {
+					return fmt.Errorf("inspect input sample: %w", err)
+				}
+			}
+			inputSamples = append(inputSamples, samples...)
+		}
+	}
+	// The appended frames continue with the parameter sets of the last input slice, which need not
+	// be the first ones in the init segment.
+	sps, pps = ext.ParameterSets()
+	width := int(sps.Width)
+	height := int(sps.Height)
+
+	newSamples := make([]mp4.FullSample, 0, count)
+	nextDecodeTime := nextDecodeTimeAfter(segParsed)
+	remaining := count
+
+	// If the source SPS signals pic_struct_present_flag (and no HRD), continue
+	// its pic_timing SEI timecodes onto the appended frames. HRD streams need
+	// CPB/DPB delay continuation, which is not yet supported, so SEIs are
+	// omitted there.
+	ptCfg := encode.PicTimingConfigFromSPS(sps)
+	emitPicTiming := ptCfg.PicStructPresent && ptCfg.HRD == nil
+	if ptCfg.PicStructPresent && ptCfg.HRD != nil {
+		fmt.Fprintln(os.Stderr, "note: source signals HRD parameters; "+
+			"pic_timing SEI omitted on appended frames (HRD timing not yet supported)")
+	}
+	timescale := mediaTimescale(trak)
+
+	if blackIDR {
+		blackY := uint8(16)
+		if sps.VUI != nil && sps.VUI.VideoFullRangeFlag {
+			blackY = 0
+		}
+		grid, colors := yuv.SolidGrid(width, height, yuv.Color{Y: blackY, Cb: 128, Cr: 128})
+		plane, err := yuv.GridToPlaneGrid(grid, colors)
+		if err != nil {
+			return fmt.Errorf("build black plane: %w", err)
+		}
+		idrAnnexB, err := encode.GenerateIDRWithSPSPPS(encode.EncodeParams{
+			Width:  width,
+			Height: height,
+			QP:     26,
+		}, sps, pps, plane, 0)
+		if err != nil {
+			return fmt.Errorf("encode black IDR: %w", err)
+		}
+		if emitPicTiming {
+			if idrAnnexB, err = prependPicTiming(ptCfg, idrAnnexB, nextDecodeTime, sampleDur, timescale); err != nil {
+				return fmt.Errorf("black IDR pic_timing: %w", err)
+			}
+		}
+		nalu := avc.ConvertByteStreamToNaluSample(idrAnnexB)
+		newSamples = append(newSamples, mp4.FullSample{
+			Sample: mp4.Sample{
+				Flags: mp4.SyncSampleFlags,
+				Dur:   sampleDur,
+				Size:  uint32(len(nalu)),
+			},
+			DecodeTime: nextDecodeTime,
+			Data:       nalu,
+		})
+		nextDecodeTime += uint64(sampleDur)
+		// Feeding the IDR back in resets the tracked numbering, as it does in a decoder.
+		if err := ext.ObserveAnnexB(idrAnnexB); err != nil {
+			return fmt.Errorf("track black IDR: %w", err)
+		}
+		remaining--
+	}
+
+	for i := uint32(0); i < remaining; i++ {
+		pSkipAnnexB, err := ext.NextSlice()
+		if err != nil {
+			return fmt.Errorf("encode P_Skip %d: %w", i, err)
+		}
+		if emitPicTiming {
+			pSkipAnnexB, err = prependPicTiming(ptCfg, pSkipAnnexB, nextDecodeTime, sampleDur, timescale)
+			if err != nil {
+				return fmt.Errorf("P_Skip %d pic_timing: %w", i, err)
+			}
+		}
+		nalu := avc.ConvertByteStreamToNaluSample(pSkipAnnexB)
+		newSamples = append(newSamples, mp4.FullSample{
+			Sample: mp4.Sample{
+				Flags: mp4.NonSyncSampleFlags,
+				Dur:   sampleDur,
+				Size:  uint32(len(nalu)),
+			},
+			DecodeTime: nextDecodeTime,
+			Data:       nalu,
+		})
+		nextDecodeTime += uint64(sampleDur)
+	}
+
+	// Write a single fragment containing all original samples followed by
+	// the appended ones.
+	out, err := os.Create(outSegPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", outSegPath, err)
+	}
+	seqNum := firstSeqNum(segParsed)
+	frag, err := mp4.CreateFragment(seqNum, trak.Tkhd.TrackID)
+	if err != nil {
+		out.Close()
+		return fmt.Errorf("create fragment: %w", err)
+	}
+	for _, s := range inputSamples {
+		frag.AddFullSample(s)
+	}
+	for _, s := range newSamples {
+		frag.AddFullSample(s)
+	}
+	newSeg := mp4.NewMediaSegment()
+	newSeg.AddFragment(frag)
+	if err := newSeg.Encode(out); err != nil {
+		out.Close()
+		return fmt.Errorf("write %s: %w", outSegPath, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", outSegPath, err)
+	}
+
+	mode := "P_Skip"
+	if blackIDR {
+		mode = "black IDR + P_Skip"
+	}
+	fmt.Printf("appended %d sample(s) (%s, dur=%d each) → %s\n",
+		len(newSamples), mode, sampleDur, outSegPath)
+	return nil
+}
+
+// decodeFile reads an MP4 file fully into memory and parses it. Reading
+// fully avoids any risk of mp4ff's lazy mdat loading hitting a closed file
+// later when callers walk the parsed structure.
+func decodeFile(path string) (*mp4.File, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return mp4.DecodeFile(bytes.NewReader(data))
+}
+
+// onlyTrack returns the track of the init segment, which must have exactly one, as a CMAF header
+// has. The output fragment gets its track ID.
+func onlyTrack(init *mp4.InitSegment) (*mp4.TrakBox, error) {
+	if init.Moov == nil {
+		return nil, fmt.Errorf("no moov")
+	}
+	if n := len(init.Moov.Traks); n != 1 {
+		return nil, fmt.Errorf("%d tracks, want exactly 1", n)
+	}
+	trak := init.Moov.Traks[0]
+	if trak.Tkhd == nil {
+		return nil, fmt.Errorf("track has no tkhd")
+	}
+	return trak, nil
+}
+
+func extractSPSPPS(trak *mp4.TrakBox) (*avc.SPS, *avc.PPS, error) {
+	stsd := sampleDescription(trak)
+	if stsd == nil {
+		return nil, nil, fmt.Errorf("track has no stsd")
+	}
+	for _, child := range stsd.Children {
+		e, ok := child.(*mp4.VisualSampleEntryBox)
+		if !ok || e.AvcC == nil {
+			continue
+		}
+		if len(e.AvcC.SPSnalus) == 0 || len(e.AvcC.PPSnalus) == 0 {
+			return nil, nil, fmt.Errorf("avcC has no SPS/PPS")
+		}
+		// The first PPS and the SPS it refers to, which need not be the first SPS.
+		spsMap := make(map[uint32]*avc.SPS, len(e.AvcC.SPSnalus))
+		for _, nalu := range e.AvcC.SPSnalus {
+			sps, err := avc.ParseSPSNALUnit(nalu, true)
+			if err != nil {
+				return nil, nil, fmt.Errorf("parse SPS: %w", err)
+			}
+			spsMap[sps.ParameterID] = sps
+		}
+		pps, err := avc.ParsePPSNALUnit(e.AvcC.PPSnalus[0], spsMap)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse PPS: %w", err)
+		}
+		sps, ok := spsMap[pps.SeqParameterSetID]
+		if !ok {
+			return nil, nil, fmt.Errorf("PPS %d refers to SPS %d, which avcC lacks",
+				pps.PicParameterSetID, pps.SeqParameterSetID)
+		}
+		return sps, pps, nil
+	}
+	return nil, nil, fmt.Errorf("track has no AVC sample entry")
+}
+
+// parameterSets returns the SPS and PPS NALUs of every AVC sample entry of the track, the SPSs
+// first, since a PPS refers to one.
+func parameterSets(trak *mp4.TrakBox) [][]byte {
+	stsd := sampleDescription(trak)
+	if stsd == nil {
+		return nil
+	}
+	var sps, pps [][]byte
+	for _, child := range stsd.Children {
+		e, ok := child.(*mp4.VisualSampleEntryBox)
+		if !ok || e.AvcC == nil {
+			continue
+		}
+		sps = append(sps, e.AvcC.SPSnalus...)
+		pps = append(pps, e.AvcC.PPSnalus...)
+	}
+	return append(sps, pps...)
+}
+
+// sampleDescription returns the stsd box of a track, or nil when the track lacks it or a box above it.
+func sampleDescription(trak *mp4.TrakBox) *mp4.StsdBox {
+	if trak.Mdia == nil || trak.Mdia.Minf == nil || trak.Mdia.Minf.Stbl == nil {
+		return nil
+	}
+	return trak.Mdia.Minf.Stbl.Stsd
+}
+
+func lastSampleDuration(file *mp4.File) uint32 {
+	var dur uint32
+	for _, seg := range file.Segments {
+		for _, frag := range seg.Fragments {
+			samples, err := frag.GetFullSamples(nil)
+			if err != nil {
+				continue
+			}
+			for _, s := range samples {
+				if s.Dur != 0 {
+					dur = s.Dur
+				}
+			}
+		}
+	}
+	return dur
+}
+
+func nextDecodeTimeAfter(file *mp4.File) uint64 {
+	var t uint64
+	for _, seg := range file.Segments {
+		for _, frag := range seg.Fragments {
+			samples, err := frag.GetFullSamples(nil)
+			if err != nil || len(samples) == 0 {
+				continue
+			}
+			last := samples[len(samples)-1]
+			t = last.DecodeTime + uint64(last.Dur)
+		}
+	}
+	return t
+}
+
+// firstSeqNum returns the sequence_number of the first fragment in the
+// input, so the output keeps the same identity as the input segment.
+func firstSeqNum(file *mp4.File) uint32 {
+	for _, seg := range file.Segments {
+		for _, frag := range seg.Fragments {
+			if frag.Moof != nil && frag.Moof.Mfhd != nil {
+				return frag.Moof.Mfhd.SequenceNumber
+			}
+		}
+	}
+	return 1
+}
+
+// mediaTimescale returns the media (mdhd) timescale of the track, in units
+// per second. Used to map sample decode times to wall-clock timecodes.
+func mediaTimescale(trak *mp4.TrakBox) uint32 {
+	if trak.Mdia == nil || trak.Mdia.Mdhd == nil {
+		return 0
+	}
+	return trak.Mdia.Mdhd.Timescale
+}
+
+// prependPicTiming prepends a pic_timing SEI NALU to an Annex-B access unit. The
+// timecode is derived from the sample's decode time, the per-sample duration,
+// and the media timescale (fps = round(timescale/sampleDur)). The SEI precedes
+// the slice in the access unit. Returns the input unchanged if timing cannot be
+// derived (zero duration or timescale).
+func prependPicTiming(cfg encode.PicTimingConfig, sliceAnnexB []byte,
+	decodeTime uint64, sampleDur, timescale uint32) ([]byte, error) {
+	if sampleDur == 0 || timescale == 0 {
+		return sliceAnnexB, nil
+	}
+	fps := int((timescale + sampleDur/2) / uint32(sampleDur))
+	if fps <= 0 {
+		return sliceAnnexB, nil
+	}
+	frameIdx := int(decodeTime / uint64(sampleDur))
+	h, m, s, fr := yuv.TimecodeComponents(frameIdx, fps)
+	seiNALU, err := encode.GeneratePicTimingSEI(cfg, encode.PicTiming{
+		Hours: uint8(h), Minutes: uint8(m), Seconds: uint8(s), Frames: uint8(fr),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(seiNALU)+len(sliceAnnexB))
+	out = append(out, seiNALU...)
+	out = append(out, sliceAnnexB...)
+	return out, nil
+}
