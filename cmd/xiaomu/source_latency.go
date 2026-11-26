@@ -1,0 +1,329 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/arixbit/xiaomu-desktop/internal/library"
+	"github.com/arixbit/xiaomu-desktop/internal/source"
+)
+
+// latencyStoreLimit is how many sites keep a measured latency. A depot
+// holds at most a few hundred sites, so the file stays small and the
+// oldest measurements go away instead of piling up.
+const latencyStoreLimit = 256
+
+// latencyEntry is one site's last measured wait, and when it was measured.
+// The key is the site's Entry.Key(): the configuration it came from plus
+// its own key, API and extension — stable across restarts and titles for
+// the same site, and the same site measured while searching another title
+// still counts.
+type latencyEntry struct {
+	Ms int64     `json:"ms"`
+	At time.Time `json:"at"`
+}
+
+// latencyStore keeps per-site latencies, only on this Mac. It never holds
+// a config URL or a media address — the key is a site identity, and the
+// file lives beside the saved source, like the search history.
+type latencyStore struct {
+	writer  *latencyWriter
+	entries map[string]latencyEntry
+	path    string
+}
+
+// record saves a fresh measurement: the write goes first, so a failed
+// save cannot appear saved, and the oldest entry goes when the store
+// is full. A measurement of zero or less is not a measurement — a
+// cached reply, for example, never reaches here.
+func (s *latencyStore) record(key string, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	kept := map[string]latencyEntry{}
+	for k, e := range s.entries {
+		kept[k] = e
+	}
+	if _, ok := kept[key]; !ok && len(kept) >= latencyStoreLimit {
+		oldest, at := "", time.Time{}
+		for k, e := range kept {
+			if at.IsZero() || e.At.Before(at) {
+				oldest, at = k, e.At
+			}
+		}
+		delete(kept, oldest)
+	}
+	kept[key] = newLatencyEntry(d)
+	if s.path != "" {
+		if err := writeJSONFile(s.path, kept); err != nil {
+			return err
+		}
+	}
+	s.entries = kept
+	return nil
+}
+
+// get returns a site's last measured latency, if one was ever recorded.
+func (s *latencyStore) get(key string) (time.Duration, bool) {
+	if s.entries == nil {
+		return 0, false
+	}
+	e, ok := s.entries[key]
+	if !ok || e.Ms <= 0 {
+		return 0, false
+	}
+	return time.Duration(e.Ms) * time.Millisecond, true
+}
+
+// snapshot returns an immutable copy of positive site latencies for scan scheduling.
+func (s *latencyStore) snapshot() map[string]time.Duration {
+	if len(s.entries) == 0 {
+		return nil
+	}
+	out := make(map[string]time.Duration, len(s.entries))
+	for k, e := range s.entries {
+		if e.Ms > 0 {
+			out[k] = time.Duration(e.Ms) * time.Millisecond
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func readLatency(path string) (map[string]latencyEntry, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var entries map[string]latencyEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("读取测速记录：%w", err)
+	}
+	return entries, nil
+}
+
+func (a *app) restoreLatency() {
+	sourcePath, err := savedSourcePath()
+	if err != nil {
+		return
+	}
+	a.latency.path = filepath.Join(filepath.Dir(sourcePath), "source-latency.json")
+	entries, err := readLatency(a.latency.path)
+	if err != nil {
+		a.status = err.Error()
+		return
+	}
+	a.latency.entries = entries
+}
+
+// formatLatency is the latency shown on a source card: milliseconds
+// below a second, one decimal above it. Nothing is shown for a source
+// that was never measured.
+func formatLatency(d time.Duration) string {
+	if d >= time.Second {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return fmt.Sprintf("%dms", d.Milliseconds())
+}
+
+// sourceSpeedTest is one manual re-measurement of every site on the
+// sources page. It runs beside the UI, like the discovery refresh:
+// workers measure, and the UI thread records, so a slow site never
+// blocks the page and the labels fill in as results arrive.
+type sourceSpeedTest struct {
+	cancel     context.CancelFunc
+	generation uint64
+	running    bool
+	done       int
+	total      int
+	okCount    int
+	failCount  int
+}
+
+// speedTestEntries is every supported site the sources page lists, each
+// once by its latency key. Unsupported sites are skipped, as the page
+// skips them.
+func (a *app) speedTestEntries() []library.Entry {
+	seen := map[string]bool{}
+	var entries []library.Entry
+	for _, document := range a.library.documents {
+		for _, site := range document.doc.Sites {
+			if site.Kind.Unsupported() {
+				continue
+			}
+			entry := library.Entry{Site: site, Config: document.doc, Line: document.line}
+			if seen[entry.Key()] {
+				continue
+			}
+			seen[entry.Key()] = true
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// measureSite is one site answering: open it and close it again. For a
+// CMS site that is one list request; for a script site it is the
+// engine load and home call a search would do anyway. A site that does
+// not answer within the timeout measures nothing, and a failed open
+// records nothing — the same rule as a failed detail read.
+func measureSite(ctx context.Context, entry library.Entry, assets string) time.Duration {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	release, err := source.AcquireBackground(ctx)
+	if err != nil {
+		return 0
+	}
+	defer release()
+	start := time.Now()
+	session, _, err := source.Open(ctx, entry.Site, assets)
+	if err != nil {
+		return 0
+	}
+	session.Close()
+	return answered(start)
+}
+
+// answered is how long a request that did answer took. Windows' clock
+// can read zero for a quick local reply; an answer still took time, and
+// zero means "no answer" to the callers.
+func answered(start time.Time) time.Duration {
+	return max(time.Since(start), time.Nanosecond)
+}
+
+// newLatencyEntry stores a measurement in whole milliseconds; a reply
+// under 1ms stays a measurement instead of reading as none.
+func newLatencyEntry(d time.Duration) latencyEntry {
+	return latencyEntry{Ms: max(d.Milliseconds(), 1), At: time.Now()}
+}
+
+type speedTestResult struct {
+	entry library.Entry
+	d     time.Duration
+}
+
+// startSourceSpeedTest re-measures every site on the sources page, one
+// measurement per site per press. Four workers bound the network work,
+// as the library scan does; the button stays disabled until the last
+// site answers or times out.
+func (a *app) cancelSourceSpeedTest() {
+	s := &a.speedTest
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.generation++
+	s.running = false
+}
+
+func (a *app) startSourceSpeedTest() {
+	if a.closed || a.speedTest.running || a.library.root == nil {
+		return
+	}
+	entries := a.speedTestEntries()
+	if len(entries) == 0 {
+		a.setNotice("当前还没有可测速的站点")
+		return
+	}
+	a.cancelSourceSpeedTest()
+	ctx, cancel := context.WithCancel(a.libraryContext())
+	a.speedTest.cancel = cancel
+	generation := a.speedTest.generation
+	a.speedTest.running, a.speedTest.done, a.speedTest.total = true, 0, len(entries)
+	a.speedTest.okCount, a.speedTest.failCount = 0, 0
+	assets := strings.TrimSpace(a.browser.assets)
+	dispatch := a.dispatch
+	update := func(fn func()) {
+		guarded := func() {
+			if !a.closed && a.speedTest.generation == generation {
+				fn()
+			}
+		}
+		if dispatch == nil {
+			guarded()
+		} else {
+			dispatch(guarded)
+		}
+	}
+	work := func() {
+		defer cancel()
+		jobs := make(chan library.Entry)
+		results := make(chan speedTestResult, 4)
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for entry := range jobs {
+					if ctx.Err() != nil {
+						return
+					}
+					result := speedTestResult{entry: entry, d: measureSite(ctx, entry, assets)}
+					select {
+					case <-ctx.Done():
+						return
+					case results <- result:
+					}
+				}
+			})
+		}
+		go func() {
+			defer close(jobs)
+			for _, entry := range entries {
+				if ctx.Err() != nil {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case jobs <- entry:
+				}
+			}
+		}()
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+		for r := range results {
+			if ctx.Err() != nil {
+				continue
+			}
+			r := r
+			update(func() {
+				key := r.entry.Key()
+				if r.d > 0 {
+					a.recordLatency(key, r.d)
+					a.markSiteHealthy(key)
+					a.speedTest.okCount++
+				} else {
+					a.markSiteFailed(key)
+					a.speedTest.failCount++
+				}
+				a.speedTest.done++
+				if a.speedTest.done >= a.speedTest.total {
+					a.speedTest.running = false
+					a.speedTest.cancel = nil
+					if a.speedTest.failCount == 0 {
+						a.setNotice(fmt.Sprintf("测速完成，%d 个站点均可用", a.speedTest.okCount))
+					} else {
+						a.setNotice(fmt.Sprintf("测速完成：%d 个可用，%d 个失效", a.speedTest.okCount, a.speedTest.failCount))
+					}
+				}
+			})
+		}
+	}
+	if dispatch == nil {
+		work()
+	} else {
+		go work()
+	}
+}
