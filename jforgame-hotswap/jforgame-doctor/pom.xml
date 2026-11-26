@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<project
+        xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd"
+        xmlns="http://maven.apache.org/POM/4.0.0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>io.github.jforgame</groupId>
+        <artifactId>jforgame-hotswap</artifactId>
+        <version>${revision}</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>jforgame-doctor</artifactId>
+    <name>jforgame-doctor</name>
+    <description>jforgame hostswap util</description>
+
+    <dependencies>
+        <!-- tools.jar dependency; no external import is needed on jdk9+,
+         so the optional flag is used here. On jdk8 and below, client code must add it manually -->
+        <dependency>
+            <groupId>com.github.olivergondza</groupId>
+            <artifactId>maven-jdk-tools-wrapper</artifactId>
+            <version>0.1</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+
+</project>

@@ -1,0 +1,55 @@
+package jforgame.socket.core.dispatch;
+
+import jforgame.socket.core.session.IdSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * This class provides a skeletal implementation of {@link SocketIoDispatcher}.
+ * It enhances the {@link SocketIoDispatcher#dispatch(IdSession, RequestContext)} method in a chain pattern.
+ * Each ChainedMessageDispatcher may have multiple message handler nodes.
+ * When a message is passed to a message handler, the handler can choose to pass the message to the next node or stop the message propagation.
+ *
+ * @see IoMessageFilter#filter(IdSession, RequestContext)
+ */
+public abstract class ChainedMessageDispatcher implements SocketIoDispatcher {
+
+    protected Logger logger = LoggerFactory.getLogger(getClass());
+
+    /**
+     * Chain of message handlers
+     * Iterates through handlers in the chain, stops and returns if any handler returns false
+     */
+    protected List<IoMessageFilter> dispatchChain = new ArrayList<>();
+
+    /**
+     * Adds a message filter to the end of the current chain
+     * @param filter message handler
+     */
+    public void addIoFilter(IoMessageFilter filter) {
+        this.dispatchChain.add(filter);
+    }
+
+    @Override
+    public void dispatch(IdSession session, RequestContext context) {
+        for (IoMessageFilter ioMessageFilter : dispatchChain) {
+            try {
+                if (!ioMessageFilter.filter(session, context)) {
+                    break;
+                }
+            } catch (Exception e) {
+                logger.error("", e);
+                break;
+            }
+        }
+    }
+
+    @Override
+    public void exceptionCaught(IdSession session, Throwable cause) {
+        logger.error("", cause);
+    }
+
+}

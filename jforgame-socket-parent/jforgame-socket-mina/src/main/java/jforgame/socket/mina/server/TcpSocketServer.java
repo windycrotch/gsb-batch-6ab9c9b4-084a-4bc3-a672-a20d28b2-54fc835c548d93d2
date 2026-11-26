@@ -1,0 +1,95 @@
+package jforgame.socket.mina.server;
+
+import jforgame.codec.MessageCodec;
+import jforgame.socket.mina.DefaultProtocolCodecFactory;
+import jforgame.socket.mina.DefaultSocketIoHandler;
+import jforgame.socket.core.dispatch.ChainedMessageDispatcher;
+import jforgame.socket.core.net.HostAndPort;
+import jforgame.socket.core.server.ServerNode;
+import jforgame.socket.core.protocol.message.MessageFactory;
+import org.apache.mina.core.buffer.IoBuffer;
+import org.apache.mina.core.buffer.SimpleBufferAllocator;
+import org.apache.mina.core.filterchain.DefaultIoFilterChainBuilder;
+import org.apache.mina.core.service.SimpleIoProcessorPool;
+import org.apache.mina.filter.codec.ProtocolCodecFactory;
+import org.apache.mina.filter.codec.ProtocolCodecFilter;
+import org.apache.mina.transport.socket.DefaultSocketSessionConfig;
+import org.apache.mina.transport.socket.SocketAcceptor;
+import org.apache.mina.transport.socket.nio.NioProcessor;
+import org.apache.mina.transport.socket.nio.NioSession;
+import org.apache.mina.transport.socket.nio.NioSocketAcceptor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.InetSocketAddress;
+import java.util.List;
+
+/**
+ * TCP protocol Socket server
+ */
+public class TcpSocketServer implements ServerNode {
+
+    private final Logger logger = LoggerFactory.getLogger(TcpSocketServer.class);
+
+    private static final int CPU_CORE_SIZE = Runtime.getRuntime().availableProcessors();
+
+    private static final SimpleIoProcessorPool<NioSession> pool =
+            new SimpleIoProcessorPool<>(NioProcessor.class, CPU_CORE_SIZE);
+
+    protected SocketAcceptor acceptor;
+
+    protected List<HostAndPort> nodesConfig;
+
+    protected MessageFactory messageFactory;
+
+    protected MessageCodec messageCodec;
+
+    protected ProtocolCodecFactory protocolCodecFactory;
+
+    protected ChainedMessageDispatcher socketIoDispatcher;
+
+    protected int maxProtocolSize;
+
+    /**
+     * start Mina socket server
+     *
+     * @throws Exception
+     */
+    @Override
+    public void start() throws Exception {
+        IoBuffer.setUseDirectBuffer(false);
+        IoBuffer.setAllocator(new SimpleBufferAllocator());
+
+        acceptor = new NioSocketAcceptor(pool);
+        acceptor.setReuseAddress(true);
+        acceptor.getSessionConfig().setAll(new DefaultSocketSessionConfig());
+
+        DefaultIoFilterChainBuilder filterChain = acceptor.getFilterChain();
+
+        if (protocolCodecFactory != null) {
+            filterChain.addLast("codec",
+                    new ProtocolCodecFilter(protocolCodecFactory));
+        } else {
+            filterChain.addLast("codec",
+                    new ProtocolCodecFilter(new DefaultProtocolCodecFactory(messageFactory, messageCodec, maxProtocolSize)));
+        }
+
+        // Specify business logic handler
+        acceptor.setHandler(new DefaultSocketIoHandler(socketIoDispatcher));
+
+        for (HostAndPort node : nodesConfig) {
+            logger.info("socket server is listening at {}......", node.getPort());
+            acceptor.bind(new InetSocketAddress(node.getPort()));
+        }
+    }
+
+    @Override
+    public void shutdown() throws Exception {
+        if (acceptor != null) {
+            acceptor.unbind();
+            acceptor.dispose();
+        }
+        logger.info("socket server stop successfully");
+    }
+
+}

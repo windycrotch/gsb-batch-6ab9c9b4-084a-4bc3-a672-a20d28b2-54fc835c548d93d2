@@ -1,0 +1,31 @@
+package jforgame.socket.mina.client;
+
+import jforgame.socket.core.client.CallBackService;
+import jforgame.socket.core.client.RpcResponseData;
+import jforgame.socket.mina.DefaultSocketIoHandler;
+import jforgame.socket.core.dispatch.SocketIoDispatcher;
+import jforgame.socket.core.protocol.message.RequestDataFrame;
+import org.apache.mina.core.session.IoSession;
+/**
+ * Default client SocketIoHandler
+ */
+public class CallbackHandler extends DefaultSocketIoHandler {
+    public CallbackHandler(SocketIoDispatcher messageDispatcher) {
+        super(messageDispatcher);
+    }
+
+    @Override
+    public void messageReceived(IoSession session, Object frame) throws Exception {
+        RequestDataFrame dataFrame = (RequestDataFrame) frame;
+        Object message = dataFrame.getMessage();
+        int msgIndex = dataFrame.getHeader().getIndex();
+        if (msgIndex > 0) {
+            RpcResponseData responseData = new RpcResponseData();
+            responseData.setResponse(message);
+            CallBackService.getInstance().fillCallBack(msgIndex, responseData);
+        } else {
+            // pass the message to the next handler
+            super.messageReceived(session, dataFrame);
+        }
+    }
+}

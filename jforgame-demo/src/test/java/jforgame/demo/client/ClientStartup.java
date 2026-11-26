@@ -1,0 +1,82 @@
+
+package jforgame.demo.client;
+
+import jforgame.codec.struct.StructCodec;
+import jforgame.commons.util.JsonUtil;
+import jforgame.demo.ServerConfig;
+import jforgame.demo.framework.socket.GameMessageFactory;
+import jforgame.demo.game.hello.ReqHello;
+import jforgame.demo.game.hello.ResHello;
+import jforgame.socket.core.client.RequestCallback;
+import jforgame.socket.core.client.RpcMessageClient;
+import jforgame.socket.core.client.SocketClient;
+import jforgame.socket.core.dispatch.RequestContext;
+import jforgame.socket.core.dispatch.SocketIoDispatcher;
+import jforgame.socket.core.dispatch.SocketIoDispatcherAdapter;
+import jforgame.socket.core.net.HostAndPort;
+import jforgame.socket.core.session.IdSession;
+import jforgame.socket.netty.client.WebSocketClient;
+
+/**
+ * 客户端模拟器启动程序
+ */
+public class ClientStartup {
+
+    public static void main(String[] args) throws Exception {
+        int serverPort = ServerConfig.getInstance().getServerPort();
+        HostAndPort hostPort = new HostAndPort();
+        hostPort.setHost("127.0.0.1");
+        hostPort.setPort(serverPort);
+
+        SocketIoDispatcher msgDispatcher = new SocketIoDispatcherAdapter() {
+            @Override
+            public void dispatch(IdSession session, RequestContext context) {
+                Object message = context.getRequest();
+                System.err.println("收到消息<-- " + message.getClass().getSimpleName() + "=" + JsonUtil.object2String(message));
+            }
+
+            @Override
+            public void exceptionCaught(IdSession session, Throwable cause) {
+                cause.printStackTrace();
+            }
+        };
+
+        SocketClient socketClient = new WebSocketClient(msgDispatcher, GameMessageFactory.getInstance(), new StructCodec(), 1, hostPort, "ws://127.0.0.1:" + serverPort + "/ws");
+        IdSession session = socketClient.openSession();
+
+        ClientPlayer robot = new ClientPlayer(session);
+        robot.login();
+
+        ResHello response = (ResHello) RpcMessageClient.request(session, new ReqHello());
+        System.out.println("rpc 消息同步调用");
+        System.out.println(response);
+
+        RpcMessageClient.callBack(session, new ReqHello(), new RequestCallback() {
+            @Override
+            public void onSuccess(Object callBack) {
+                System.err.println("rpc 消息异步调用");
+                ResHello response = (ResHello) callBack;
+                System.err.println(response);
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                System.out.println("----onError");
+                error.printStackTrace();
+            }
+        });
+
+        // future可以实现嵌套调用，避免“回调地狱”
+        RpcMessageClient.future(session, new ReqHello()).thenCompose(o -> {
+            ResHello response2 = (ResHello) o;
+            System.out.println("rpc 消息future调用");
+            System.out.println(response2);
+            return RpcMessageClient.future(session, new ReqHello());
+        }).thenAccept(o -> {
+            System.out.println("rpc 消息future调用，继续处理");
+            ResHello response3 = (ResHello) o;
+            System.out.println(response3);
+        });
+    }
+
+}

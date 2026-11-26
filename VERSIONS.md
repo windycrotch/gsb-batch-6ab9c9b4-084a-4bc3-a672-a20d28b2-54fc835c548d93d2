@@ -1,0 +1,507 @@
+﻿# 版本发布规则
+
+对于发布的工具，遵循基本的版本规则，采用常用的三段式。即
+主版本号(Major version).次版本号(Minor version).修订号(Revision number)，如:1.2.3
+
+*主版本号: 版本的主要变更，通常添加重大特性，或者代码重构（无法向下兼容），会增加主版本号，如从1.x升级到2.x.  
+*次版本号: 版本的次要变更，修复bug或增加小特性会增加次版本号，尽量向下兼容，如从2.1升级到2.2. （部分版本可能涉及到类路径移动，会在版本文档进行说明） 
+*修订号: 版本的微小变更，通常修复bug或优化功能会增加修订号，如从2.2.1升级到2.2.2.
+
+# 版本更新说明
+
+## V1.0.0(2024-03-22)
+
+### jforgame-commons 
+    基本工具类
+
+### jforgame-socket-parent 
+    网络框架,netty+mina
+
+### jforgame-codec-parent 
+    消息编解码,protobuf+struct
+
+## V1.1.0(2024-03-29)
+
+### jforgame-hotswap 
+    新增代码热更模块
+
+### jforgame-socket-parent
+
+    新增线程模型接口ThreadModel及其实现DispatchThreadModel
+    新增消息处理器注册中心CommonMessageHandlerRegister
+
+### jforgame-socket-netty
+
+    增加websocket简易实现
+
+### jforgame-codec-struct
+
+    消息javabean支持继承关系，允许编解码父类字段
+
+### jforgame-parent
+
+    所有子模块取消对log4j的全局依赖,log层只绑定sl4j接口
+
+## V1.2.0(2024-06-16)
+
+### jforgame-socket-netty
+
+    TcpSocketServerBuilder的protocolEncoder改为单例模式，所有客户端共享
+
+### jforgame-doctor
+
+    增加對jdk17及以上版本的支持
+
+### jforgame-data
+
+    新增加策划配置数据读取工具，支持csv/excel格式，允许数据按id查询，按索引查询，支持数据热更新(此版本不推荐使用，直接升级到2.x)
+
+## V2.0.0(2024-08-01), api变动！！网关客户端代码需要稍微修改
+
+### jforgame-socket
+
+    修改私有协议栈格式，消息头增加一个index字段，保存客户端的消息序号。
+    删除Traceable接口，客户端回调id直接使用上面的消息序号。
+    注：消息序号不是每个项目都需要，在每个消息增加这样的字段，会导致每个消息多出4个字段的长度。一开始设计是拒绝的，但底层设计不应过于严格，应尽量宽容。
+       就像消息类型cmd字段，其实在很多项目里直接申明为short（3w+）也足够用。当然，int的长度允许业务为各种类型进行分段分类。还是那个词，宽容！
+       如果实在介意消息序号，或者消息长度，或者需要支持压缩，加密啥的，底层无法做到面面俱到，用户可以参考DefaultProtocolDecoder/DefaultProtocolEncoder,设计自己的私有协议。
+       至于RequestDataFrame的MessageHeader类，接口参数及返回值都是int类型，但编辑码层面仍可选择short等类型，节省网络流量。至于应用程序方面的内存消耗，这些消息属于“短命小对象”，对GC影响甚微。
+
+### jforgame-socket-netty
+
+    websocket支持BinaryWebSocketFrame
+
+### jforgame-socket-mina
+
+    升级mina-core版本： from 2.0.7 to 2.0.22, 去掉mina-http依赖
+
+### jforgame-data
+
+    jforgame-data更名为jforgame-data-spring-boot-starter
+    修复DataManager注入失败bug
+    PTable重命名为DataTable，增加name()方法用于重命名文件
+    Container支持使用子类，用于存储二级缓存
+
+## V2.1.1(2024-12-16)
+
+### jforgame-socket-api
+
+    消息处理器如果方法签名有返回值，则无须申明index字段
+
+### jforgame-socket-netty
+
+    修复bug：WebSocketServer二进制流只支持json编解码
+
+### jforgame-codec-struct
+
+    StructMessageCodec新增构造函数，用于设置编码最大字节长度
+
+### jforgame-runtime
+
+    新增模块，用于对应用程序的线程、CPU、内存、gc等数据进行监控
+
+## V2.2.2(2025-2-6)
+
+### jforgame-data
+
+    修复读取excel文件，如果首列数据为空导致数据错乱问题
+
+### jforgame-socket-api
+
+    IdSession类增加sendAndClose方法，用于在主动关闭session前做一些清尾通知
+
+### jforgame-socket-netty
+
+    WebSocketServerBuilder增加idleMilliSeconds参数，若XX时间没收到请求，则服务器主动断开session
+
+## V2.3.0(2025-6-21)
+
+### jforgame-commons
+
+    引入eventbus;DateUtil新增若干方法
+
+### jforgame-data-spring-boot-starter
+
+    excel配置读取改用FileSystemResource；完善表格读取异常日志；增加导出export选项
+
+### jforgame-socket-netty
+
+    websocket增加客户端工具
+
+## V2.4.0(2025-7-28)
+
+### jforgame-commons
+
+    增加trie树结构，用于实现脏词检测
+    增加persist工具，用于实现对象异步持久化
+    增加MethodCaller工具，基于句柄高性能反射工具
+    新增随机工具RandomUtil, RandomWeightPool
+
+### jforgame-socket-netty
+
+    增加websocket帧聚合器，处理大数据请求
+
+### jforgame-socket-parent
+
+    消息处理器使用方法句柄代替传统反射，大幅提升性能
+
+### jforgame-data-spring-boot-starter
+
+    ResourceAutoConfiguration类dataConversionService组件增加ConditionalOnMissingBean注解，允许用户自定义
+    引入DataValidator数据完整性验证，目前包括主键及自定义验证规则
+
+### jforgame-hotswap
+
+    修复无法热更新类的bug
+
+## V2.5.0(2025-9-7)
+
+### jforgame-orm
+
+    发布jforgame-orm工具，轻量级，专门为游戏服务器打造的orm工具，支持mysql, sqllite等关系型数据库
+
+### jforgame-doctor
+
+    修复JavaDoctor#hotSwap()返回值有误
+
+### jforgame-data
+
+    增加通用配置项，参考CommonData类，CommonConfig注解相关，通过注解直接引用策划配置项
+    org.apache.poi版本从4.1.1升到5.4.0， https://github.com/kingston-csj/jforgame/security/dependabot/34
+
+### jforgame-commons
+
+    新增DigestUtil，ZipUtil, TypeUtil几个工具类
+    LruHashMap优化; 修复QueueContainerGroup运行异常。
+
+### jforgame-socket
+
+    完善API文档
+
+### jforgame-socket-netty
+
+    修复WebSocketClient.openSession()方法，确保返回的IdSession是可用的
+
+### jforgame-socket-mina
+
+    mina版本从2.0.22升级到2.0.27， https://github.com/kingston-csj/jforgame/security/dependabot/33
+
+## V2.6.0(2025-10-12)
+
+### jforgame-commons
+
+    修复QueueContainerGroup#name字段显示为空。
+
+### jforgame-socket
+
+    修复MessageTask构造函数初始化问题
+    RpcMessageClient增加future请求模式
+    TcpSocketClient增加构造函数
+
+### jforgame-orm
+
+    优化SqlFactory的sql语句
+
+### jforgame-socket-netty
+
+    WebSocketServerBuilder增加maxProtocolBytes参数，用于设置最大协议字节数
+
+### jforgame-data
+
+    修复ExcelDataReader,CsvDataReader配置读取规则不统一。
+    配置bean支持继承关系，子类可以继承父类的配置字段
+
+## V3.0.0 api变动！！(2025-10-12)
+
+### jforgame-commons
+
+    新增util包，容纳所有工具类, Pair, Triple放到ds包下, FileUtils更名为FileUtil
+
+### jforgame-data
+
+    Container#init()更名为afterLoad(), getRecordsBy()更名为getRecordsByIndex(), getRecord()更名为getRecordById()
+
+### jforgame-orm
+
+    移除SchemaUpdate冗余类
+
+### jforgame-threadmodel
+
+    新增线程模型模块，包含两种实现：1.基于关键字分发模型；2.基于Actor模型
+
+### jforgame-socket
+
+    ServerNode迁移到server目录
+    WebSocketJsonFrame移到socket-api模块
+    ThreadModel相关接口迁移到threadmodel新模块
+    netty/mina 包路径去掉support层
+    MessageTask更名为ClientRequestTask，去掉dispatchKey字段
+    SocketIoDispatcher#dispatch()参数由RequestDataFrame变更为RequestContext，整合请求的所有上下文信息
+
+## V3.1.0(2025-12-1) (注意，涉及API类路径变动！！)
+
+### jforgame-socket
+
+    调整ServerNode的类路径(涉及API类路径变动！！)
+
+### jforgame-socket-netty
+
+    WebSocketServer增加参数fameType参数，用于设置websocket帧类型
+
+### jforgame-threadmodel
+
+    ThreadModel新增方法isShutdown()，用于判断线程池是否已关闭
+
+### jforgame-data
+
+    DataRepository新增方法queryByUniqueIndex(), 用于根据唯一索引查询单个记录
+    Container#inject()方法增加主键检查
+    Container增加#validate(DataRepository dataRepository)方法，允许容器进行关联数据校验
+
+### jforgame-commons
+
+    FileUtil新增checkAndCreateDirectory()方法，用于检查并创建目录
+
+### jforgame-hotswap
+
+    修复linux+jdk17热更新失败
+
+### jforgame-codec-struct
+
+    增加MapCodec，以支持字典字段
+
+## V3.2.0(2026-1-11)
+
+### jforgame-codec-struct
+
+    增加FieldIgnore注解，用于忽略字段序列化
+
+### jforgame-commons
+
+    修复NumberUtil#doubleValue()方法内部错误
+    增加schedule.parser包，用于解析游戏常用的自定义格式时间表达式
+    EventBus事件监听支持类继承关系，事件分发支持事件继承关系
+    修改MethodHandleUtils#createMethodCaller抛出的异常类型
+
+### jforgame-socket-api
+
+    新增Response类，作为客户端响应消息的基类
+
+### jforgame-data
+
+    DataManager修复非小写表名读取失败问题
+    修改ForeignKeyValidator触发的提示内容
+
+## V3.3.0(2026-3-14)
+
+### jforgame-data
+
+    修复TableDefinition采用继承关系的类数据源索引重复验证异常
+    增加JsonDataReader，用于读取json数据源
+    修复Container读取的数据记录无序
+
+### jforgame-threadmodel
+
+    增加拥有线程监控能力的增强版线程模型MonitoredDispatchThreadModel
+
+### jforgame-commons
+
+    jackson版本从2.16.1 升级到 2.18.6
+
+### jforgame-socket-struct
+
+    StructMessageCodec增加集合元素类型异构模式
+
+## V3.4.0(2026-5-3)
+
+### jforgame-commons
+
+    修复DelayContainer和QueueContainer并发修改bug
+    增加CronContainer基于cron表达式的持久化容器
+    修复LruHashMap#get()读写锁问题
+    DateUtil增加getDayDiffFromToday()来计算指定时间戳与今天相差的天数
+
+### jforgame-threadmodel
+
+    ActorSystemConfig增加queueCapacity字段，用于配置线程池队列
+    ActorSystem优化accept()方法性能
+
+### jforgame-codec-struct
+
+    内部增加一些运行期异常检测
+
+### jforgame-orm
+
+    SchemaStrategy#doExecute()改为由业务代码自行关闭连接库连接
+
+### jforgame-runtime
+
+    修复 ThreadSampler对“JVM 内部线程”CPU统计不准的问题
+    修复DiskFileSystemVo#usage()磁盘空间为0时异常
+
+## V3.5.0(2026-3-14)
+
+### jforgame-logger
+
+    新增日志系统，自动适配各种日志框架，为生产运营/监控提供日志服务
+
+### jforgame-socket-api
+
+    优化RpcMessageClient#request()内部逻辑
+
+### jforgame-socket-netty
+
+    websocket服务器对wspath带参数进行容错
+
+### jforgame-socket-mina
+
+    版本从2.0.27升至2.0.28
+
+### jforgame-orm
+
+    BeanProcessor#toBean和toBeanList方法内部自动执行BaseEntity#afterLoad()钩子    
+    修复BeanProcessor#toBean()没有处理对象继承的属性
+
+## V4.0.0 api变动！！(2026-7-20)
+
+### jforgame-data-spring-boot-starter
+
+    Container去掉#validate()无参方法
+    Container#validate(DataRepository dataRepository)签名增加DataValidator异常
+
+### jforgame-socket-core
+
+    jforgame-socket-api更名为jforgame-socket-core
+    新增加RequestScheduler抽象层
+    新增加RequestExecutionInterceptor, 为请求执行前后增加拦截器
+    删除ClientRequestMail和ClientRequestTask
+    代码目录结构调整
+    MessageExecuteUnit更名为MessageHandlerMethod
+    CallBackService#closeTimer()更名为shutdown()
+
+### jforgame-codec-struct
+
+    StructMessageCodec更名为StructCodec
+    ProtobufMessageCodec更名为ProtobufCodec
+    修复CollectionCodec2编码空集合时异常
+
+### jforgame-data-spring-boot-starter
+
+    拆分为jforgame-data业务模块和jforgame-data-spring-boot-starter装配模块
+    jforgame-data-spring-boot-starter更名为jforgame-data-spring-boot-starter
+
+### jforgame-threadmodel
+
+    ActorSystem移除actor时同步停用实例并清空邮箱
+    ActorSystem增加运行状态校验，系统关闭后拒绝新建actor和提交任务
+    ActorSystemConfig调整部署规则匹配策略，改为“精确匹配优先，其次最长前缀匹配”
+
+### jforgame-doctor
+
+    ClassFileMeta读取类名移除对org.ow2.as依赖，改为直接解析字节码
+
+### jforgame-orm
+
+    去掉entity主键字段必须是基本类型包装类的限制
+
+### jforgame-codec-json
+
+    新增基于json的消息编解码工具
+
+## V4.1.0 (2026-8-30)
+
+### jforgame-orm
+
+    entity字段允许使用基本类型，不强迫使用包装类
+    补充JPA注解关于Table#indexes联合索引的语义
+
+### jforgame-commons
+
+    TrieDictionary改为线程安全
+    优化DelayContainer和QueueContainer持久化容器， 增加通用容器组PersistContainerGroup
+    PersistContainer增加死信机制
+
+### jforgame-data
+    CommonData#key add @Index annotation
+    ResourceOptions add ignoreConfig attribute
+    ExcelDataReader对类型为公式的单元格，直接使用单元格缓存结果
+
+### jforgame-socket-netty
+
+    netty版本从4.1.107.Final升级到4.1.125.Final，精简netty的依赖包
+    websocket服务器支持自适应帧类型，frameType为0代表自动根据客户端上行编码类型选择编码方式
+    修复 websocket 数据分片聚合 bug，废弃jforgame.socket.netty.server.WebSocketFrameAggregator
+
+## V4.2.0到4.4.0 跳过版本
+
+
+## V4.5.0 (2026-10-11) (注意，涉及API类路径变动！！)
+
+### jforgame-data
+    增加TableDataLoader抽象层，支持数据库作为配置数据源
+
+### jforgame-socket-core
+    Session增加OwnerId代表宿主,例如表示玩家id或服务器节点id
+    与线程模型相关的代码统一移到support子包(涉及API类路径变动！！)
+
+### jforgame-socket-netty
+    WebSocketServer和WebSocketClient增加对ssl的支持
+
+### jforgame-commons
+    persist模块内部类路径结构调整(涉及API类路径变动！！)
+
+### jforgame-parent
+    Bumps org.apache.logging.log4j from 2.0.7 to 2.22.0
+    Bumps com.fasterxml.jackson.core:jackson-core from 2.18.6 to 2.18.8
+
+## V4.6.0
+
+### jforgame-commons
+    JsonUtil 方法执行失败时抛出JsonParseException运行期异常而不是返回空
+
+### jforgame-logger
+    增加LoggerUtil#logSystem记录系统日志（按天滚动）和logBusiness记录业务日志（按小时滚动）
+    项目无需额外配置log4j.xml 或 logback.xml等文件
+
+### jforgame-codec-api
+    增加MessageCodecException受检异常，下个大版本MessageCodec#decode()将抛出该异常
+
+### jforgame-codec-struct
+    jforgame.codec.struct.ByteBuffUtil.readUtf8()防止OOM
+    为Int, Long增加变长编码支持（类似Protocol Buffers）
+
+### jforgame-orm
+    BeanProcessor 当遇到null字符串保留构造函数默认值而不是报错
+
+## V5.0.0 api变动！！
+### jforgame-commons
+    DbService更名为EntityPersister
+    移除QueueContainerGroup废弃容器，统一使用PersistContainerGroup进行组装
+
+### jforgame-persist
+    从commons升级为独立模块
+
+### jforgame-socket-mina
+
+    DefaultClientSocketIoHandler更名为CallbackHandler
+
+### jforgame-socket-core
+    MessageHandler更名为IoMessageFilter，messageReceived更名为filter，强调io层处理
+    ChainedMessageDispatcher#addMessageHandler更名为addIoFilter
+    RequestExecutionSupport更名为RequestProcessor
+    代码内部结构调整
+
+### jforgame-data
+    DataReader更名为FileDataReader
+
+### jforgame-codec-struct
+
+    MapCodec/MapCodec2 key增加对Integer的支持（只支持Integer和String，其他基本类型无实际意义）
+### jforgame-codec
+    MessageCodec#decode()编码失败时抛出MessageCodecException，而不是return null
+
+### jforgame-socket-threadmodel
+    从jforgame-socket-core模块拆分，用于聚合socket与线程模型
+
+
+

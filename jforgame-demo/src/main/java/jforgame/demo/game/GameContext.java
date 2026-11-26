@@ -1,0 +1,36 @@
+package jforgame.demo.game;
+
+import jforgame.commons.eventbus.EventBus;
+import jforgame.demo.game.gm.GmManager;
+import jforgame.demo.game.player.PlayerManager;
+import jforgame.demo.game.skill.SkillManager;
+
+import java.util.Arrays;
+
+/**
+ * 游戏业务上下文
+ * 管理game包下所有manager
+ */
+public class GameContext {
+
+    public static GmManager gmManager = new GmManager();
+
+    public static PlayerManager playerManager = new PlayerManager();
+
+    public static SkillManager skillManager = new SkillManager();
+
+    public static EventBus eventBus = new EventBus();
+
+    public static void init() {
+        Class c = GameContext.class;
+        Arrays.stream(c.getDeclaredFields()).forEach( f->{
+            try {
+              Object obj =  f.getType().newInstance();
+              f.set(null, obj);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+}
