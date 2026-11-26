@@ -10,3 +10,5 @@ vendor
 profile*.pdf
 .DS_Store
 dolly/dolly
+*.exe
+*.log
