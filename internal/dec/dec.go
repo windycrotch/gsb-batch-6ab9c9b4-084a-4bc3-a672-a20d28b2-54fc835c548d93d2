@@ -90,6 +90,31 @@ const maxElemID = 16
 // and 7 (short) for AAC-LC by ff_aac_decode_tns.
 const tnsMaxOrder = 20
 
+// overlapLen is the extent of SCE.Saved the AAC-LC inverse MDCT reads and
+// writes as the previous frame's overlap: saved_fixed is 1536 long in the C
+// (SingleChannelElement.saved_fixed), but imdct_and_windowing never touches an
+// index past 512 for LC. The frame transaction stores exactly this extent.
+const overlapLen = 512
+
+// maxFrameElems bounds the audio elements one raw_data_block can publish.
+// configure allocates at most one channel-element slot (an SCE for mono, a
+// CPE for stereo), and decodeFrameGA rejects an element whose slot is nil or
+// that repeats an ID, so a decoded frame lists at most one element. The
+// transaction keeps one slot of headroom so a future layout cannot silently
+// truncate the restored list.
+const maxFrameElems = 2
+
+// maxLiveElems bounds the channel elements present in the che grid, i.e. the
+// number of elements a frame transaction snapshots. configure populates
+// exactly one slot (SCE[0] for mono, CPE[0] for stereo) and nils the other, so
+// one is the reachable count; the second is headroom.
+const maxLiveElems = 2
+
+// windowHist is one channel's window history: the ICS WindowSequence and
+// UseKBWindow pairs, where index 0 is the current unit and index 1 the previous
+// one. decodeICSInfo shifts them in place and imdctAndWindowing reads index 1.
+type windowHist struct{ seq, kb [2]int }
+
 // ICSInfo carries individual_channel_stream configuration. Mirrors struct
 // IndividualChannelStream (libavcodec/aac/aacdec.h @ d09d5afc3a), symbol
 // fields only.
@@ -198,17 +223,7 @@ type CPE struct {
 	commonWindow bool
 	msPresent    int
 	MaxSFBSte    int
-
-	// savedWin holds each channel's window history as it was when the current
-	// raw_data_block started parsing. decodeFrameGA fills it and DecodeFrame
-	// restores it when the block fails to parse.
-	savedWin [2]windowHist
 }
-
-// windowHist is one channel's window history: the ICS WindowSequence and
-// UseKBWindow pairs, where index 0 is the current unit and index 1 the previous
-// one. decodeICSInfo shifts them in place and imdctAndWindowing reads index 1.
-type windowHist struct{ seq, kb [2]int }
 
 // Config is the decoder configuration established from the first ADTS
 // header or from an AudioSpecificConfig. Mirrors the fields of
@@ -240,6 +255,84 @@ type Decoder struct {
 	// scratch (init_dsp).
 	randomState int32
 	dsp         dspState
+
+	// snapshot holds the cross-frame state captured at the start of the frame
+	// being decoded, so DecodeFrame can roll a failed unit back as one
+	// transaction (see beginFrame). It is a value the decoder owns, not a
+	// per-call allocation, so the failure path allocates nothing.
+	snapshot frameSnapshot
+}
+
+// frameSnapshot is the decoder state a failed access unit must leave exactly
+// as it found it. Every field here is written while parsing a frame and read
+// again by a later frame, so a unit that fails midway must not keep any of the
+// writes it made:
+//
+//   - cfg, configured, adts: the configuration an ADTS decoder latches from a
+//     frame header before the payload parses, and the raw/ADTS mode.
+//   - randomState: the PNS generator advances once per noise band during
+//     dequant, so a unit that fills some bands and then fails must not hand
+//     the next frame a different seed.
+//   - nelems/elems: the published element list; a unit can append one element
+//     and then fail on a later one.
+//   - nelem/slots: each live channel element's cross-frame fields, including
+//     the window history decodeICSInfo shifts in place, the M/S mask and
+//     stereo flags decodeCPE writes, the per-band parse state, and the
+//     overlap buffer the inverse MDCT reads and writes.
+//
+// It is a value with fixed extents and no slice fields, held once on the
+// Decoder, so beginFrame copies into it without allocating and the failure
+// path does not allocate either.
+type frameSnapshot struct {
+	cfg         Config
+	adts        bool
+	configured  bool
+	randomState int32
+
+	nelems int
+	elems  [maxFrameElems]ElemRef
+
+	// cheGrid snapshots the element grid verbatim. A failed unit that latched a
+	// first ADTS header has already run configure, which installs the new
+	// layout's element (and nils the other slot); assigning the grid back undoes
+	// that exactly, and the per-slot state below restores the element's fields.
+	cheGrid [4][maxElemID]*CPE
+
+	nelem int
+	slots [maxLiveElems]gridSlot
+}
+
+// gridSlot records one live channel element's position in the che grid and its
+// captured state. The slot is identified by (typ, id) rather than by pointer:
+// a failed unit's configure can retire and replace the element at a position,
+// and restoreFrame must then put the captured element back at that position.
+type gridSlot struct {
+	typ, id int
+	che     *CPE
+	nch     int
+	ch      [2]chSnapshot
+
+	present      bool
+	commonWindow bool
+	msPresent    int
+	MaxSFBSte    int
+	msMask       [128]uint8
+}
+
+// chSnapshot is one channel's cross-frame state. SWBOffset points into the
+// immutable per-sample-rate tables, so it is copied as a header and its
+// backing array never needs saving. Coeffs and QCoefs are per-frame scratch
+// rewritten before use and Output is filled during reconstruction, so none of
+// them is saved; all three are rebuilt in full before any frame reads them.
+type chSnapshot struct {
+	ics       ICSInfo
+	tns       TNSData
+	pulse     Pulse
+	pulsePres bool
+	bandType  [128]uint8
+	sfo       [128]int32
+	sf        [128]int32
+	saved     [overlapLen]int32
 }
 
 // ElemRef identifies one decoded channel element of a frame.
@@ -295,6 +388,8 @@ func (d *Decoder) configure(cfg Config) error {
 	// (the che != nil guard in decodeFrameGA would pass) and emit two channels
 	// of stale audio instead of being rejected. The C frees elements absent
 	// from the new layout in che_configure (aacdec.c av_freep(&ac->che...)).
+	// A failed frame that latched this configure is rolled back by
+	// restoreFrame, which restores the captured che grid verbatim.
 	switch cfg.ChanConfig {
 	case 1:
 		d.che[TypeSCE][0] = reuseCPE(d.che[TypeSCE][0])

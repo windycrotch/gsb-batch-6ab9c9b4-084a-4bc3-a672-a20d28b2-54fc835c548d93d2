@@ -77,14 +77,14 @@ func NewRawDecoder(asc []byte) (*FrameDecoder, error) {
 // package sentinels (ErrCorruptStream for malformed input, including an access
 // unit that carries no audio; ErrUnsupported and its SBR/PS refinements for a
 // valid stream outside the AAC-LC scope), testable with errors.Is. A decode
-// error does not consume decoder state: the failed unit leaves the
-// configuration, overlap-add, window history and PNS state untouched, so
-// the next valid unit decodes byte-identically to a decoder that never saw the
-// failed one, and a caller may skip a corrupt access unit and decode the next,
-// or Reset for a clean session. A corrupt unit that still parses is decoded as
-// audio and does advance the state. The output recovered after an error is
-// not guaranteed to match what another AAC decoder produces after the same
-// error.
+// error does not consume decoder state: the whole unit, including the
+// configuration an ADTS header latches and any PNS and overlap-add state,
+// is rolled back as one transaction, so the next valid unit decodes
+// byte-identically to a decoder that never saw the failed one, and a caller may
+// skip a corrupt access unit and decode the next, or Reset for a clean session.
+// A corrupt unit that still parses is decoded as audio and does advance the
+// state. The output recovered after an error is not guaranteed to match what
+// another AAC decoder produces after the same error.
 //
 // For an ADTS decoder, au must hold exactly one ADTS frame. The decoder parses
 // the frame from its header and payload and does not compare aac_frame_length
@@ -99,22 +99,12 @@ func (d *FrameDecoder) DecodeFrame(dst, au []byte) (out []byte, samples int, err
 	if d == nil || d.dec == nil {
 		return dst, 0, errNotInitialised
 	}
-	// Whether the decoder already knew its configuration before this call. An
-	// ADTS decoder learns it from a frame's header inside AppendS16, before the
-	// audio elements are parsed, so a first frame that turns out to carry no
-	// audio still leaves the decoder configured unless the rejection rolls back.
-	configured := d.dec.Channels() != 0
 	out, samples, err = d.dec.AppendS16(dst, au)
 	if err != nil {
-		// A first ADTS frame configures the decoder from its header before its
-		// payload is decoded, so a payload error would otherwise leave that
-		// header-derived config latched, for the same reason the no-element path
-		// below rolls back. Undo it so a failed first unit consumes no state. The
-		// internal decoder restores the payload parse state itself (the window
-		// history); this rollback covers only the header-derived configuration.
-		if !d.raw && !configured {
-			d.dec.ResetADTS()
-		}
+		// AppendS16 runs the whole unit, parse and reconstruction, as one
+		// transaction: a failed unit rolls back, including the configuration a
+		// first ADTS frame's header latched. So the decoder is exactly as it was
+		// before the call.
 		return dst, 0, mapErr(err)
 	}
 	// An access unit with no audio channel element (only DSE/FIL, or a bare
@@ -122,17 +112,16 @@ func (d *FrameDecoder) DecodeFrame(dst, au []byte) (out []byte, samples int, err
 	// full frame of samples. Reject it so the caller is never handed a phantom
 	// frame whose reported sample count does not match the PCM appended; no valid
 	// AAC-LC audio frame omits its SCE/CPE. Guarding here rather than in the
-	// shared internal decoder keeps the io.Reader Decoder's behaviour unchanged.
+	// shared internal decoder keeps the io.Reader Decoder's behaviour unchanged
+	// (it emits no bytes for such a unit and moves on).
 	if len(out)-len(dst) != samples*d.dec.Channels()*2 {
-		// A first ADTS frame that carried no audio still configured the decoder
-		// from its header. Undo that so the rejected unit consumes no state, as
-		// the doc promises: otherwise a later valid frame with a different
-		// configuration would be wrongly rejected as a mid-stream change. A raw
-		// decoder's configuration comes from the ASC, not the frame, so it is
-		// never rolled back.
-		if !d.raw && !configured {
-			d.dec.ResetADTS()
-		}
+		// The unit parsed, but a FrameDecoder caller must not see partial or
+		// absent audio with a full-frame sample count. Roll the whole unit back
+		// so this rejected access unit consumes no state, exactly as a failed
+		// parse does: otherwise a later valid frame with a different
+		// configuration would be wrongly rejected as a mid-stream change, and
+		// the element list would be left dirty.
+		d.dec.RollbackUnit()
 		return dst, 0, fmt.Errorf("%w: no audio channel element in access unit", ErrCorruptStream)
 	}
 	return out, samples, nil

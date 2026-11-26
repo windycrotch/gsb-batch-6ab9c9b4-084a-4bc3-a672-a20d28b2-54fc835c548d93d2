@@ -22,15 +22,39 @@ const frameSamples = 1024
 //
 // On a decode error dst is returned unmodified with a zero sample count and
 // the wrapped error; the caller (pcm.Decoder) decides whether the error ends
-// the stream or is skipped. The decoder's cross-frame state (window history,
-// overlap buffers, PNS) is then as it was before the call, except that a first
-// ADTS frame's header configuration stays latched.
+// the stream or is skipped. The decoder's cross-frame state is then exactly as
+// it was before the call, configuration included: the whole decode, header
+// parse and reconstruction, runs as one transaction (beginFrame captured it,
+// restoreFrame puts it back), so a skipped unit leaves no trace in the next
+// frame's output.
+//
+// A unit that parses cleanly but carries no audio element is not an error at
+// this level: it reconstructs nothing and appends nothing, matching the
+// reconstructed frame count the caller expects. A caller that requires audio
+// from every unit (pcm.FrameDecoder) detects the empty result and rolls the
+// whole transaction back via RollbackUnit, so the accepted-but-empty unit
+// leaves no more state than a failed one.
 func (d *Decoder) AppendS16(dst, pkt []byte) (out []byte, samples int, err error) {
-	if err := d.DecodeFrame(pkt); err != nil {
+	d.beginFrame()
+	if err := d.decodePacket(pkt); err != nil {
+		d.restoreFrame()
 		return dst, 0, err
 	}
 	d.reconstruct(nil)
 	return d.appendElemsS16(dst), frameSamples, nil
+}
+
+// RollbackUnit undoes the state of the most recent AppendS16 call, whether it
+// succeeded or failed. It exists for a caller that rejects a unit the decoder
+// itself accepted (pcm.FrameDecoder rejects an access unit that carries no
+// audio element): rolling the whole unit back makes that rejection consume no
+// state, exactly as a failed parse does. It is a no-op before any AppendS16
+// call. Because AppendS16 reconstructs only frames that carry audio, a
+// rollback of an empty unit cannot have advanced the PNS generator or the
+// overlap, but restoreFrame restores those fields regardless, so the rollback
+// is correct for any unit.
+func (d *Decoder) RollbackUnit() {
+	d.restoreFrame()
 }
 
 // Channels reports the decoded channel count (1 or 2 for AAC-LC mono/stereo).
