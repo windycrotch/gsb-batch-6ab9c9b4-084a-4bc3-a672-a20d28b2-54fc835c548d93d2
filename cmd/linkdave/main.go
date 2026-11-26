@@ -84,7 +84,7 @@ DrainLoop:
 			logger.Warn("drain timeout reached, forcing shutdown")
 			break DrainLoop
 		case <-ticker.C:
-			playerCount := server.PlayerCount()
+			playerCount := server.DrainPendingCount()
 			if playerCount == 0 {
 				logger.Info("all players migrated successfully")
 				break DrainLoop

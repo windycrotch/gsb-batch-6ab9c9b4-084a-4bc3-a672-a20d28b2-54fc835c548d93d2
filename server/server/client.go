@@ -30,6 +30,12 @@ type Player struct {
 	startedAt   time.Time
 	requesterID string
 	filters     *filter.Filters
+
+	// migrating marks an in-flight migration handoff. While set, snapshot is
+	// the single authoritative, immutable handoff state; repeat handshakes
+	// return it and stop/play transitions clear it.
+	migrating bool
+	snapshot  *protocol.MigrateReadyData
 }
 
 type Client struct {
@@ -39,8 +45,15 @@ type Client struct {
 	sessionID  string
 	clientName string
 
-	players   map[snowflake.ID]*Player
-	playersMu sync.RWMutex
+	players map[snowflake.ID]*Player
+	// handoffs keeps the immutable snapshot of every guild whose migration
+	// handshake was served. It makes repeated handshakes return the exact
+	// same state and lets lifecycle callbacks stay silent afterwards.
+	handoffs map[snowflake.ID]protocol.MigrateReadyData
+	// guildLocks serializes all same-guild entry points (voice update,
+	// play/replace, stop/disconnect, migration) against each other.
+	guildLocks map[snowflake.ID]*sync.Mutex
+	playersMu  sync.RWMutex
 
 	closeChan chan struct{}
 	closeOnce sync.Once
@@ -54,8 +67,26 @@ func NewClient(server *Server, conn *websocket.Conn, clientName string) *Client 
 		sessionID:  uuid.New().String(),
 		clientName: clientName,
 		players:    make(map[snowflake.ID]*Player),
+		handoffs:   make(map[snowflake.ID]protocol.MigrateReadyData),
+		guildLocks: make(map[snowflake.ID]*sync.Mutex),
 		closeChan:  make(chan struct{}),
 	}
+}
+
+// withGuildLock runs fn while holding the lock for a single guild, linearizing
+// concurrent updates/play/disconnect operations for that player.
+func (c *Client) withGuildLock(guildID snowflake.ID, fn func()) {
+	c.playersMu.Lock()
+	lock, ok := c.guildLocks[guildID]
+	if !ok {
+		lock = &sync.Mutex{}
+		c.guildLocks[guildID] = lock
+	}
+	c.playersMu.Unlock()
+
+	lock.Lock()
+	defer lock.Unlock()
+	fn()
 }
 
 func (c *Client) readPump() {
@@ -162,17 +193,53 @@ func (c *Client) getPlayer(guildID snowflake.ID) *Player {
 
 func (c *Client) removePlayer(guildID snowflake.ID) {
 	c.playersMu.Lock()
-	defer c.playersMu.Unlock()
 	delete(c.players, guildID)
+	c.playersMu.Unlock()
+}
+
+func (c *Client) addHandoff(guildID snowflake.ID, data protocol.MigrateReadyData) {
+	c.playersMu.Lock()
+	c.handoffs[guildID] = data
+	c.playersMu.Unlock()
+}
+
+func (c *Client) getHandoff(guildID snowflake.ID) (protocol.MigrateReadyData, bool) {
+	c.playersMu.RLock()
+	data, ok := c.handoffs[guildID]
+	c.playersMu.RUnlock()
+	return data, ok
+}
+
+func (c *Client) removeHandoff(guildID snowflake.ID) (protocol.MigrateReadyData, bool) {
+	c.playersMu.Lock()
+	data, ok := c.handoffs[guildID]
+	delete(c.handoffs, guildID)
+	c.playersMu.Unlock()
+	return data, ok
+}
+
+func (c *Client) isHandedOff(guildID snowflake.ID) bool {
+	c.playersMu.RLock()
+	_, ok := c.handoffs[guildID]
+	c.playersMu.RUnlock()
+	return ok
 }
 
 func (c *Client) destroyAllPlayers() {
 	c.playersMu.Lock()
-	guildIDs := make([]snowflake.ID, 0, len(c.players))
+	guildIDs := make([]snowflake.ID, 0, len(c.players)+len(c.handoffs))
 	for id := range c.players {
 		guildIDs = append(guildIDs, id)
 	}
+	// Handoff guilds were removed from players but still own a voice
+	// connection that must not leak when the socket goes away.
+	for id := range c.handoffs {
+		if _, active := c.players[id]; !active {
+			guildIDs = append(guildIDs, id)
+		}
+	}
 	c.players = make(map[snowflake.ID]*Player)
+	c.handoffs = make(map[snowflake.ID]protocol.MigrateReadyData)
 	c.playersMu.Unlock()
 
 	for _, guildID := range guildIDs {
@@ -248,6 +315,7 @@ func (p *Player) SetPlayingState(url string, position int64, requesterID string,
 	p.startedAt = time.Now()
 	p.requesterID = requesterID
 	p.filters = filters.Normalize()
+	p.clearMigrationLocked()
 	p.mutex.Unlock()
 }
 
@@ -268,6 +336,7 @@ func (p *Player) SetIdleState() {
 	p.state = protocol.PlayerStateIdle
 	p.currentURL = ""
 	p.requesterID = ""
+	p.clearMigrationLocked()
 	p.mutex.Unlock()
 }
 
@@ -286,4 +355,106 @@ func (p *Player) GetMigrateData() (url string, position int64, state string, req
 		calculatedPos = time.Since(p.startedAt).Milliseconds() + p.position
 	}
 	return p.currentURL, calculatedPos, p.state, p.requesterID, p.filters
+}
+
+// LivePosition returns the wall-clock-interpolated playback position. It is
+// only a fallback when the voice connection cannot report a source position.
+func (p *Player) LivePosition() int64 {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	if p.state != protocol.PlayerStatePlaying {
+		return p.position
+	}
+
+	return time.Since(p.startedAt).Milliseconds() + p.position
+}
+
+// BeginMigration freezes the immutable handoff snapshot. positionFn resolves
+// the authoritative position (the frozen voice source position) while the
+// player lock is held, so a concurrent pause/seek/play cannot mix old
+// metadata with a new position. Idempotent: while a handoff is in flight the
+// original snapshot is returned.
+func (p *Player) BeginMigration(positionFn func() int64) protocol.MigrateReadyData {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.migrating {
+		return *p.snapshot
+	}
+
+	position := positionFn()
+	p.position = position
+	p.migrating = true
+	p.snapshot = &protocol.MigrateReadyData{
+		GuildID:     p.guildID,
+		URL:         p.currentURL,
+		Position:    position,
+		State:       p.state,
+		RequesterID: p.requesterID,
+		Filters:     p.filters.Normalize(),
+	}
+
+	return *p.snapshot
+}
+
+// MigrationData returns the frozen snapshot when a handoff is in flight.
+func (p *Player) MigrationData() (protocol.MigrateReadyData, bool) {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	if !p.migrating || p.snapshot == nil {
+		return protocol.MigrateReadyData{}, false
+	}
+
+	return *p.snapshot, true
+}
+
+func (p *Player) IsMigrating() bool {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+	return p.migrating
+}
+
+// EndMigration aborts the handoff and restores wall-clock timing so playback
+// continues from the frozen position without moving backwards.
+func (p *Player) EndMigration() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if !p.migrating || p.snapshot == nil {
+		p.clearMigrationLocked()
+		return
+	}
+
+	if p.state == protocol.PlayerStatePlaying {
+		p.position = p.snapshot.Position
+		p.startedAt = time.Now()
+	} else if p.state == protocol.PlayerStatePaused {
+		p.position = p.snapshot.Position
+	}
+
+	p.clearMigrationLocked()
+}
+
+func (p *Player) clearMigrationLocked() {
+	p.migrating = false
+	p.snapshot = nil
+}
+
+// RestoreFromHandoff rebuilds player state from a snapshot. It is used when a
+// handoff record (rather than the in-player migration state) is aborted.
+func (p *Player) RestoreFromHandoff(data protocol.MigrateReadyData) {
+	p.mutex.Lock()
+	p.state = data.State
+	p.currentURL = data.URL
+	p.position = data.Position
+	p.requesterID = data.RequesterID
+	p.filters = data.Filters.Normalize()
+	p.clearMigrationLocked()
+
+	if p.state == protocol.PlayerStatePlaying {
+		p.startedAt = time.Now()
+	}
+	p.mutex.Unlock()
 }

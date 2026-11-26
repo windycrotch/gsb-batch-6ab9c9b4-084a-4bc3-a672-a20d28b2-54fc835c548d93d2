@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/disgoorg/disgo v0.19.7-0.20260911181919-b61a46a3b8aa
+	github.com/disgoorg/godave v0.3.0
 	github.com/disgoorg/snowflake/v2 v2.0.3
 	github.com/getsentry/sentry-go v0.49.0
 	github.com/google/uuid v1.6.0
@@ -14,7 +15,6 @@ require (
 )
 
 require (
-	github.com/disgoorg/godave v0.3.0 // indirect
 	github.com/disgoorg/json/v2 v2.0.0 // indirect
 	github.com/disgoorg/omit v1.0.0 // indirect
 	github.com/klauspost/compress v1.20.0 // indirect

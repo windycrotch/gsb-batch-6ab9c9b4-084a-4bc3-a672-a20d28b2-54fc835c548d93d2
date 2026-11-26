@@ -17,10 +17,11 @@ import (
 )
 
 type Connection struct {
-	logger    *slog.Logger
-	guildID   snowflake.ID
-	channelID snowflake.ID
-	userID    snowflake.ID
+	logger     *slog.Logger
+	connCreate voice.ConnCreateFunc
+	guildID    snowflake.ID
+	channelID  snowflake.ID
+	userID     snowflake.ID
 
 	voiceConn       voice.Conn
 	targetVoiceConn voice.Conn
@@ -30,19 +31,30 @@ type Connection struct {
 	onDisconnect func()
 	paused       atomic.Bool
 	closed       atomic.Bool
-	mutex        sync.Mutex
-	setupMu      sync.Mutex
+	// handedOff marks a completed migration handoff: every later teardown
+	// callback (stop, unexpected disconnect, voice conn removal) stays
+	// silent so an already migrated player is never reported again.
+	handedOff atomic.Bool
+	mutex     sync.Mutex
+	setupMu   sync.Mutex
 
 	setupCancel context.CancelFunc
 
 	stopChan chan struct{}
 
 	staleTimer *time.Timer
+
+	// migrating is an in-flight (not yet committed/aborted) migration
+	// handoff. While set, audio frames are suppressed and the position is
+	// frozen at frozenPosition so repeated handshakes return one state.
+	migrating      bool
+	frozenPosition int64
 }
 
 func NewConnection(
 	ctx context.Context,
 	logger *slog.Logger,
+	connCreate voice.ConnCreateFunc,
 	userID, guildID, channelID snowflake.ID,
 	sessionID string,
 	voiceServerEvent protocol.VoiceServerEvent,
@@ -51,6 +63,7 @@ func NewConnection(
 ) (*Connection, error) {
 	conn := &Connection{
 		logger:       logger,
+		connCreate:   connCreate,
 		guildID:      guildID,
 		channelID:    channelID,
 		userID:       userID,
@@ -87,7 +100,7 @@ func (c *Connection) setupVoiceConn(ctx context.Context, channelID snowflake.ID,
 	c.mutex.Unlock()
 
 	var vc voice.Conn
-	vc = voice.NewConn(
+	vc = c.connCreate(
 		c.guildID,
 		c.userID,
 		func(ctx context.Context, guildID snowflake.ID, channelID *snowflake.ID, selfMute, selfDeaf bool) error {
@@ -235,13 +248,31 @@ func (c *Connection) handleUnexpectedDisconnect() {
 
 	c.staleTimer = nil
 	stale := c.voiceConn == nil && c.targetVoiceConn == nil
+	migrating := c.migrating
 
-	if !stale || c.closed.Swap(true) {
+	if !stale {
+		c.mutex.Unlock()
+		return
+	}
+
+	// A migration handoff owns the player's lifecycle now: dropping the old
+	// voice connection must not close the Connection (a replacement voice
+	// update may rebuild it), end the track, or emit a disconnect while the
+	// handoff can still commit or abort.
+	if migrating || c.handedOff.Load() {
+		c.mutex.Unlock()
+		c.logger.Info("voice connection lost during migration handoff, keeping player",
+			slog.String("guild_id", c.guildID.String()))
+		return
+	}
+
+	if c.closed.Swap(true) {
 		c.mutex.Unlock()
 		return
 	}
 
 	c.mutex.Unlock()
+
 	c.logger.Info("sending unexpected disconnect", slog.String("guild_id", c.guildID.String()))
 
 	c.Stop()
@@ -260,6 +291,10 @@ func (c *Connection) Play(ctx context.Context, src source.Source) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	if c.handedOff.Load() {
+		return fmt.Errorf("connection was handed off during migration")
+	}
+
 	if c.source != nil {
 		oldSource := c.source
 		c.source = nil
@@ -269,6 +304,10 @@ func (c *Connection) Play(ctx context.Context, src source.Source) error {
 			c.onTrackEnd(oldSource, protocol.TrackEndReasonReplaced, nil)
 		}
 	}
+
+	// A new track supersedes an in-flight migration freeze.
+	c.migrating = false
+	c.frozenPosition = 0
 
 	c.source = src
 	c.paused.Store(false)
@@ -304,14 +343,69 @@ func (c *Connection) Stop() {
 		close(c.stopChan)
 	}
 
+	c.migrating = false
+	c.frozenPosition = 0
+
 	if c.source != nil {
 		oldSource := c.source
 		c.source = nil
 		oldSource.Close()
-		if c.onTrackEnd != nil {
+
+		// A handed-off track belongs to the new node now; tearing the old
+		// connection down must not report it as stopped.
+		if c.onTrackEnd != nil && !c.handedOff.Load() {
 			c.onTrackEnd(oldSource, protocol.TrackEndReasonStopped, nil)
 		}
 	}
+}
+
+// MarkHandedOff silences all later lifecycle events for this connection. It is
+// called once the migration handoff is complete.
+func (c *Connection) MarkHandedOff() {
+	c.handedOff.Store(true)
+}
+
+func (c *Connection) IsHandedOff() bool {
+	return c.handedOff.Load()
+}
+
+// BeginMigration freezes playback at the real source position and returns it.
+// Idempotent: repeated calls return the position chosen by the first call.
+func (c *Connection) BeginMigration() int64 {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.migrating {
+		return c.frozenPosition
+	}
+
+	c.migrating = true
+	c.frozenPosition = c.positionLocked()
+
+	return c.frozenPosition
+}
+
+// EndMigration aborts a pending handoff and resumes frame delivery. The
+// source never advanced while frozen, so playback continues without jumping.
+func (c *Connection) EndMigration() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.migrating = false
+	c.frozenPosition = 0
+}
+
+func (c *Connection) IsMigrating() bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.migrating
+}
+
+func (c *Connection) positionLocked() int64 {
+	if c.source == nil {
+		return c.frozenPosition
+	}
+	return c.source.Position()
 }
 
 func (c *Connection) handleTrackEnd(src source.Source, err error) {
@@ -342,9 +436,15 @@ type trackWrapper struct {
 func (w *trackWrapper) ProvideOpusFrame() ([]byte, error) {
 	w.conn.mutex.Lock()
 	src := w.conn.source
+	migrating := w.conn.migrating
 	w.conn.mutex.Unlock()
 
 	if src == nil {
+		return nil, nil
+	}
+	if migrating {
+		// Handoff in progress: freeze the old node so its position cannot
+		// run ahead of the snapshot handed to the new node.
 		return nil, nil
 	}
 	if w.conn.paused.Load() {
@@ -385,14 +485,13 @@ func (c *Connection) SeekTo(positionMs int64) error {
 
 func (c *Connection) Position() int64 {
 	c.mutex.Lock()
-	source := c.source
-	c.mutex.Unlock()
+	defer c.mutex.Unlock()
 
-	if source == nil {
-		return 0
+	if c.migrating {
+		return c.frozenPosition
 	}
 
-	return source.Position()
+	return c.positionLocked()
 }
 
 func (c *Connection) Close() {

@@ -1,8 +1,10 @@
 package protocol
 
 const (
-	OpVoiceUpdate   uint8 = 0
-	OpPlayerMigrate uint8 = 1
+	OpVoiceUpdate         uint8 = 0
+	OpPlayerMigrate       uint8 = 1
+	OpPlayerMigrateCommit uint8 = 2
+	OpPlayerMigrateAbort  uint8 = 3
 )
 
 const (
@@ -16,6 +18,7 @@ const (
 	OpStats           uint8 = 7
 	OpNodeDraining    uint8 = 8
 	OpMigrateReady    uint8 = 9
+	OpMigrateFailed   uint8 = 10
 )
 
 const (
@@ -35,4 +38,5 @@ const (
 	DisconnectReasonConnectionLost   = "connection_lost"
 	DisconnectReasonConnectionFailed = "connection_failed"
 	DisconnectReasonRequested        = "requested"
+	DisconnectReasonMigrated         = "migrated"
 )

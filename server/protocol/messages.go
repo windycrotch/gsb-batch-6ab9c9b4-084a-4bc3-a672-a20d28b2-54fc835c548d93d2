@@ -112,6 +112,11 @@ type MigrateReadyData struct {
 	Filters     *filter.Filters `json:"filters,omitempty"`
 }
 
+type MigrateFailedData struct {
+	GuildID snowflake.ID `json:"guild_id"`
+	Reason  string       `json:"reason"`
+}
+
 type StatsResponse struct {
 	Version      string `json:"version"`
 	Runtime      string `json:"runtime"`
