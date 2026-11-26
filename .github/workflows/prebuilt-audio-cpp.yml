@@ -1,0 +1,414 @@
+name: Build prebuilt audio-cpp artifacts
+
+on:
+  # 仅在正式发布 tag 推送时构建预编译资产；main 开发期推送不触发。
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+      inputs:
+        upload_to_release:
+          description: Upload artifacts to the selected tag release
+          type: boolean
+          default: false
+        tag:
+          description: Existing tag to upload assets to (workflow_dispatch only)
+          required: false
+          default: ""
+        platform:
+          description: OS to build (tag pushes always build all)
+          type: choice
+          default: all
+          options:
+            - all
+            - linux
+            - windows
+            - macos
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # 仅 tag 推送触发：校验 tag 与 Cargo.toml 版本一致，并按 CHANGELOG.md 对应版本段
+  # 创建 GitHub Release（机制参照 rumark 的 release.yml）。各平台 job 只管往这个
+  # Release 传附件；非 tag 的 workflow_dispatch 构建跳过本 job（下游以
+  # needs.prepare-release.result == 'skipped' 放行）。
+  prepare-release:
+    name: Prepare release (changelog)
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Create release with changelog notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          # 版本一致性校验：release 标题与预编译 metadata.json 的 crate_version 都取自
+          # Cargo.toml，对不上说明标签打错，宁可在这里挡住。
+          crate="$(grep -m1 -E '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "${TAG_NAME#v}" != "$crate" ]; then
+            echo "::error::标签 $TAG_NAME 与 Cargo.toml 版本 $crate 不一致：先改版本号（含 Cargo.lock）再打 tag"
+            exit 1
+          fi
+          # 重复推同一 tag（重传资产场景）时只补缺失的 Release，不覆盖已有说明与附件。
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME 已存在，跳过创建"
+            exit 0
+          fi
+          # Release 说明取 CHANGELOG.md 中对应版本段（## [x.y.z] 行到下一个 ## 标题之间）。
+          ver="${TAG_NAME#v}"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          if [ -f CHANGELOG.md ] && awk -v ver="$ver" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > "$notes_file" && [ -s "$notes_file" ]; then
+            printf '\n\n---\n\n本 Release 附带预编译静态库：共 9 个资产（linux 4 / windows 4 / macos 1），文件名含 submodule commit（audio_commit），包内 metadata.json 记录 target/features/crate_version；`audio-cpp-sys` 的 `prebuilt` feature 按 crate 版本号自动下载对应 tag 的资产。\n' >> "$notes_file"
+          else
+            echo "::warning::CHANGELOG.md 中没有版本 $ver 的段落，Release 说明使用通用文案；发布前请在 CHANGELOG.md 补充该版本的变化"
+            printf '版本发布 %s。本 Release 附带预编译静态库：共 9 个资产（linux 4 / windows 4 / macos 1），文件名含 submodule commit（audio_commit），包内 metadata.json 记录 target/features/crate_version；`audio-cpp-sys` 的 `prebuilt` feature 按 crate 版本号自动下载对应 tag 的资产。\n' "$TAG_NAME" > "$notes_file"
+          fi
+          gh release create "$TAG_NAME" --title "$TAG_NAME" --notes-file "$notes_file"
+
+  linux-prebuilt:
+    name: Linux prebuilt (${{ matrix.label }})
+    needs: prepare-release
+    # prepare-release 成功（tag 推送）或被跳过（workflow_dispatch 构建）时都放行。
+    if: ${{ (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped') && (inputs.platform == '' || inputs.platform == 'all' || inputs.platform == 'linux') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "x64 cpu full",     runner: "ubuntu-24.04",     target: "x86_64-unknown-linux-gnu",   backend: "cpu",    modelset: "full", features: "full-models" }
+          - { label: "x64 vulkan full",  runner: "ubuntu-24.04",     target: "x86_64-unknown-linux-gnu",   backend: "vulkan", modelset: "full", features: "full-models,vulkan" }
+          - { label: "arm64 cpu full",   runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu",  backend: "cpu",    modelset: "full", features: "full-models" }
+          - { label: "arm64 vulkan full", runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu",  backend: "vulkan", modelset: "full", features: "full-models,vulkan" }
+    env:
+      TARGET_TRIPLE: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake ninja-build git libclang-dev
+
+      - name: Install Vulkan dependencies
+        if: contains(matrix.features, 'vulkan')
+        run: |
+          sudo apt-get install -y libvulkan-dev glslang-tools spirv-headers glslc
+          # Ubuntu 24.04 的 glslc 是独立包（source 为 shaderc）；glslang-tools 只含
+          # glslangValidator，不提供 glslc。
+          command -v glslc || echo "::warning::glslc not found in PATH"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: ". -> target"
+          shared-key: prebuilt-linux-${{ env.TARGET_TRIPLE }}-${{ matrix.backend }}-${{ matrix.modelset }}-v2
+          cache-targets: false
+          cache-on-failure: false
+
+      - name: Build audio-cpp-sys (prebuilt target)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p audio-cpp-sys \
+            --release \
+            --target "${TARGET_TRIPLE}" \
+            --no-default-features \
+            --features "${{ matrix.features }}"
+
+      - name: Compute asset name
+        id: asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 父仓库记录的 submodule gitlink（完整 40 位 SHA），与消费端 local_audio_commit 口径一致。
+          AUDIO_COMMIT="$(git ls-tree HEAD audio-cpp-sys/audio.cpp | awk '{print substr($3,1,12)}')"
+          echo "AUDIO_COMMIT=$AUDIO_COMMIT" >> "$GITHUB_ENV"
+          # 上传目标 Release：tag push / dispatch 用显式 tag，main 开发期用 crate 版本（v{CARGO_PKG_VERSION}）。
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            # main 开发期 push：`cargo pkgid` 返回 `path+file://...#0.3.0`（无 `@`），
+            # 发版 tag push 返回 `audio-cpp-sys@0.3.0`。两种形态都要正确取到版本号。
+            PKGID="$(cargo pkgid -p audio-cpp-sys)"
+            PKG_VER="${PKGID##*#}"
+            if [ "$PKG_VER" = "$PKGID" ]; then PKG_VER="${PKGID##*@}"; fi
+            TAG="v${PKG_VER}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          # 打包时的 crate 版本：写入 metadata.json 的 crate_version，供 registry
+          # 消费端做版本锚定校验（TAG 可能是 dispatch 自定义 tag，不能直接复用）。
+          PKGID="$(cargo pkgid -p audio-cpp-sys)"
+          PKG_VER="${PKGID##*#}"
+          if [ "$PKG_VER" = "$PKGID" ]; then PKG_VER="${PKGID##*@}"; fi
+          echo "PKG_VER=$PKG_VER" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=audio-cpp-prebuilt-linux-${TARGET_TRIPLE}-${{ matrix.backend }}-${{ matrix.modelset }}-static-${AUDIO_COMMIT}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Collect prebuilt libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/prebuilt"
+          bash .github/scripts/collect-unix-prebuilt.sh "$ROOT" linux
+          cat > "$ROOT/metadata.json" <<EOF
+          {"target":"${TARGET_TRIPLE}","features":"${{ matrix.features }}","modelset":"${{ matrix.modelset }}","audio_commit":"${AUDIO_COMMIT}","crate_version":"${PKG_VER}"}
+          EOF
+          tar -C "$ROOT" -czf "$RUNNER_TEMP/$ASSET_NAME" .
+
+      - name: Create or update GitHub release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.upload_to_release == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="$TAG"
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --notes "Prebuilt artifacts for $TAG_NAME"
+          fi
+          gh release upload "$TAG_NAME" "$RUNNER_TEMP/$ASSET_NAME" --clobber
+
+  windows-prebuilt:
+    name: Windows prebuilt (${{ matrix.label }})
+    needs: prepare-release
+    if: ${{ (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped') && (inputs.platform == '' || inputs.platform == 'all' || inputs.platform == 'windows') }}
+    runs-on: windows-2022
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # full × CRT 双变体：md（动态 CRT，默认）/ mt（静态 CRT，crt-static）。
+          - { label: "x64 cpu full md",    target: "x86_64-pc-windows-msvc", backend: "cpu",    modelset: "full", crt: "md", features: "full-models" }
+          - { label: "x64 cpu full mt",    target: "x86_64-pc-windows-msvc", backend: "cpu",    modelset: "full", crt: "mt", features: "full-models" }
+          - { label: "x64 vulkan full md", target: "x86_64-pc-windows-msvc", backend: "vulkan", modelset: "full", crt: "md", features: "full-models,vulkan" }
+          - { label: "x64 vulkan full mt", target: "x86_64-pc-windows-msvc", backend: "vulkan", modelset: "full", crt: "mt", features: "full-models,vulkan" }
+    env:
+      TARGET_TRIPLE: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: ". -> target"
+          shared-key: prebuilt-windows-${{ env.TARGET_TRIPLE }}-${{ matrix.backend }}-${{ matrix.modelset }}-${{ matrix.crt }}-v2
+          cache-targets: false
+          cache-on-failure: false
+
+      - name: Setup Vulkan SDK
+        if: contains(matrix.features, 'vulkan')
+        uses: ./.github/actions/setup-vulkan-sdk-windows
+
+      - name: Build audio-cpp-sys (prebuilt target)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # mt 变体：crt-static 让 Rust/cc 侧用 /MT，build.rs 同步给 CMake 注入 /MT。
+          if [ "${{ matrix.crt }}" = "mt" ]; then
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build -p audio-cpp-sys \
+            --release \
+            --target "${TARGET_TRIPLE}" \
+            --no-default-features \
+            --features "${{ matrix.features }}"
+
+      - name: Compute asset name
+        id: asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 父仓库记录的 submodule gitlink（完整 40 位 SHA），与消费端 local_audio_commit 口径一致。
+          AUDIO_COMMIT="$(git ls-tree HEAD audio-cpp-sys/audio.cpp | awk '{print substr($3,1,12)}')"
+          echo "AUDIO_COMMIT=$AUDIO_COMMIT" >> "$GITHUB_ENV"
+          # 上传目标 Release：tag push / dispatch 用显式 tag，main 开发期用 crate 版本（v{CARGO_PKG_VERSION}）。
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            # main 开发期 push：`cargo pkgid` 返回 `path+file://...#0.3.0`（无 `@`），
+            # 发版 tag push 返回 `audio-cpp-sys@0.3.0`。两种形态都要正确取到版本号。
+            PKGID="$(cargo pkgid -p audio-cpp-sys)"
+            PKG_VER="${PKGID##*#}"
+            if [ "$PKG_VER" = "$PKGID" ]; then PKG_VER="${PKGID##*@}"; fi
+            TAG="v${PKG_VER}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          # 打包时的 crate 版本：写入 metadata.json 的 crate_version，供 registry
+          # 消费端做版本锚定校验（TAG 可能是 dispatch 自定义 tag，不能直接复用）。
+          PKGID="$(cargo pkgid -p audio-cpp-sys)"
+          PKG_VER="${PKGID##*#}"
+          if [ "$PKG_VER" = "$PKGID" ]; then PKG_VER="${PKGID##*@}"; fi
+          echo "PKG_VER=$PKG_VER" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=audio-cpp-prebuilt-windows-${TARGET_TRIPLE}-${{ matrix.backend }}-${{ matrix.crt }}-${{ matrix.modelset }}-static-${AUDIO_COMMIT}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Collect prebuilt libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ROOT = "$env:RUNNER_TEMP/prebuilt"
+          bash .github/scripts/collect-windows-prebuilt.sh "$ROOT"
+          # pwsh 对 native 命令的非零退出不会抛异常（$ErrorActionPreference 无效），
+          # 必须显式检查 $LASTEXITCODE，否则脚本的 exit 1 被吞掉、照样打包发坏包。
+          if ($LASTEXITCODE -ne 0) { "collect 脚本失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
+          $msvcVer = 0
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -property installationPath 2>$null
+            if ($vs) {
+              $msvcDir = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
+                Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+              if ($msvcDir) {
+                # 目录名如 "14.44.35207"：MSVC 14.4x 的 _MSC_VER = 1900 + 次版本（14.44 → 1944）。
+                $parts = ($msvcDir.Name -split '\.')
+                if ($parts[0] -eq '14' -and $parts.Count -ge 2) {
+                  $msvcVer = 1900 + [int]$parts[1]
+                }
+              }
+            }
+          }
+          $json = @{
+            target        = "$env:TARGET_TRIPLE"
+            features      = "${{ matrix.features }}"
+            backend       = "${{ matrix.backend }}"
+            crt           = "${{ matrix.crt }}"
+            modelset      = "${{ matrix.modelset }}"
+            audio_commit  = "$env:AUDIO_COMMIT"
+            crate_version = "$env:PKG_VER"
+            msvc_ver      = [int]$msvcVer
+          } | ConvertTo-Json -Compress
+          Set-Content -Path "$ROOT/metadata.json" -Value $json -Encoding ascii
+          tar -C "$ROOT" -czf "$env:RUNNER_TEMP/$env:ASSET_NAME" .
+          if ($LASTEXITCODE -ne 0) { "tar 打包失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
+
+      - name: Create or update GitHub release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.upload_to_release == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="$TAG"
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --notes "Prebuilt artifacts for $TAG_NAME"
+          fi
+          gh release upload "$TAG_NAME" "$RUNNER_TEMP/$ASSET_NAME" --clobber
+
+  macos-prebuilt:
+    name: macOS prebuilt (${{ matrix.label }})
+    needs: prepare-release
+    if: ${{ (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped') && (inputs.platform == '' || inputs.platform == 'all' || inputs.platform == 'macos') }}
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "arm64 metal full", target: "aarch64-apple-darwin", backend: "metal",  modelset: "full", features: "full-models,metal" }
+    env:
+      TARGET_TRIPLE: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: ". -> target"
+          shared-key: prebuilt-macos-${{ env.TARGET_TRIPLE }}-${{ matrix.backend }}-${{ matrix.modelset }}-v2
+          cache-targets: false
+          cache-on-failure: false
+
+      - name: Build audio-cpp-sys (prebuilt target)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p audio-cpp-sys \
+            --release \
+            --target "${TARGET_TRIPLE}" \
+            --no-default-features \
+            --features "${{ matrix.features }}"
+
+      - name: Compute asset name
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 父仓库记录的 submodule gitlink（完整 40 位 SHA），与消费端 local_audio_commit 口径一致。
+          AUDIO_COMMIT="$(git ls-tree HEAD audio-cpp-sys/audio.cpp | awk '{print substr($3,1,12)}')"
+          echo "AUDIO_COMMIT=$AUDIO_COMMIT" >> "$GITHUB_ENV"
+          # 上传目标 Release：tag push / dispatch 用显式 tag，main 开发期用 crate 版本（v{CARGO_PKG_VERSION}）。
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            # main 开发期 push：`cargo pkgid` 返回 `path+file://...#0.3.0`（无 `@`），
+            # 发版 tag push 返回 `audio-cpp-sys@0.3.0`。两种形态都要正确取到版本号。
+            PKGID="$(cargo pkgid -p audio-cpp-sys)"
+            PKG_VER="${PKGID##*#}"
+            if [ "$PKG_VER" = "$PKGID" ]; then PKG_VER="${PKGID##*@}"; fi
+            TAG="v${PKG_VER}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          # 打包时的 crate 版本：写入 metadata.json 的 crate_version，供 registry
+          # 消费端做版本锚定校验（TAG 可能是 dispatch 自定义 tag，不能直接复用）。
+          PKGID="$(cargo pkgid -p audio-cpp-sys)"
+          PKG_VER="${PKGID##*#}"
+          if [ "$PKG_VER" = "$PKGID" ]; then PKG_VER="${PKGID##*@}"; fi
+          echo "PKG_VER=$PKG_VER" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=audio-cpp-prebuilt-macos-${TARGET_TRIPLE}-${{ matrix.backend }}-${{ matrix.modelset }}-static-${AUDIO_COMMIT}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Collect prebuilt libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/prebuilt"
+          bash .github/scripts/collect-unix-prebuilt.sh "$ROOT" macos
+          cat > "$ROOT/metadata.json" <<EOF
+          {"target":"${TARGET_TRIPLE}","features":"${{ matrix.features }}","modelset":"${{ matrix.modelset }}","audio_commit":"${AUDIO_COMMIT}","crate_version":"${PKG_VER}"}
+          EOF
+          tar -C "$ROOT" -czf "$RUNNER_TEMP/$ASSET_NAME" .
+
+      - name: Create or update GitHub release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.upload_to_release == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="$TAG"
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --notes "Prebuilt artifacts for $TAG_NAME"
+          fi
+          gh release upload "$TAG_NAME" "$RUNNER_TEMP/$ASSET_NAME" --clobber

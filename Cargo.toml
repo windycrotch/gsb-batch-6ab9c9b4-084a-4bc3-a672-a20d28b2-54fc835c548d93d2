@@ -1,0 +1,68 @@
+# =====================================================================
+# audio-cpp-rs — 用 Rust 封装 audio.cpp（基于 ggml 的本地音频推理引擎）。
+#
+# 仓库结构：
+#   audio-cpp-sys/  —— 底层 FFI：CMake 构建 engine_runtime + bindgen 生成 C ABI 绑定
+#   audio-cpp/      —— 高层安全封装（待创建）
+#
+# 上游源码以 vendored 拷贝存放在 audio-cpp-sys/audio.cpp（由 .gitignore 排除，
+# 不入库）；参考 llama-cpp-rs 使用 git submodule 的做法见 docs/research_report.md。
+# =====================================================================
+
+[workspace]
+resolver = "3"
+members = ["audio-cpp-sys", "audio-cpp"]
+
+[workspace.package]
+version = "0.11.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/launcher-rs/audio-cpp-rs"
+
+[workspace.dependencies]
+# 构建脚本依赖
+bindgen = "0.72" # C ABI -> Rust 绑定生成
+cmake = "0.1"    # 调用 CMake 构建上游 C++ 库
+cc = { version = "1", features = ["parallel"] } # 编译 C/C++ shim
+glob = "0.3"     # 静态库发现
+
+# 运行期依赖（高层 crate 使用）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# 仅示例/测试使用：用 symphonia 解码 mp3/flac/ogg/m4a 等非 WAV 格式，
+# 演示如何把任意格式音频解码为 f32 采样喂给引擎（不进入库本身依赖）。
+symphonia = { version = "0.6", default-features = false }
+
+# 仅示例/测试使用：用 hf-hub 从 Hugging Face 下载模型权重（不进入库本身依赖）。
+hf-hub = { version = "1.0", default-features = false, features = ["blocking"] }
+
+# 内部 crate（版本随 workspace.package 统一升版）
+audio-cpp-sys = { version = "0.11.0", path = "audio-cpp-sys" }
+
+# =====================================================================
+# 工作区统一 lint 配置（所有成员 crate 继承）。
+# 用 clippy 规范代码：修正性建议全部按 warning 处理，CI 里再加 -D warnings
+# 把告警升为错误，确保不引入新的违规项。
+# =====================================================================
+[workspace.lints.clippy]
+# 警示性建议：与书写意图明显不符的写法一律告警
+all = "warn"
+# pedantic 组（cast 截断、doc_markdown 等）过于吹毛求疵，在 C 绑定/数值边界
+# 场景大量误报，统一不启用；需要时用单独规则或局部 #[allow] 开启。
+# pedantic = "warn"
+# 用 let-else 取代嵌套 if let / else，减少缩进噪音
+manual_let_else = "warn"
+# 禁止非检查条件下的 panic（构建脚本 / 库代码统一用 Result / 断言）
+unwrap_used = "warn"
+expect_used = "warn"
+# 文档注释完整性（缺反引号、缺错误/恐慌说明）
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+# 模块级检查
+mod_module_files = "warn"
+# 冗余写法
+redundant_closure_for_method_calls = "warn"
+# 默认返回/歧义
+default_trait_access = "warn"

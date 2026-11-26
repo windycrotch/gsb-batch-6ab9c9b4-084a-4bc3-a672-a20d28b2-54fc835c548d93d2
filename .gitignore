@@ -1,0 +1,15 @@
+# 构建产物
+/target
+
+# IDE 配置
+.idea
+.vscode
+
+# 临时目录（含 llama-cpp-rs / audio.cpp 参考克隆）
+temp
+
+# 零散的编译中间文件
+*.obj
+*.o
+
+*.wav

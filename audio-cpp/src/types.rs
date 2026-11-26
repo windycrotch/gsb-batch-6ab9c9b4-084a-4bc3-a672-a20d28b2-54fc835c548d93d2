@@ -1,0 +1,2848 @@
+//! 与 `capi.cpp` JSON 输出一一对应的结构化类型。
+//!
+//! 这些类型由 serde 从 shim 返回的 JSON 反序列化而来，字段名与
+//! `capi.cpp` 的 `dump_*` 系列函数保持一致。
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// 任务种类（映射 `audiocpp_model_create_task_session` 的 `task` 参数）。
+///
+/// serde 表示与 [`TaskKind::as_str`] 一致（`"sep"` 而非 `"sourceseparation"`），
+/// 与 C 边界字符串一一对应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskKind {
+    /// 语音活动检测（VAD）
+    Vad,
+    /// 语音识别（ASR）
+    Asr,
+    /// 说话人分离（Diarization）
+    Diar,
+    /// 音频源分离（Source Separation，如 Demucs 分离人声/鼓/贝斯/其他）
+    SourceSeparation,
+    /// 音频生成（Audio Generation，如 MiniMax Music3 音乐生成）
+    AudioGeneration,
+    /// 语音合成（TTS）
+    Tts,
+    /// 语音克隆（Voice Cloning）
+    VoiceCloning,
+    /// 语音转换（Voice Conversion）
+    VoiceConversion,
+    /// 语音到语音（Speech-to-Speech）
+    SpeechToSpeech,
+    /// 强制对齐（Alignment）
+    Alignment,
+    /// 声音设计（Voice Design）
+    VoiceDesign,
+    /// 说话人识别（Speaker Recognition）
+    SpeakerRecognition,
+    /// 歌唱语音转换（SVC）
+    Svc,
+    /// MIDI 生成
+    Midi,
+    /// 轮次检测（Turn Detection，如 Smart Turn 会话是否说完；仅离线）
+    TurnDetection,
+    /// 唤醒词检测（Wake Word，如 microWakeWord / sherpa KWS；离线+流式）
+    WakeWord,
+    /// 音频分类（Audio Classification，如 CED / AST AudioSet 的 527 类；
+    /// 仅离线，结果在 `custom_schema_output`）
+    AudioClassification,
+}
+
+impl TaskKind {
+    /// 转换为传给 C 边界的字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Vad => "vad",
+            TaskKind::Asr => "asr",
+            TaskKind::Diar => "diar",
+            TaskKind::SourceSeparation => "sep",
+            TaskKind::AudioGeneration => "gen",
+            TaskKind::Tts => "tts",
+            TaskKind::VoiceCloning => "clon",
+            TaskKind::VoiceConversion => "vc",
+            TaskKind::SpeechToSpeech => "s2s",
+            TaskKind::Alignment => "align",
+            TaskKind::VoiceDesign => "vdes",
+            TaskKind::SpeakerRecognition => "spk",
+            TaskKind::Svc => "svc",
+            TaskKind::Midi => "midi",
+            TaskKind::TurnDetection => "turn",
+            TaskKind::WakeWord => "wake",
+            TaskKind::AudioClassification => "cls",
+        }
+    }
+}
+
+impl Serialize for TaskKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "vad" => Ok(TaskKind::Vad),
+            "asr" => Ok(TaskKind::Asr),
+            "diar" => Ok(TaskKind::Diar),
+            "sep" => Ok(TaskKind::SourceSeparation),
+            "gen" => Ok(TaskKind::AudioGeneration),
+            "tts" => Ok(TaskKind::Tts),
+            "clon" => Ok(TaskKind::VoiceCloning),
+            "vc" => Ok(TaskKind::VoiceConversion),
+            "s2s" => Ok(TaskKind::SpeechToSpeech),
+            "align" => Ok(TaskKind::Alignment),
+            "vdes" => Ok(TaskKind::VoiceDesign),
+            "spk" => Ok(TaskKind::SpeakerRecognition),
+            "svc" => Ok(TaskKind::Svc),
+            "midi" => Ok(TaskKind::Midi),
+            "turn" => Ok(TaskKind::TurnDetection),
+            // 上游别名：`wake_word`（`wake` 的别名）、`classify`（`cls` 的别名），
+            // capabilities 等 JSON 里出现的是规范短名，解析时两者都接受。
+            "wake" | "wake_word" => Ok(TaskKind::WakeWord),
+            "cls" | "classify" => Ok(TaskKind::AudioClassification),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &[
+                    "vad", "asr", "diar", "sep", "gen", "tts", "clon", "vc", "s2s", "align",
+                    "vdes", "spk", "svc", "midi", "turn", "wake", "cls",
+                ],
+            )),
+        }
+    }
+}
+
+/// 会话运行模式（离线 / 流式）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    /// 离线：一次请求 → 一次结果。
+    Offline,
+    /// 流式：持续送入音频、持续产出事件。
+    Streaming,
+}
+
+impl RunMode {
+    /// 转换为传给 C 边界的字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunMode::Offline => "offline",
+            RunMode::Streaming => "streaming",
+        }
+    }
+}
+
+/// 模型族（映射 `Registry::load` 的 `family_hint` 参数）。
+///
+/// 枚举覆盖上游 `engine_runtime` 的全部 loader 族，`as_str()` 返回传给
+/// C 边界的字符串。GGUF / NeMo safetensors 无法被引擎自动探测族别，加载
+/// 时必须显式指定；用枚举代替裸字符串可避免拼写错误。
+///
+/// 上游社区持续新增模型，本枚举可能滞后：unknown 族可直接用
+/// [`ModelFamily::Custom`] 传任意字符串，`From<&str>` 也会把未收录的名字
+/// 自动映射到 `Custom`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModelFamily {
+    // ---- VAD ----
+    /// Silero VAD（内置权重，通常可省略 family_hint）
+    SileroVad,
+    /// MarbleNet VAD（NeMo 格式，须显式指定）
+    MarblenetVad,
+    /// PulseVAD（16kHz 单声道语音活动检测，2.1K student / 81K teacher；
+    /// 仅离线，阈值选项键为 `threshold`）
+    Pulsevad,
+    /// FireRed VAD（DFSMN 语音活动检测，16kHz mono；离线+流式，
+    /// 流式需 Stream-VAD checkpoint；选项 `threshold` 等）
+    FireredVad,
+    /// Earshot VAD（原生 C++ 移植的语音活动检测，16kHz mono，16ms 帧；
+    /// task 为 `vad`，离线+流式；权重为 `earshot_vad.safetensors`（非 GGUF），
+    /// CMake target `earshot_vad`（alias `earshot`）；流式硬要求 16kHz 单声道；
+    /// 阈值选项 `threshold`/`neg_threshold`，另支持 `smoothing_factor`/
+    /// `speech_pad_ms`/`min_speech_duration_ms`/`min_silence_duration_ms`/
+    /// `start_delay_ms`/`keep_trailing_segment`/会话选项 `exec_plan`）
+    EarshotVad,
+
+    // ---- ASR ----
+    /// Qwen3 ASR
+    Qwen3Asr,
+    /// Citrinet ASR
+    CitrinetAsr,
+    /// SenseVoice ASR（阿里，社区模型）
+    SenseAsr,
+    /// Fun ASR Nano
+    FunAsrNano,
+    /// Higgs Audio STT
+    HiggsAudioStt,
+    /// Hviske ASR
+    HviskeAsr,
+    /// Hviske ASR v6（丹麦语 Whisper-rotary 编码器 + Qwen3 解码器；
+    /// task 为 `asr` 仅离线，16kHz 输入）
+    HviskeAsrV6,
+    /// Kroko ASR
+    KrokoAsr,
+    /// Nemotron ASR
+    NemotronAsr,
+    /// Nemotron 3 Diarization（NVIDIA 八说话人流式分离，社区预览；
+    /// CMake target `nemotron_3_diar`，用 `model-nemotron-3-diar` feature 编译；
+    /// task 为 `diar`，离线+原生批+流式，16kHz 输入）
+    Nemotron3Diar,
+    /// Nemotron 3.5 Transcribe 30B-A4B（NVIDIA Nemotron-H 语音大模型，实验性；
+    /// CMake target `nemotron_transcribe`，用 `model-nemotron-transcribe` feature
+    /// 编译；task 为 `asr` 仅离线；输出含 `word_timestamps` + `speaker_turns` +
+    /// `custom_schema_output`；请求选项 `template_name`/`return_timestamps`/
+    /// `diarization`，会话选项 `disk_experts`/`pin_experts`/`expert_cache_size`
+    /// 等 CPU 专家卸载系）
+    NemotronTranscribe,
+    /// Parakeet TDT
+    ParakeetTdt,
+    /// Vibevoice ASR
+    VibevoiceAsr,
+    /// VibeVoice ASR 流式 7B（离线+流式；与 VibevoiceAsr 同属
+    /// `vibevoice_asr` CMake target，用 `model-vibevoice-asr` feature 编译）
+    VibevoiceAsrStreaming,
+    /// FireRed Audio（语音理解 / 生成，含 Qwen3.5 运行时）
+    FireredAudio,
+    /// Granite 5 ASR（IBM Granite Speech 5.0 470M TurboCTC ASR，社区模型）
+    Granite5Asr,
+    /// Granite Speech 5.0 2B（IBM 自回归多语 ASR + 语音翻译：Conformer 编码器 +
+    /// Q-Former 投影 + Granite 文本解码器；社区模型。CMake target
+    /// `granite_speech5`，用 `model-granite-speech5` feature 编译；
+    /// task 为 `asr` 仅离线，en/fr/de/es/pt/ja，翻译目标另支持 it/zh；
+    /// 请求选项 `language`/`target_language`；权重为
+    /// `Granite-Speech-5.0-2B-GGUF/granite-speech-5.0-2b-{q8_0,orig}.gguf`）
+    GraniteSpeech5,
+    /// Audio8 ASR（社区 ASR 模型）
+    Audio8Asr,
+    /// Audio8 TTS（社区 TTS 模型）
+    Audio8Tts,
+    /// VibeASR（社区 INT8/ternary ASR）
+    Vibeasr,
+    /// Moonshine ASR（社区流式 ASR，离线+流式）
+    MoonshineAsr,
+    /// Niagara ASR（ABR Niagara 英文批处理 ASR，仅离线）
+    NiagaraAsr,
+    /// Canary ASR（NVIDIA Canary 180M Flash 多语 ASR/翻译，仅离线；
+    /// en/de/es/fr，选项 `target_language`/`pnc`）
+    CanaryAsr,
+    /// Cohere ASR（Cohere Transcribe 多语转写，仅离线；14 语种，
+    /// 选项 `pnc`/`max_tokens`）
+    CohereAsr,
+    /// MOSS-Transcribe-Diarize（Whisper 编码器 + Qwen3 解码器，
+    /// 转写+说话人分离+时间戳联合输出；离线+流式）
+    MossTranscribeDiarize,
+    /// Confucius4-R2T2（网易实时流式 ASR，社区模型；离线+流式）
+    Confucius4R2t2,
+    /// Edda ASR（丹麦语 Whisper-large-v3 微调，实验性；可选 DFlash2 无损投机
+    /// 解码 drafter；CMake target `edda_asr`，用 `model-edda-asr` feature 编译；
+    /// task 为 `asr`，离线+流式，da；请求选项 `language`/`speculative`）
+    EddaAsr,
+    /// Audio Flamingo（转写/描述/问答，speech+music+环境音；task 为 `asr` 仅离线）
+    AudioFlamingo,
+    /// CrisperWhisper（Whisper 逐字/意图转写；task 为 `asr`/`align`，离线+流式）
+    Crisperwhisper,
+    /// GigaAM ASR（v3 与多语 Conformer，CTC/RNN-T 解码；task 为 `asr` 仅离线）
+    GigaamAsr,
+    /// Index-Echo-S2TT（语音到文本翻译，双语时间戳字幕；task 为 `asr` 仅离线）
+    IndexEcho,
+    /// LFM2-Audio（Liquid LFM2.5-Audio，FastConformer 编码器；task 为 `asr` 仅离线）
+    Lfm2Audio,
+    /// LFM3-Audio（Liquid AI LFM3-Audio-2B，实验性；log-mel 编码器 + LFM3 混合
+    /// conv/attention 主干，TTS 走 MaskGIT depth 解码 + LiquidCodec 得 24kHz；
+    /// CMake target `lfm3_audio`，用 `model-lfm3-audio` feature 编译；
+    /// task 为 `asr`/`tts`/`s2s`，离线+流式，18 语种（无 auto）；
+    /// S2S 多轮历史经 `output_artifacts` 的 `lfm3_audio.reply` 产物回传）
+    Lfm3Audio,
+    /// LFM d1-Omni（Liquid AI d1-Omni-2B 音频决策：对音频+具名问题输出
+    /// 校准的是/否、选项、评分与数值估计；CMake target `lfm_d1_omni`，
+    /// 用 `model-lfm-d1-omni` feature 编译；task 为 `cls`（classify）仅离线，
+    /// 多语种，结果在 `custom_schema_output`（schema `audio_decisions`））
+    LfmD1Omni,
+    /// OWSM（ESPnet Open Whisper 式多语 ASR/翻译；task 为 `asr`，离线+流式）
+    Owsm,
+    /// OWSM-CTC（ESPnet 非自回归多语 ASR/翻译；task 为 `asr`，离线+流式）
+    OwsmCtc,
+    /// SAMSONE（紧凑音频语言模型：描述/问答/声音音乐语音理解；
+    /// task 为 `asr` 仅离线）
+    Samsone,
+    /// Whistle ASR（社区离线语音识别，本地 FP32 GGUF；task 为 `asr` 仅离线）
+    WhistleAsr,
+    /// Phonon-2 ASR（Fermion Research 英文 ASR，复用 Parakeet 实现，原生热词
+    /// 与短语级流式；与 `parakeet_tdt` 同属 `parakeet_tdt` CMake target
+    /// （ALIASES），用 `model-phonon2-asr` feature 编译；
+    /// task 为 `asr`，离线+流式，en）
+    Phonon2Asr,
+    /// Underdog Bark 3（Conway Research 英文 ASR，Standard/Plus/Pro，
+    /// 复用 Parakeet 实现；与 `parakeet_tdt` 同 target（ALIASES），
+    /// 用 `model-underdog-bark3` feature 编译；task 为 `asr`，离线+流式，en）
+    UnderdogBark3,
+    /// Haas ASR（Haas-ja-v1.0 日文 KDA-TDT ASR，复用 Parakeet 实现；
+    /// 与 `parakeet_tdt` 同 target（ALIASES），用 `model-haas-asr` feature
+    /// 编译；task 为 `asr`，离线+流式，ja）
+    HaasAsr,
+
+    // ---- TTS ----
+    /// Qwen3 TTS
+    Qwen3Tts,
+    /// Confucius4 TTS
+    Confucius4Tts,
+    /// Dots TTS
+    DotsTts,
+    /// Fish Audio
+    FishAudio,
+    /// Fish Audio Drama 3（原生 MoE 语音生成/声音克隆/续写，社区模型，
+    /// 语言 `auto`；task 为 `tts` 长文 / `clon`，离线+流式；克隆需参考音频
+    /// 及其转写 `reference_text`，多参考/续写走 `multi_reference_cond` /
+    /// `previous_takes` 等 JSON 字符串选项）
+    FishDrama3,
+    /// GLM TTS
+    GlmTts,
+    /// Higgs Audio TTS
+    HiggsAudioTts,
+    /// Index TTS2
+    IndexTts2,
+    /// Irodori TTS
+    IrodoriTts,
+    /// MOSS TTS Local
+    MossTtsLocal,
+    /// MOSS TTS Nano
+    MossTtsNano,
+    /// MOSS-TTS-v1.5（8B delay-pattern 零样本声音克隆 TTS，en/zh；
+    /// task 为 `tts`/`clon` 仅离线；克隆需参考音频，请求选项
+    /// `tokens`/`instruct`/`language`/`moss_tts_v15.weight_type`）
+    MossTtsV15,
+    /// MOSS VoiceGen（语音生成）
+    MossVoicegen,
+    /// Neutts
+    Neutts,
+    /// Outetts
+    Outetts,
+    /// Pocket TTS
+    PocketTts,
+    /// Gradium Phonon（与 PocketTTS 同运行时：Mimi codec + flow 声学模型，
+    /// 预置音色 `default`，可导出/复用 voice state；task 为 `tts`，
+    /// 离线+流式；与 `pocket_tts` 同属 `pocket_tts` CMake target）
+    GradiumPhonon,
+    /// PocketTTS Small（英文 2m/7m/18m 及 ReFL 变体，实验性；
+    /// 独立 CMake target `pocket_tts_small`，用 `model-pocket-tts-small`
+    /// feature 编译；task 为 `tts`/`clon`，离线+流式，en，
+    /// 内置音色如 `alba`，克隆走 voice embeddings）
+    PocketTtsSmall,
+    /// VieNeu TTS v3 Turbo（越南语/英语 48kHz TTS + 即时声音克隆，社区模型；
+    /// 上游族名由 `vietneu_tts` 改名而来，旧名仍可经 `From<&str>` 解析；
+    /// task 为 `tts`/`clon` 仅离线；文本输入为 SEA-G2P 音素）
+    VieneuV3Turbo,
+    /// FireRed TTS3（零样本语音合成）
+    Fireredtts3,
+    /// F5 TTS
+    F5Tts,
+    /// Magpie TTS
+    MagpieTts,
+    /// PersonaPlex（多角色对话语音）
+    Personaplex,
+    /// MiniMax H3
+    MinimaxH3,
+    /// SanoTTS（社区 TTS，en/vi/id 共 7 个声音）
+    Sanotts,
+    /// Sopro V2 Turbo TTS
+    SoproTts,
+    /// MiraTTS（社区 TTS）
+    MiraTts,
+    /// CosyVoice3 TTS
+    Cosyvoice3,
+    /// BreezeTTS
+    BreezeTts,
+    /// Soprano TTS
+    SopranoTts,
+    /// Echo TTS
+    EchoTts,
+    /// VoxCPM1 TTS
+    Voxcpm1,
+    /// Kokoro TTS（Kokoro 82M 多语 TTS，仅离线）
+    KokoroTts,
+    /// ZipVoice（k2-fsa 社区流匹配 TTS，含 Distill 变体；en/zh；
+    /// task 为 `tts`/`clon` 仅离线；零样本克隆需 `reference_text` 选项）
+    Zipvoice,
+    /// AuK（腾讯 AuK / AuK-Flash 语音生成与编辑；
+    /// task 为 `tts`/`edit` 仅离线）
+    Auk,
+    /// Piper TTS（社区 VITS TTS，首包英文 `en_US-lessac-medium`，22.05kHz mono；
+    /// task 为 `tts` 仅离线；请求选项 `speed`/`variation`/`duration_variation`/`seed`）
+    PiperTts,
+    /// KittenTTS Mini 0.8（社区英文 TTS，80M 参数，8 个内置声音，24kHz mono；
+    /// task 为 `tts` 仅离线；请求选项 `speed`/`seed`，`--voice-id` 选声音）
+    KittenTts,
+    /// Kitten TTS 2（原生多语 Qwen3 语音生成 + S3 meanflow 解码 + 参考音频克隆；
+    /// task 为 `tts`/`clon` 仅离线）
+    KittenTts2,
+    /// Plapre 3（丹麦语 TTS：Llama 自回归解码器 + Kanade 音频 codec，
+    /// 内置 5 个音色；task 为 `tts`/`clon`，离线+流式（流式仅出完整文本块）；
+    /// 克隆需 `reference_text`，另有 `voice_id`/`context_text`/`edit_*_frame` 等选项）
+    Plapre,
+    /// KugelAudio-0-Open（预置音色 TTS，增量音频输出；task 为 `tts`，离线+流式）
+    Kugelaudio,
+    /// Maya1（3B 表现力英文 TTS，自然语言音色设计 + 行内情感控制；
+    /// task 为 `tts` 仅离线）
+    Maya1,
+    /// MOSS-TTSD（8B delay-pattern 对话 TTS：单遍多说话人 + 逐人零样本克隆，
+    /// 24kHz 16 codebook；task 为 `tts`/`clon` 仅离线）
+    MossTtsd,
+    /// Ming 3.0 TTS 0.5B（Qwen 主干 + flow matching 声学头 + CAMPPlus 说话人
+    /// 条件 + 音频 VAE，zh/en/ja/ko/de/fr/es；task 为 `tts`/`clon`/`vdes`
+    /// 仅离线；`voice_design`/`freeform` 等模板经 `template_name` 选择）
+    Ming3Tts,
+    /// XTTS v2（Coqui 跨语 TTS + 声音克隆：GPT-2 mel-code 生成器 + perceiver
+    /// 条件重采样 + HiFi-GAN 解码器，17 语；task 为 `tts` 仅离线；
+    /// 参考音频即说话人条件，`language` 选项必填）
+    XttsV2,
+    /// ZONOS2（Zyphra 社区 TTS：28 层 GQA/MoE 主干 + 9 延迟 1024-entry DAC
+    /// codebook + 44.1kHz Descript Audio Codec，ECAPA 说话人嵌入克隆；
+    /// CMake target `zonos2`，用 `model-zonos2` feature 编译；task 为
+    /// `tts`/`clon`，离线+流式，en/fr/de/es/it/pt/ja/zh/ko）
+    Zonos2,
+    /// ZONOS3-Mini（Zyphra 社区 TTS：GDN/attention latent-MoE 主干 + 10 延迟
+    /// 4096-entry codebook + 44.1kHz MR-iSTFT 解码器，说话人嵌入与原始参考
+    /// 克隆；CMake target `zonos3`，用 `model-zonos3` feature 编译；task 为
+    /// `tts`/`clon`，离线+流式，en/fr/de/es/it/pt/ja/zh/ko；
+    /// 权重主干文件名为 `backbone-ptq.gguf`，族名靠目录 `ZONOS3-Mini-GGUF` 识别）
+    Zonos3,
+    /// M5-TTS（多语自回归 TTS 与参考音频克隆：Qwen3 speech codec 解码，
+    /// zh/yue/zh-Sichuan/en/de/fr/ja/ko；CMake target `m5_tts`，用
+    /// `model-m5-tts` feature 编译；task 为 `tts`/`clon`，离线+流式；
+    /// `voice_id` 仅对 CustomVoice 检查点有效，`reference_text` 供克隆；
+    /// 请求选项 `language`/`temperature`/`top_k`/`max_tokens`/`instruct`）
+    M5Tts,
+    /// Tiny Voca（4.5M 参数英文 TTS，自带 dizione 音素化前端，无需外部
+    /// phonemizer；CMake target `tiny_voca`，用 `model-tiny-voca` feature
+    /// 编译；task 为 `tts` 仅离线；内置 M2/F2 两个音色，支持长文本；
+    /// 请求选项 `voice_id`/`speed`/`semitone_shift`/`pitch_shift`/`language`）
+    TinyVoca,
+    /// kale-tts-1（kale-tts-1-nano 7.5M / tiny 45.7M 英文 TTS，社区模型；
+    /// 10 个预置音色（8 美音 + 2 英音），自带词表前端（eSpeak-ng 仅读数字与
+    /// 生词）；CMake target `kale_tts`，用 `model-kale-tts` feature 编译；
+    /// task 为 `tts` 仅离线，en-us/en-gb；请求选项 `voice_id`/`speed`/`seed`/
+    /// `text_chunk_mode`/`text_chunk_size` 与 `phonemes`（数组选项，本仓 shim
+    /// 暂不可达），会话选项 `espeak_library_path`/`espeak_data_path`）
+    KaleTts,
+    /// VoxMel（连续 wavelet-factorized 自回归 TTS + 参考音频克隆；CMake target
+    /// `voxmel_tts`，用 `model-voxmel-tts` feature 编译；task 为 `tts`/`clon`
+    /// 仅离线，en/zh；请求选项 `seed`/`reference_text`/`guidance_scale`/
+    /// `speaker_guidance_scale`/`num_inference_steps`/`text_chunk_size` 等，
+    /// 会话选项 `weight_type`/`attention`）
+    VoxmelTts,
+
+    // ---- 说话人分离 / 语音转换 / 音乐生成 ----
+    /// SortFormer 说话人分离（Diar）
+    SortformerDiar,
+    /// SortFormer v2.1 说话人分离（离线+流式，社区模型；
+    /// CMake target `sortformer_diar_v2`，用 `model-sortformer-diar-v2` feature 编译）
+    SortformerDiarV2,
+    /// Seed VC（语音转换）
+    SeedVc,
+    /// RVC（语音转换）
+    Rvc,
+    /// MeanVC2（语音转换）
+    Meanvc2,
+    /// Tone Color VC（独立语音转换，需参考说话人录音；task 为 `vc` 仅离线）
+    ToneColorVc,
+    /// Chatterbox（说话人还原 / TTS）
+    Chatterbox,
+    /// Chatterbox Turbo TTS（快速推理变体）
+    ChatterboxTurbo,
+    /// Vevo2（零样本 TTS / VC / 语音编辑）
+    Vevo2,
+    /// VoxCPM2
+    Voxcpm2,
+    /// Complex Inversion（多任务音频）
+    AceStep,
+
+    // ---- 音乐 / 音频生成与分离 ----
+    /// HTDemucs 音乐源分离
+    Htdemucs,
+    /// HTDemucs 6-stem（鼓/贝斯/人声/其他/吉他/钢琴六轨；task 为 `sep` 仅离线；
+    /// 与 `htdemucs` 同属 `demucs` CMake target，用 `model-demucs` feature 编译）
+    Htdemucs6Stems,
+    /// MossFormer2（重叠语音分离，16kHz；task 为 `sep` 仅离线）
+    Mossformer2,
+    /// TF-GridNet（时频 GridNet 重叠语音分离；task 为 `sep` 仅离线）
+    TfGridnet,
+    /// Mel Band Roformer（乐音建模）
+    MelBandRoformer,
+    /// BSRoformer
+    BsRoformer,
+    /// Muscriptor（乐理描述）
+    Muscriptor,
+    /// Omnivoice（条件自回归生成）
+    Omnivoice,
+    /// Stable Audio（音频生成）
+    StableAudio,
+    /// MiniMax Music3（音乐生成）
+    MinimaxMusic3,
+    /// Supertonic（音乐生成）
+    Supertonic,
+    /// YuE2（音乐生成：符号 ABC 规划 + 语义 codec + NAR 声学流合成；
+    /// 仅离线，task 为 `gen`；请求为纯文本（歌词）+ `style` 选项，不消费音频）
+    Yue2,
+    /// MuLaCover（翻唱歌曲生成：参考音频或旋律/和弦 MIDI + 新歌词与风格，
+    /// 实验性；CMake target `mulacover`，用 `model-mulacover` feature 编译；
+    /// task 为 `music`（即 `gen`）仅离线；请求选项 `melody_file`/`chord_file`/
+    /// `drum_file` 等 MIDI 路径）
+    Mulacover,
+    /// Magenta RealTime 2（Google 帧自回归立体声音乐生成，实验性；文本/音频风格/
+    /// MIDI 条件；CMake target `magenta_realtime_2`，用 `model-magenta-realtime-2`
+    /// feature 编译；task 为 `music`（即 `gen`），离线+流式；结果在 `audio_output`；
+    /// 请求选项 `duration_sec`/`guidance_scale`/`note_guidance_scale`/
+    /// `drum_guidance_scale`/`use_mapper`/`pianoroll_file`（JSON 字符串）/`drums`）
+    MagentaRealtime2,
+    /// SheetSage2（音频转符号谱：输入录音，输出 ABC 乐谱产物；
+    /// 仅离线，task 为 `midi`；结果在 `artifact_output` / `output_artifacts`）
+    Sheetsage2,
+    /// ROSVOT（歌声转符号谱：音符音高/时值与词对齐 MIDI，ROSVOT + RWBD +
+    /// RMVPE；CMake target `rosvot`，用 `model-rosvot` feature 编译；
+    /// task 为 `midi` 仅离线；请求选项 `output_format`（midi/json）/
+    /// `note_boundary_threshold`/`word_boundary_threshold`/`word_durations_file`）
+    Rosvot,
+    /// Dettato（28M 多乐器音频转 MIDI，实验性：音符检测 + evidence 修复 +
+    /// 乐器分组 + 鼓转录；CMake target `dettato`，用 `model-dettato` feature
+    /// 编译；task 为 `midi` 仅离线，语言 `music`；请求选项 `output_format`
+    /// （midi/json），会话选项 `window_hop_sec`）
+    Dettato,
+    /// Voxtral Realtime
+    VoxtralRealtime,
+    /// Voxtral 4B TTS（Mistral Ministral 系自回归 + 流匹配 TTS，内置 20 个预置音色；
+    /// task 为 `tts`，离线+流式；语言 en/fr/es/de/it/pt/nl/ar/hi）
+    VoxtralTts,
+    /// AudioSR（语音/音频超分辨率）
+    Audiosr,
+    /// Apollo（44.1kHz 压缩音频音乐修复；task 为 `s2s` 仅离线）
+    Apollo,
+    /// UniverSR（复数 STFT 流匹配音频超分至 48kHz；task 为 `s2s` 仅离线；
+    /// 选项 `input_sample_rate`/`sampler_mode`/`num_inference_steps`/
+    /// `guidance_scale`/`seed`）
+    Universr,
+    /// 内置音频工具（降噪/增强/超分：deepfilternet2、rnnoise、zipenhancer、
+    /// gtcrn 系列、flashsr；task 为 `s2s` 仅离线；加载时 `model_path`
+    /// 传权重文件或其所在目录（权重需另行下载，非内嵌），另须经 `load_options`
+    /// 传 `{"utility":"<工具 ID>"}`（如 `"rnnoise"`）指定实现）
+    BuiltinAudioUtils,
+    /// Voice Isolator v1（Inworld 48kHz 人声隔离：因果 realtime 检查点支持
+    /// 流式、two-sided offline 检查点仅离线；CMake target `voice_isolator`，
+    /// 用 `model-voice-isolator` feature 编译；task 为 `s2s`，离线+流式，
+    /// 语言无关；会话选项 `weight_type`/`attention_cache_type`/`lookahead_frames`/
+    /// `block_frames`/`audio_chunk_duration_sec`/`audio_chunk_overlap_sec`）
+    VoiceIsolator,
+    /// ControlFoley（可控电影音效生成）
+    ControlFoley,
+    /// MOSS-SoundEffect v2（en/zh 文本转音效：Qwen3 文本编码器、Wan 音频 DiT
+    /// 与连续 DAC 解码器；CMake target `moss_soundeffect`，用
+    /// `model-moss-soundeffect` feature 编译；task 为 `sfx`（即 `gen`）仅离线；
+    /// 请求选项 `duration_sec`/`num_steps` 等）
+    MossSoundeffect,
+    /// MidoAudio / MIdashengLM 生成式音频
+    MidashEnglmGen,
+    /// LiveAvatar（Wan S2V 音频驱动数字人；task 为 `sfx`（即 `gen`），
+    /// 离线+流式）
+    Liveavatar,
+    /// LatentSync 1.6（音频驱动唇形同步参考视频，实验性；task 为 `sfx`
+    /// （即 `gen`）仅离线；请求选项 `reference_video_file` 必填，
+    /// 需 FFmpeg 在 PATH）
+    Latentsync,
+    /// SoulX-FlashHead Lite（音频驱动的流行人像视频生成，实验性；
+    /// CMake target `soulx_flashhead`，用 `model-soulx-flashhead` feature 编译；
+    /// task 为 `sfx`（即 `gen`），离线+流式；请求选项 `reference_image_file`
+    /// 必填（单个 path），另有 `height`/`width`/`num_inference_steps`/
+    /// `color_correction_strength`/`audio_guidance_scale`；视频帧经
+    /// `output_artifacts` 回传，会话选项 `exec_plan`（vae.impl ggml/cudnn））
+    SoulxFlashhead,
+    /// SoulX-Singer（参考音频条件的歌唱合成（SVS）与歌唱 voice conversion
+    /// （SVC）；CMake target `soulx_singer`，用 `model-soulx-singer` feature
+    /// 编译；task 为 `music`（即 `gen`）/`svc` 仅离线，语言 zh/en/yue；
+    /// 请求选项 `reference_metadata_file`/`target_metadata_file`/`control`/
+    /// `pitch_shift`/`auto_pitch_shift`/`guidance_scale`/`num_steps`/`seed`，
+    /// 会话选项 `weight_type`/`attention`）
+    SoulxSinger,
+    /// RE-USE（采样率无关语音修复，双向 Mamba；task 为 `s2s` 仅离线）
+    Reuse,
+    /// Real-time RE-USE（RE-USE 的实时流式变体，语言无关；独立 CMake target
+    /// `realtime_reuse`，用 `model-realtime-reuse` feature 编译；
+    /// task 为 `s2s`，离线+流式，结果在 `audio_output`）
+    RealtimeReuse,
+    /// SAM Audio（prompt 条件音频分离；task 为 `s2s` 仅离线）
+    SamAudio,
+    /// Sidon v0.1（单说话人语音修复，48kHz 输出；task 为 `s2s` 仅离线）
+    Sidon,
+    /// Smart Turn（音频原生轮次完成检测，Whisper-Tiny 编码器；
+    /// task 为 `turn` 仅离线，16kHz mono，选项 `threshold`，结果在
+    /// `custom_schema_output`（schema `smart_turn.v1`））
+    SmartTurn,
+
+    // ---- 唤醒词 / 音频分类 ----
+    /// microWakeWord（MixedNet TFLite 转 GGUF 的流式唤醒词检测；
+    /// task 为 `wake`（别名 `wake_word`），离线+流式，16kHz mono，
+    /// 检测结果在 `speech_segments`）
+    MicroWakeWord,
+    /// sherpa KWS（Zipformer transducer 关键词检测，sherpa-onnx 导出；
+    /// task 为 `wake`（别名 `wake_word`），离线+流式，16kHz mono，
+    /// 检测结果在 `speech_segments`）
+    SherpaKws,
+    /// OpenWakeWord（共享语音嵌入 CNN + 转换分类器的唤醒词检测，英文
+    /// "alexa"；task 为 `wake`（别名 `wake_word`），离线+流式，
+    /// 检测结果在 `speech_segments`，请求选项 `threshold`）
+    OpenWakeWord,
+    /// CED（Consistent Ensemble Distillation ViT 音频分类，527 个 AudioSet
+    /// 类别；task 为 `cls`（别名 `classify`）仅离线，结果在
+    /// `custom_schema_output`（schema `ced.classification.v1`））
+    Ced,
+    /// AST AudioSet（Audio Spectrogram Transformer 多标签分类，527 个
+    /// AudioSet 类别；task 为 `cls`（别名 `classify`）仅离线，结果在
+    /// `custom_schema_output`（schema `ast_audioset.classification.v1`））
+    AstAudioset,
+
+    // ---- 其他 ----
+    /// Miocodec / Miotts（小米语音）
+    Miocodec,
+    /// Miotts（小米 TTS）
+    Miotts,
+    /// Vibevoice（语音转换）
+    Vibevoice,
+    /// Dramabox（剧本播客）
+    Dramabox,
+    /// Heartmula
+    Heartmula,
+    /// Inflect V2
+    InflectV2,
+    /// Qwen3 Forced Aligner（强制对齐）
+    Qwen3ForcedAligner,
+    /// MMS Forced Aligner（强制对齐，社区模型）
+    MmsForcedAligner,
+    /// Ming 3.0 Audio Tiny（Whisper 音频编码器 + 混合 KDA/MLA MoE Thinker，
+    /// 另有连续 latent Talker 产出语音；task 为 `asr`/`s2s`/`tts`/`clon`
+    /// 仅离线，zh/en；内置 300+ Talker 音色，克隆需参考音频）
+    Ming3Audio,
+
+    /// 未收录的模型族名（原样传给 C 边界）。
+    Custom(String),
+}
+
+impl ModelFamily {
+    /// 按文件名关键词推断模型族。
+    ///
+    /// GGUF / NeMo safetensors 无法被引擎自动探测族别，加载时必须显式指定。
+    /// 上游社区习惯以模型族名命名权重文件（如 `qwen3-asr-0.6b-q8_0.gguf`、
+    /// `sortformer-diar-4spk-v1-q8_0.gguf`），本函数从文件名中的关键词
+    /// 匹配到对应 [`ModelFamily`]；无法识别时返回 `None`，调用方应回退到
+    /// 显式 hint 或 [`ModelFamily::Custom`]。
+    ///
+    /// 匹配规则按关键词**首次命中**，文件名需包含明确的族名（如 `qwen3`、
+    /// `citrinet`、`moss-tts-nano`）。`#family=` 片段（`path#family=qwen3_asr`）
+    /// 会被剥离后参与匹配，同时优先于关键词命中。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use audio_cpp::ModelFamily;
+    ///
+    /// assert_eq!(
+    ///     ModelFamily::from_path("models/qwen3-asr-0.6b-q8_0.gguf"),
+    ///     Some(ModelFamily::Qwen3Asr),
+    /// );
+    /// assert_eq!(
+    ///     ModelFamily::from_path("model.gguf#family=citrinet_asr"),
+    ///     Some(ModelFamily::CitrinetAsr),
+    /// );
+    /// assert_eq!(ModelFamily::from_path("my-weights.gguf"), None);
+    /// ```
+    pub fn from_path(path: &str) -> Option<ModelFamily> {
+        let lower = path.to_ascii_lowercase();
+        // `#family=xxx` 片段：显式指定优先，直接映射后返回。
+        if let Some((_, f)) = lower.rsplit_once("#family=") {
+            return Some(ModelFamily::from(f.trim()));
+        }
+        // 关键词 → 族：按文件名常用命名约定匹配。
+        const KEYWORDS: &[(&str, ModelFamily)] = &[
+            ("silero_vad", ModelFamily::SileroVad),
+            ("silero-vad", ModelFamily::SileroVad),
+            ("marblenet_vad", ModelFamily::MarblenetVad),
+            ("marblenet-vad", ModelFamily::MarblenetVad),
+            ("marblenet", ModelFamily::MarblenetVad),
+            ("pulsevad", ModelFamily::Pulsevad),
+            ("pulse-vad", ModelFamily::Pulsevad),
+            ("pulse", ModelFamily::Pulsevad),
+            ("firered_vad", ModelFamily::FireredVad),
+            ("firered-vad", ModelFamily::FireredVad),
+            ("fireredvad", ModelFamily::FireredVad),
+            ("earshot_vad", ModelFamily::EarshotVad),
+            ("earshot-vad", ModelFamily::EarshotVad),
+            ("earshot", ModelFamily::EarshotVad),
+            ("qwen3_asr", ModelFamily::Qwen3Asr),
+            ("qwen3-asr", ModelFamily::Qwen3Asr),
+            ("qwen3_tts", ModelFamily::Qwen3Tts),
+            ("qwen3-tts", ModelFamily::Qwen3Tts),
+            ("qwen3_forced_aligner", ModelFamily::Qwen3ForcedAligner),
+            ("qwen3-forced-aligner", ModelFamily::Qwen3ForcedAligner),
+            ("qwen3", ModelFamily::Qwen3Asr),
+            ("citrinet", ModelFamily::CitrinetAsr),
+            ("sense_asr", ModelFamily::SenseAsr),
+            ("sense-asr", ModelFamily::SenseAsr),
+            ("sensevoice", ModelFamily::SenseAsr),
+            ("fun-asr-nano", ModelFamily::FunAsrNano),
+            ("fun_asr_nano", ModelFamily::FunAsrNano),
+            ("funasr", ModelFamily::FunAsrNano),
+            ("higgs_audio_stt", ModelFamily::HiggsAudioStt),
+            ("higgs_audio_tts", ModelFamily::HiggsAudioTts),
+            ("higgs", ModelFamily::HiggsAudioStt),
+            // hviske_asr_v6 必须排在裸 "hviske" 之前，否则会被吞掉。
+            ("hviske_asr_v6", ModelFamily::HviskeAsrV6),
+            ("hviske-asr-v6", ModelFamily::HviskeAsrV6),
+            ("hviske-v6", ModelFamily::HviskeAsrV6),
+            ("hviskev6", ModelFamily::HviskeAsrV6),
+            ("hviske", ModelFamily::HviskeAsr),
+            ("whistle_asr", ModelFamily::WhistleAsr),
+            ("whistle-asr", ModelFamily::WhistleAsr),
+            ("whistle", ModelFamily::WhistleAsr),
+            // edda_asr 无裸前缀冲突，单独列出（丹麦语 Whisper）。
+            ("edda_asr", ModelFamily::EddaAsr),
+            ("edda-asr", ModelFamily::EddaAsr),
+            ("edda", ModelFamily::EddaAsr),
+            ("kroko", ModelFamily::KrokoAsr),
+            // nemotron_transcribe 必须排在 nemotron_3_diar / 裸 "nemotron" 之前：
+            // 上游权重目录名 `NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF` 小写后
+            // 含子串 "nemotron-3"，会被 diar 的关键词抢先吞掉。
+            ("nemotron_transcribe", ModelFamily::NemotronTranscribe),
+            ("nemotron-transcribe", ModelFamily::NemotronTranscribe),
+            ("nemotron_3.5_transcribe", ModelFamily::NemotronTranscribe),
+            ("nemotron-3.5-transcribe", ModelFamily::NemotronTranscribe),
+            ("nemotron-3.5", ModelFamily::NemotronTranscribe),
+            ("nemotron_3.5", ModelFamily::NemotronTranscribe),
+            ("nemotron_3_diar", ModelFamily::Nemotron3Diar),
+            ("nemotron-3-diar", ModelFamily::Nemotron3Diar),
+            ("nemotron_3", ModelFamily::Nemotron3Diar),
+            ("nemotron-3", ModelFamily::Nemotron3Diar),
+            ("nemotron", ModelFamily::NemotronAsr),
+            ("parakeet", ModelFamily::ParakeetTdt),
+            // phonon2_asr / underdog_bark3 / haas_asr 与 parakeet_tdt 同属
+            // `parakeet_tdt` target（ALIASES），权重名分别为
+            // phonon-2-mixed-*.gguf / underdog-bark-3.0-*.gguf / haas-ja-v1.0-*.gguf。
+            // phonon-2 现为正式族（此前 gradium_phonon 只收 phonon-31m/40m
+            // 正是给这里留白）；"bark" 裸词易误伤，只收带 3 的写法。
+            ("phonon2_asr", ModelFamily::Phonon2Asr),
+            ("phonon2-asr", ModelFamily::Phonon2Asr),
+            ("phonon-2", ModelFamily::Phonon2Asr),
+            ("phonon2", ModelFamily::Phonon2Asr),
+            ("phonon_2", ModelFamily::Phonon2Asr),
+            ("underdog_bark3", ModelFamily::UnderdogBark3),
+            ("underdog-bark3", ModelFamily::UnderdogBark3),
+            ("underdog-bark-3", ModelFamily::UnderdogBark3),
+            ("underdog", ModelFamily::UnderdogBark3),
+            ("bark3", ModelFamily::UnderdogBark3),
+            ("bark-3", ModelFamily::UnderdogBark3),
+            ("haas_asr", ModelFamily::HaasAsr),
+            ("haas-asr", ModelFamily::HaasAsr),
+            ("haas-ja", ModelFamily::HaasAsr),
+            ("haas", ModelFamily::HaasAsr),
+            (
+                "vibevoice_asr_streaming",
+                ModelFamily::VibevoiceAsrStreaming,
+            ),
+            (
+                "vibevoice-asr-streaming",
+                ModelFamily::VibevoiceAsrStreaming,
+            ),
+            ("vibevoice_asr", ModelFamily::VibevoiceAsr),
+            ("firered_audio", ModelFamily::FireredAudio),
+            ("firered-audio", ModelFamily::FireredAudio),
+            // granite_speech5（Granite Speech 5.0 2B）必须排在 granite5asr 的
+            // "granite-speech"/"granite" 之前：新族权重为 granite-speech-5.0-2b-*.gguf，
+            // 含 "granite-speech" 子串，会被既有关键词抢先吞掉；470m-turboctc
+            // 权重名不含 "-5.0-2b"，不受影响。
+            ("granite_speech5", ModelFamily::GraniteSpeech5),
+            ("granite-speech5", ModelFamily::GraniteSpeech5),
+            ("granite-speech-5.0-2b", ModelFamily::GraniteSpeech5),
+            ("granite5asr", ModelFamily::Granite5Asr),
+            ("granite-speech", ModelFamily::Granite5Asr),
+            ("granite_speech", ModelFamily::Granite5Asr),
+            ("granite", ModelFamily::Granite5Asr),
+            ("audio8_asr", ModelFamily::Audio8Asr),
+            ("audio8-asr", ModelFamily::Audio8Asr),
+            ("audio8asr", ModelFamily::Audio8Asr),
+            ("arkasr", ModelFamily::Audio8Asr),
+            ("audio8_tts", ModelFamily::Audio8Tts),
+            ("audio8-tts", ModelFamily::Audio8Tts),
+            ("audio8tts", ModelFamily::Audio8Tts),
+            ("fireredtts3", ModelFamily::Fireredtts3),
+            ("firered_tts3", ModelFamily::Fireredtts3),
+            ("firered-tts3", ModelFamily::Fireredtts3),
+            ("vibevoice", ModelFamily::Vibevoice),
+            // confucius4_r2t2 必须排在裸 "confucius" 之前，否则会被吞掉。
+            ("confucius4_r2t2", ModelFamily::Confucius4R2t2),
+            ("confucius4-r2t2", ModelFamily::Confucius4R2t2),
+            ("r2t2", ModelFamily::Confucius4R2t2),
+            ("confucius", ModelFamily::Confucius4Tts),
+            ("dots_tts", ModelFamily::DotsTts),
+            ("dots-tts", ModelFamily::DotsTts),
+            // fish_drama3 与 fish_audio 无子串重叠，但仍按“更具体者优先”排列。
+            ("fish_drama3", ModelFamily::FishDrama3),
+            ("fish-drama3", ModelFamily::FishDrama3),
+            ("fish_audio", ModelFamily::FishAudio),
+            ("fish-audio", ModelFamily::FishAudio),
+            ("glm_tts", ModelFamily::GlmTts),
+            ("glm-tts", ModelFamily::GlmTts),
+            ("index_tts2", ModelFamily::IndexTts2),
+            ("index-tts2", ModelFamily::IndexTts2),
+            ("irodori", ModelFamily::IrodoriTts),
+            // moss_transcribe_diarize 必须排在裸 "moss" 之前，否则会被吞掉。
+            (
+                "moss_transcribe_diarize",
+                ModelFamily::MossTranscribeDiarize,
+            ),
+            (
+                "moss-transcribe-diarize",
+                ModelFamily::MossTranscribeDiarize,
+            ),
+            // mossformer2 必须排在裸 "moss" 之前，否则会被吞掉。
+            ("mossformer2", ModelFamily::Mossformer2),
+            ("mossformer-2", ModelFamily::Mossformer2),
+            ("mossformer", ModelFamily::Mossformer2),
+            // moss_soundeffect 必须排在裸 "moss" 之前（权重名
+            // moss-soundeffect-v2-q8_0.gguf）。
+            ("moss_soundeffect", ModelFamily::MossSoundeffect),
+            ("moss-soundeffect", ModelFamily::MossSoundeffect),
+            ("moss_sound_effect", ModelFamily::MossSoundeffect),
+            ("moss-sound-effect", ModelFamily::MossSoundeffect),
+            ("moss-tts-nano", ModelFamily::MossTtsNano),
+            ("moss_tts_nano", ModelFamily::MossTtsNano),
+            ("moss-tts-local", ModelFamily::MossTtsLocal),
+            ("moss_tts_local", ModelFamily::MossTtsLocal),
+            // moss_tts_v15 / moss_ttsd 必须排在裸 "moss" 之前，否则会被吞掉。
+            ("moss-tts-v15", ModelFamily::MossTtsV15),
+            ("moss_tts_v15", ModelFamily::MossTtsV15),
+            ("moss_ttsd", ModelFamily::MossTtsd),
+            ("moss-ttsd", ModelFamily::MossTtsd),
+            ("mossttsd", ModelFamily::MossTtsd),
+            ("moss_voicegen", ModelFamily::MossVoicegen),
+            ("moss-voicegen", ModelFamily::MossVoicegen),
+            ("moss", ModelFamily::MossTtsNano),
+            ("neutts", ModelFamily::Neutts),
+            ("outetts", ModelFamily::Outetts),
+            ("gradium_phonon", ModelFamily::GradiumPhonon),
+            ("gradium-phonon", ModelFamily::GradiumPhonon),
+            ("gradium", ModelFamily::GradiumPhonon),
+            // 打包权重名为 phonon-31m-en-*.gguf；不收裸 "phonon"（与 31m/40m
+            // 都无子串交叠的 "phonon-2" 已自 cc21c9ea→d2da530b 起归属正式族
+            // Phonon2Asr，见 parakeet 段关键词）。
+            ("phonon-31m", ModelFamily::GradiumPhonon),
+            ("phonon_31m", ModelFamily::GradiumPhonon),
+            ("phonon-40m", ModelFamily::GradiumPhonon),
+            ("phonon_40m", ModelFamily::GradiumPhonon),
+            // pocket_tts_small 必须排在裸 "pocket_tts" 之前（族名含其子串，
+            // 否则会被吞成 PocketTts）；官方目录名 PocketTTS-Small-GGUF 由
+            // "pockettts-small" 覆盖。
+            ("pocket_tts_small", ModelFamily::PocketTtsSmall),
+            ("pocket-tts-small", ModelFamily::PocketTtsSmall),
+            ("pockettts-small", ModelFamily::PocketTtsSmall),
+            ("pocket_tts", ModelFamily::PocketTts),
+            ("pocket-tts", ModelFamily::PocketTts),
+            ("vietneu", ModelFamily::VieneuV3Turbo),
+            ("vieneu", ModelFamily::VieneuV3Turbo),
+            ("f5_tts", ModelFamily::F5Tts),
+            ("f5-tts", ModelFamily::F5Tts),
+            ("magpie", ModelFamily::MagpieTts),
+            ("personaplex", ModelFamily::Personaplex),
+            ("soprano_tts", ModelFamily::SopranoTts),
+            ("soprano-tts", ModelFamily::SopranoTts),
+            ("soprano", ModelFamily::SopranoTts),
+            // index_echo 必须排在裸 "echo" 之前，否则会被吞掉。
+            ("index_echo", ModelFamily::IndexEcho),
+            ("index-echo", ModelFamily::IndexEcho),
+            ("indexecho", ModelFamily::IndexEcho),
+            ("echo_tts", ModelFamily::EchoTts),
+            ("echo-tts", ModelFamily::EchoTts),
+            ("echo", ModelFamily::EchoTts),
+            ("kokoro_tts", ModelFamily::KokoroTts),
+            ("kokoro-tts", ModelFamily::KokoroTts),
+            ("kokoro", ModelFamily::KokoroTts),
+            ("piper_tts", ModelFamily::PiperTts),
+            ("piper-tts", ModelFamily::PiperTts),
+            ("piper", ModelFamily::PiperTts),
+            // kitten_tts2 必须排在 kitten_tts / 裸 "kitten" 之前，否则会被吞掉。
+            ("kitten_tts2", ModelFamily::KittenTts2),
+            ("kitten-tts2", ModelFamily::KittenTts2),
+            ("kitten_tts_2", ModelFamily::KittenTts2),
+            ("kittentts2", ModelFamily::KittenTts2),
+            ("kitten_tts", ModelFamily::KittenTts),
+            ("kitten-tts", ModelFamily::KittenTts),
+            ("kitten", ModelFamily::KittenTts),
+            // plapre 置于裸关键词之前不受影响（无前缀家族），单独列出。
+            ("plapre_3", ModelFamily::Plapre),
+            ("plapre-3", ModelFamily::Plapre),
+            ("plapre", ModelFamily::Plapre),
+            ("kugelaudio", ModelFamily::Kugelaudio),
+            ("kugel-audio", ModelFamily::Kugelaudio),
+            ("kugel_audio", ModelFamily::Kugelaudio),
+            ("kugel", ModelFamily::Kugelaudio),
+            ("maya1", ModelFamily::Maya1),
+            ("maya-1", ModelFamily::Maya1),
+            ("maya_1", ModelFamily::Maya1),
+            ("maya", ModelFamily::Maya1),
+            // ming3_audio 必须排在裸 "ming3" 之前，否则会被吞成 Ming3Tts。
+            ("ming3_audio", ModelFamily::Ming3Audio),
+            ("ming3-audio", ModelFamily::Ming3Audio),
+            ("ming-3.0-audio", ModelFamily::Ming3Audio),
+            ("ming_3.0_audio", ModelFamily::Ming3Audio),
+            ("ming3_tts", ModelFamily::Ming3Tts),
+            ("ming3-tts", ModelFamily::Ming3Tts),
+            ("ming-3.0-tts", ModelFamily::Ming3Tts),
+            ("ming_3.0_tts", ModelFamily::Ming3Tts),
+            ("ming3", ModelFamily::Ming3Tts),
+            ("xtts_v2", ModelFamily::XttsV2),
+            ("xtts-v2", ModelFamily::XttsV2),
+            ("xtts", ModelFamily::XttsV2),
+            // zonos2 / zonos3 无裸前缀冲突，各收族名与连字符写法；
+            // zonos3 主干权重名 backbone-ptq.gguf 不含族名，靠目录
+            // ZONOS3-Mini-GGUF 命中。
+            ("zonos2", ModelFamily::Zonos2),
+            ("zonos-2", ModelFamily::Zonos2),
+            ("zonos3_mini", ModelFamily::Zonos3),
+            ("zonos3-mini", ModelFamily::Zonos3),
+            ("zonos3", ModelFamily::Zonos3),
+            ("zonos-3", ModelFamily::Zonos3),
+            // m5_tts：上游权重目录 M5-TTS-GGUF / 文件名 m5-tts-50m-*.gguf
+            ("m5_tts", ModelFamily::M5Tts),
+            ("m5-tts", ModelFamily::M5Tts),
+            ("m5tts", ModelFamily::M5Tts),
+            ("voxcpm1", ModelFamily::Voxcpm1),
+            ("voxcpm-1", ModelFamily::Voxcpm1),
+            ("sanotts", ModelFamily::Sanotts),
+            ("sano-tts", ModelFamily::Sanotts),
+            ("sano_tts", ModelFamily::Sanotts),
+            ("sopro_tts", ModelFamily::SoproTts),
+            ("sopro-tts", ModelFamily::SoproTts),
+            ("sopro", ModelFamily::SoproTts),
+            ("mira_tts", ModelFamily::MiraTts),
+            ("mira-tts", ModelFamily::MiraTts),
+            ("miratts", ModelFamily::MiraTts),
+            ("mira", ModelFamily::MiraTts),
+            ("cosyvoice3", ModelFamily::Cosyvoice3),
+            ("cosyvoice-3", ModelFamily::Cosyvoice3),
+            ("cosyvoice", ModelFamily::Cosyvoice3),
+            ("breeze_tts", ModelFamily::BreezeTts),
+            ("breeze-tts", ModelFamily::BreezeTts),
+            ("breeze", ModelFamily::BreezeTts),
+            ("vibeasr", ModelFamily::Vibeasr),
+            ("vibe-asr", ModelFamily::Vibeasr),
+            ("moonshine_asr", ModelFamily::MoonshineAsr),
+            ("moonshine-asr", ModelFamily::MoonshineAsr),
+            ("moonshine", ModelFamily::MoonshineAsr),
+            ("niagara_asr", ModelFamily::NiagaraAsr),
+            ("niagara-asr", ModelFamily::NiagaraAsr),
+            ("niagara", ModelFamily::NiagaraAsr),
+            ("canary_asr", ModelFamily::CanaryAsr),
+            ("canary-asr", ModelFamily::CanaryAsr),
+            ("canary", ModelFamily::CanaryAsr),
+            ("cohere_asr", ModelFamily::CohereAsr),
+            ("cohere-asr", ModelFamily::CohereAsr),
+            ("cohere", ModelFamily::CohereAsr),
+            ("audio_flamingo", ModelFamily::AudioFlamingo),
+            ("audio-flamingo", ModelFamily::AudioFlamingo),
+            ("audioflamingo", ModelFamily::AudioFlamingo),
+            ("crisperwhisper", ModelFamily::Crisperwhisper),
+            ("crisper-whisper", ModelFamily::Crisperwhisper),
+            ("crisper_whisper", ModelFamily::Crisperwhisper),
+            ("gigaam_asr", ModelFamily::GigaamAsr),
+            ("gigaam-asr", ModelFamily::GigaamAsr),
+            ("gigaam", ModelFamily::GigaamAsr),
+            // lfm_d1_omni 权重名为 d1-Omni-2B-*.gguf（含 mmproj- 前缀的
+            // encoder 文件）；"d1" 过短易误伤，只收族名与 d1-omni。
+            ("lfm_d1_omni", ModelFamily::LfmD1Omni),
+            ("lfm-d1-omni", ModelFamily::LfmD1Omni),
+            ("d1_omni", ModelFamily::LfmD1Omni),
+            ("d1-omni", ModelFamily::LfmD1Omni),
+            ("lfm2_audio", ModelFamily::Lfm2Audio),
+            ("lfm2-audio", ModelFamily::Lfm2Audio),
+            ("lfm2", ModelFamily::Lfm2Audio),
+            ("lfm3_audio", ModelFamily::Lfm3Audio),
+            ("lfm3-audio", ModelFamily::Lfm3Audio),
+            ("lfm3", ModelFamily::Lfm3Audio),
+            // owsm_ctc 必须排在裸 "owsm" 之前，否则会被吞掉。
+            ("owsm_ctc", ModelFamily::OwsmCtc),
+            ("owsm-ctc", ModelFamily::OwsmCtc),
+            ("owsmctc", ModelFamily::OwsmCtc),
+            ("owsm", ModelFamily::Owsm),
+            ("samsone", ModelFamily::Samsone),
+            ("sam-sone", ModelFamily::Samsone),
+            ("zipvoice", ModelFamily::Zipvoice),
+            ("zip-voice", ModelFamily::Zipvoice),
+            ("liveavatar", ModelFamily::Liveavatar),
+            ("live-avatar", ModelFamily::Liveavatar),
+            ("latentsync", ModelFamily::Latentsync),
+            ("latent-sync", ModelFamily::Latentsync),
+            ("latent_sync", ModelFamily::Latentsync),
+            // tiny_voca / rosvot 与既有关键词无前缀冲突。
+            ("tiny_voca", ModelFamily::TinyVoca),
+            ("tiny-voca", ModelFamily::TinyVoca),
+            ("tinyvoca", ModelFamily::TinyVoca),
+            ("rosvot", ModelFamily::Rosvot),
+            // soulx_singer 必须排在裸 "soulx" 之前：官方权重目录为
+            // SoulX-Singer-GGUF、文件名 soulx-singer-q8_0.gguf，都会被既有
+            // SoulX-FlashHead 的 "soulx" 关键词抢先吞掉。
+            ("soulx_singer", ModelFamily::SoulxSinger),
+            ("soulx-singer", ModelFamily::SoulxSinger),
+            ("soulxsinger", ModelFamily::SoulxSinger),
+            ("soulx_flashhead", ModelFamily::SoulxFlashhead),
+            ("soulx-flashhead", ModelFamily::SoulxFlashhead),
+            ("soulx", ModelFamily::SoulxFlashhead),
+            ("flashhead", ModelFamily::SoulxFlashhead),
+            // realtime_reuse 必须排在裸 "reuse"/"re-use" 之前：官方权重目录为
+            // RE-USE-GGUF（小写后含 "re-use"），文件名 realtime-reuse-f32.gguf
+            // （含 "reuse"），两者都会被既有 RE-USE 关键词抢先吞掉。
+            ("realtime_reuse", ModelFamily::RealtimeReuse),
+            ("realtime-reuse", ModelFamily::RealtimeReuse),
+            ("real-time-reuse", ModelFamily::RealtimeReuse),
+            ("realtimereuse", ModelFamily::RealtimeReuse),
+            ("reuse", ModelFamily::Reuse),
+            ("re-use", ModelFamily::Reuse),
+            ("sam_audio", ModelFamily::SamAudio),
+            ("sam-audio", ModelFamily::SamAudio),
+            ("samaudio", ModelFamily::SamAudio),
+            ("sidon", ModelFamily::Sidon),
+            ("smart_turn", ModelFamily::SmartTurn),
+            ("smart-turn", ModelFamily::SmartTurn),
+            ("smartturn", ModelFamily::SmartTurn),
+            ("auk", ModelFamily::Auk),
+            ("minimax_h3", ModelFamily::MinimaxH3),
+            ("minimax-h3", ModelFamily::MinimaxH3),
+            ("sortformer_diar_v2", ModelFamily::SortformerDiarV2),
+            ("sortformer-diar-v2", ModelFamily::SortformerDiarV2),
+            ("sortformer_diar", ModelFamily::SortformerDiar),
+            ("sortformer-diar", ModelFamily::SortformerDiar),
+            ("sortformer", ModelFamily::SortformerDiar),
+            ("seed_vc", ModelFamily::SeedVc),
+            ("seed-vc", ModelFamily::SeedVc),
+            ("seedvc", ModelFamily::SeedVc),
+            ("rvc", ModelFamily::Rvc),
+            ("meanvc2", ModelFamily::Meanvc2),
+            ("mean-vc2", ModelFamily::Meanvc2),
+            ("tone_color_vc", ModelFamily::ToneColorVc),
+            ("tone-color-vc", ModelFamily::ToneColorVc),
+            ("tone_color", ModelFamily::ToneColorVc),
+            ("tonecolor", ModelFamily::ToneColorVc),
+            ("chatterbox_turbo", ModelFamily::ChatterboxTurbo),
+            ("chatterbox-turbo", ModelFamily::ChatterboxTurbo),
+            ("chatterbox", ModelFamily::Chatterbox),
+            ("vevo2", ModelFamily::Vevo2),
+            ("voxcpm2", ModelFamily::Voxcpm2),
+            ("ace_step", ModelFamily::AceStep),
+            ("ace-step", ModelFamily::AceStep),
+            // htdemucs_6stems（含别名 6s）必须排在裸 "htdemucs" 之前，否则会被吞掉。
+            ("htdemucs_6stems", ModelFamily::Htdemucs6Stems),
+            ("htdemucs-6stems", ModelFamily::Htdemucs6Stems),
+            ("htdemucs_6s", ModelFamily::Htdemucs6Stems),
+            ("htdemucs-6s", ModelFamily::Htdemucs6Stems),
+            ("htdemucs", ModelFamily::Htdemucs),
+            ("demucs", ModelFamily::Htdemucs),
+            ("tf_gridnet", ModelFamily::TfGridnet),
+            ("tf-gridnet", ModelFamily::TfGridnet),
+            ("tfgridnet", ModelFamily::TfGridnet),
+            ("gridnet", ModelFamily::TfGridnet),
+            ("mel-band-roformer", ModelFamily::MelBandRoformer),
+            ("mel_band_roformer", ModelFamily::MelBandRoformer),
+            ("bs-roformer", ModelFamily::BsRoformer),
+            ("bs_roformer", ModelFamily::BsRoformer),
+            ("muscriptor", ModelFamily::Muscriptor),
+            ("omnivoice", ModelFamily::Omnivoice),
+            ("stable_audio", ModelFamily::StableAudio),
+            ("stable-audio", ModelFamily::StableAudio),
+            ("minimax_music3", ModelFamily::MinimaxMusic3),
+            ("minimax-music3", ModelFamily::MinimaxMusic3),
+            ("supertonic", ModelFamily::Supertonic),
+            ("yue2", ModelFamily::Yue2),
+            ("magenta_realtime_2", ModelFamily::MagentaRealtime2),
+            ("magenta-realtime-2", ModelFamily::MagentaRealtime2),
+            ("magenta_rt2", ModelFamily::MagentaRealtime2),
+            ("magenta-rt2", ModelFamily::MagentaRealtime2),
+            ("magenta", ModelFamily::MagentaRealtime2),
+            ("yue-2", ModelFamily::Yue2),
+            // mulacover 只收完整族名：裸 "mula" 会误伤 heartmula。
+            ("mulacover", ModelFamily::Mulacover),
+            ("mula-cover", ModelFamily::Mulacover),
+            ("mula_cover", ModelFamily::Mulacover),
+            ("sheetsage2", ModelFamily::Sheetsage2),
+            ("sheetsage-2", ModelFamily::Sheetsage2),
+            ("sheetsage", ModelFamily::Sheetsage2),
+            // voxtral_tts 必须排在裸 "voxtral" 之前，否则会被吞掉。
+            ("voxtral_tts", ModelFamily::VoxtralTts),
+            ("voxtral-tts", ModelFamily::VoxtralTts),
+            ("voxtral-realtime", ModelFamily::VoxtralRealtime),
+            ("voxtral", ModelFamily::VoxtralRealtime),
+            ("audiosr", ModelFamily::Audiosr),
+            ("audio-sr", ModelFamily::Audiosr),
+            ("apollo", ModelFamily::Apollo),
+            ("universr", ModelFamily::Universr),
+            ("univer-sr", ModelFamily::Universr),
+            ("controlfoley", ModelFamily::ControlFoley),
+            ("control-foley", ModelFamily::ControlFoley),
+            ("midashenglm_gen", ModelFamily::MidashEnglmGen),
+            ("midashenglm-gen", ModelFamily::MidashEnglmGen),
+            ("midashen", ModelFamily::MidashEnglmGen),
+            ("builtin_audio_utils", ModelFamily::BuiltinAudioUtils),
+            ("builtin-audio-utils", ModelFamily::BuiltinAudioUtils),
+            ("deepfilternet", ModelFamily::BuiltinAudioUtils),
+            ("rnnoise", ModelFamily::BuiltinAudioUtils),
+            ("zipenhancer", ModelFamily::BuiltinAudioUtils),
+            ("gtcrn", ModelFamily::BuiltinAudioUtils),
+            ("flashsr", ModelFamily::BuiltinAudioUtils),
+            ("miocodec", ModelFamily::Miocodec),
+            ("miotts", ModelFamily::Miotts),
+            ("dramabox", ModelFamily::Dramabox),
+            ("heartmula", ModelFamily::Heartmula),
+            ("inflect", ModelFamily::InflectV2),
+            ("mms_forced_aligner", ModelFamily::MmsForcedAligner),
+            ("mms", ModelFamily::MmsForcedAligner),
+            ("forced-aligner", ModelFamily::Qwen3ForcedAligner),
+            // 唤醒词 / 分类族：`ced` 是 `forced-aligner`（for**ced**）的子串，
+            // 必须排在它之后，否则对齐模型会被误判为 CED。
+            ("micro_wake_word", ModelFamily::MicroWakeWord),
+            ("micro-wake-word", ModelFamily::MicroWakeWord),
+            ("micro_wake", ModelFamily::MicroWakeWord),
+            ("micro-wake", ModelFamily::MicroWakeWord),
+            ("microwake", ModelFamily::MicroWakeWord),
+            ("sherpa_kws", ModelFamily::SherpaKws),
+            ("sherpa-kws", ModelFamily::SherpaKws),
+            ("sherpa", ModelFamily::SherpaKws),
+            // open_wake_word 无裸前缀冲突，紧随其它唤醒词族列出。
+            ("open_wake_word", ModelFamily::OpenWakeWord),
+            ("open-wake-word", ModelFamily::OpenWakeWord),
+            ("openwake", ModelFamily::OpenWakeWord),
+            ("ced", ModelFamily::Ced),
+            ("ast_audioset", ModelFamily::AstAudioset),
+            ("ast-audioset", ModelFamily::AstAudioset),
+            ("audioset", ModelFamily::AstAudioset),
+            // d09b2d78 新增 4 族：与既有关键词无前缀吞并冲突，各收族名、
+            // 连字符写法与上游权重目录名（kale-tts-1 / voice-isolator /
+            // VoxMel-TTS / Dettato）。不收裸 "voice"（会误伤 vibevoice）。
+            ("kale_tts", ModelFamily::KaleTts),
+            ("kale-tts", ModelFamily::KaleTts),
+            ("kaletts", ModelFamily::KaleTts),
+            ("voxmel_tts", ModelFamily::VoxmelTts),
+            ("voxmel-tts", ModelFamily::VoxmelTts),
+            ("voxmeltts", ModelFamily::VoxmelTts),
+            ("voxmel", ModelFamily::VoxmelTts),
+            ("voice_isolator", ModelFamily::VoiceIsolator),
+            ("voice-isolator", ModelFamily::VoiceIsolator),
+            ("voiceisolator", ModelFamily::VoiceIsolator),
+            ("dettato", ModelFamily::Dettato),
+        ];
+        KEYWORDS
+            .iter()
+            .find(|(k, _)| lower.contains(k))
+            .map(|(_, family)| family.clone())
+    }
+
+    /// 转换为传给 C 边界的字符串。
+    pub fn as_str(&self) -> &str {
+        match self {
+            ModelFamily::SileroVad => "silero_vad",
+            ModelFamily::MarblenetVad => "marblenet_vad",
+            ModelFamily::Pulsevad => "pulsevad",
+            ModelFamily::FireredVad => "firered_vad",
+            ModelFamily::EarshotVad => "earshot_vad",
+            ModelFamily::Qwen3Asr => "qwen3_asr",
+            ModelFamily::CitrinetAsr => "citrinet_asr",
+            ModelFamily::SenseAsr => "sense_asr",
+            ModelFamily::FunAsrNano => "fun_asr_nano",
+            ModelFamily::HiggsAudioStt => "higgs_audio_stt",
+            ModelFamily::HviskeAsr => "hviske_asr",
+            ModelFamily::HviskeAsrV6 => "hviske_asr_v6",
+            ModelFamily::KrokoAsr => "kroko_asr",
+            ModelFamily::NemotronAsr => "nemotron_asr",
+            ModelFamily::Nemotron3Diar => "nemotron_3_diar",
+            ModelFamily::NemotronTranscribe => "nemotron_transcribe",
+            ModelFamily::ParakeetTdt => "parakeet_tdt",
+            ModelFamily::VibevoiceAsr => "vibevoice_asr",
+            ModelFamily::VibevoiceAsrStreaming => "vibevoice_asr_streaming",
+            ModelFamily::FireredAudio => "firered_audio",
+            ModelFamily::Granite5Asr => "granite5asr",
+            ModelFamily::GraniteSpeech5 => "granite_speech5",
+            ModelFamily::Audio8Asr => "audio8_asr",
+            ModelFamily::Audio8Tts => "audio8_tts",
+            ModelFamily::Vibeasr => "vibeasr",
+            ModelFamily::MoonshineAsr => "moonshine_asr",
+            ModelFamily::NiagaraAsr => "niagara_asr",
+            ModelFamily::CanaryAsr => "canary_asr",
+            ModelFamily::CohereAsr => "cohere_asr",
+            ModelFamily::MossTranscribeDiarize => "moss_transcribe_diarize",
+            ModelFamily::Confucius4R2t2 => "confucius4_r2t2",
+            ModelFamily::EddaAsr => "edda_asr",
+            ModelFamily::AudioFlamingo => "audio_flamingo",
+            ModelFamily::Crisperwhisper => "crisperwhisper",
+            ModelFamily::GigaamAsr => "gigaam_asr",
+            ModelFamily::IndexEcho => "index_echo",
+            ModelFamily::Lfm2Audio => "lfm2_audio",
+            ModelFamily::Lfm3Audio => "lfm3_audio",
+            ModelFamily::LfmD1Omni => "lfm_d1_omni",
+            ModelFamily::Owsm => "owsm",
+            ModelFamily::OwsmCtc => "owsm_ctc",
+            ModelFamily::Samsone => "samsone",
+            ModelFamily::WhistleAsr => "whistle_asr",
+            ModelFamily::Phonon2Asr => "phonon2_asr",
+            ModelFamily::UnderdogBark3 => "underdog_bark3",
+            ModelFamily::HaasAsr => "haas_asr",
+            ModelFamily::Qwen3Tts => "qwen3_tts",
+            ModelFamily::Confucius4Tts => "confucius4_tts",
+            ModelFamily::DotsTts => "dots_tts",
+            ModelFamily::FishAudio => "fish_audio",
+            ModelFamily::FishDrama3 => "fish_drama3",
+            ModelFamily::GlmTts => "glm_tts",
+            ModelFamily::HiggsAudioTts => "higgs_audio_tts",
+            ModelFamily::IndexTts2 => "index_tts2",
+            ModelFamily::IrodoriTts => "irodori_tts",
+            ModelFamily::MossTtsLocal => "moss_tts_local",
+            ModelFamily::MossTtsNano => "moss_tts_nano",
+            ModelFamily::MossTtsV15 => "moss_tts_v15",
+            ModelFamily::MossVoicegen => "moss_voicegen",
+            ModelFamily::Neutts => "neutts",
+            ModelFamily::Outetts => "outetts",
+            ModelFamily::PocketTts => "pocket_tts",
+            ModelFamily::GradiumPhonon => "gradium_phonon",
+            ModelFamily::PocketTtsSmall => "pocket_tts_small",
+            ModelFamily::VieneuV3Turbo => "vieneu_v3_turbo",
+            ModelFamily::Fireredtts3 => "fireredtts3",
+            ModelFamily::F5Tts => "f5_tts",
+            ModelFamily::MagpieTts => "magpie_tts",
+            ModelFamily::Personaplex => "personaplex",
+            ModelFamily::SopranoTts => "soprano_tts",
+            ModelFamily::EchoTts => "echo_tts",
+            ModelFamily::Voxcpm1 => "voxcpm1",
+            ModelFamily::KokoroTts => "kokoro_tts",
+            ModelFamily::Zipvoice => "zipvoice",
+            ModelFamily::Auk => "auk",
+            ModelFamily::PiperTts => "piper_tts",
+            ModelFamily::KittenTts => "kitten_tts",
+            ModelFamily::KittenTts2 => "kitten_tts2",
+            ModelFamily::Plapre => "plapre",
+            ModelFamily::Kugelaudio => "kugelaudio",
+            ModelFamily::Maya1 => "maya1",
+            ModelFamily::MossTtsd => "moss_ttsd",
+            ModelFamily::Ming3Tts => "ming3_tts",
+            ModelFamily::XttsV2 => "xtts_v2",
+            ModelFamily::Zonos2 => "zonos2",
+            ModelFamily::Zonos3 => "zonos3",
+            ModelFamily::M5Tts => "m5_tts",
+            ModelFamily::TinyVoca => "tiny_voca",
+            ModelFamily::KaleTts => "kale_tts",
+            ModelFamily::VoxmelTts => "voxmel_tts",
+            ModelFamily::MinimaxH3 => "minimax_h3",
+            ModelFamily::Sanotts => "sanotts",
+            ModelFamily::SoproTts => "sopro_tts",
+            ModelFamily::MiraTts => "mira_tts",
+            ModelFamily::Cosyvoice3 => "cosyvoice3",
+            ModelFamily::BreezeTts => "breeze_tts",
+            ModelFamily::SortformerDiar => "sortformer_diar",
+            ModelFamily::SortformerDiarV2 => "sortformer_diar_v2",
+            ModelFamily::SeedVc => "seed_vc",
+            ModelFamily::Rvc => "rvc",
+            ModelFamily::Meanvc2 => "meanvc2",
+            ModelFamily::ToneColorVc => "tone_color_vc",
+            ModelFamily::Chatterbox => "chatterbox",
+            ModelFamily::ChatterboxTurbo => "chatterbox_turbo",
+            ModelFamily::Vevo2 => "vevo2",
+            ModelFamily::Voxcpm2 => "voxcpm2",
+            ModelFamily::AceStep => "ace_step",
+            ModelFamily::Htdemucs => "htdemucs",
+            ModelFamily::Htdemucs6Stems => "htdemucs_6stems",
+            ModelFamily::Mossformer2 => "mossformer2",
+            ModelFamily::TfGridnet => "tf_gridnet",
+            ModelFamily::MelBandRoformer => "mel_band_roformer",
+            ModelFamily::BsRoformer => "bs_roformer",
+            ModelFamily::Muscriptor => "muscriptor",
+            ModelFamily::Omnivoice => "omnivoice",
+            ModelFamily::StableAudio => "stable_audio",
+            ModelFamily::MinimaxMusic3 => "minimax_music3",
+            ModelFamily::Supertonic => "supertonic",
+            ModelFamily::Yue2 => "yue2",
+            ModelFamily::Mulacover => "mulacover",
+            ModelFamily::MagentaRealtime2 => "magenta_realtime_2",
+            ModelFamily::Sheetsage2 => "sheetsage2",
+            ModelFamily::Rosvot => "rosvot",
+            ModelFamily::Dettato => "dettato",
+            ModelFamily::VoxtralRealtime => "voxtral_realtime",
+            ModelFamily::VoxtralTts => "voxtral_tts",
+            ModelFamily::Audiosr => "audiosr",
+            ModelFamily::Apollo => "apollo",
+            ModelFamily::Universr => "universr",
+            ModelFamily::BuiltinAudioUtils => "builtin_audio_utils",
+            ModelFamily::VoiceIsolator => "voice_isolator",
+            ModelFamily::ControlFoley => "controlfoley",
+            ModelFamily::MossSoundeffect => "moss_soundeffect",
+            ModelFamily::MidashEnglmGen => "midashenglm_gen",
+            ModelFamily::Liveavatar => "liveavatar",
+            ModelFamily::Latentsync => "latentsync",
+            ModelFamily::SoulxFlashhead => "soulx_flashhead",
+            ModelFamily::SoulxSinger => "soulx_singer",
+            ModelFamily::Reuse => "reuse",
+            ModelFamily::RealtimeReuse => "realtime_reuse",
+            ModelFamily::SamAudio => "sam_audio",
+            ModelFamily::Sidon => "sidon",
+            ModelFamily::SmartTurn => "smart_turn",
+            ModelFamily::MicroWakeWord => "micro_wake_word",
+            ModelFamily::SherpaKws => "sherpa_kws",
+            ModelFamily::OpenWakeWord => "open_wake_word",
+            ModelFamily::Ced => "ced",
+            ModelFamily::AstAudioset => "ast_audioset",
+            ModelFamily::Miocodec => "miocodec",
+            ModelFamily::Miotts => "miotts",
+            ModelFamily::Vibevoice => "vibevoice",
+            ModelFamily::Dramabox => "dramabox",
+            ModelFamily::Heartmula => "heartmula",
+            ModelFamily::InflectV2 => "inflect_v2",
+            ModelFamily::Qwen3ForcedAligner => "qwen3_forced_aligner",
+            ModelFamily::MmsForcedAligner => "mms_forced_aligner",
+            ModelFamily::Ming3Audio => "ming3_audio",
+            ModelFamily::Custom(s) => s,
+        }
+    }
+}
+
+impl From<&str> for ModelFamily {
+    /// 从字符串构造：收录的名字映射到对应变体，未收录的落入 `Custom`。
+    fn from(s: &str) -> Self {
+        match s {
+            "silero_vad" => ModelFamily::SileroVad,
+            "marblenet_vad" => ModelFamily::MarblenetVad,
+            "pulsevad" => ModelFamily::Pulsevad,
+            "firered_vad" => ModelFamily::FireredVad,
+            "firered-vad" => ModelFamily::FireredVad,
+            "earshot_vad" => ModelFamily::EarshotVad,
+            "earshot-vad" => ModelFamily::EarshotVad,
+            // 上游 loader 声明的家族别名（family_aliases）。
+            "earshot" => ModelFamily::EarshotVad,
+            "qwen3_asr" => ModelFamily::Qwen3Asr,
+            "citrinet_asr" => ModelFamily::CitrinetAsr,
+            "sense_asr" => ModelFamily::SenseAsr,
+            "fun_asr_nano" => ModelFamily::FunAsrNano,
+            "higgs_audio_stt" => ModelFamily::HiggsAudioStt,
+            "hviske_asr" => ModelFamily::HviskeAsr,
+            "hviske_asr_v6" => ModelFamily::HviskeAsrV6,
+            "hviske-asr-v6" => ModelFamily::HviskeAsrV6,
+            "kroko_asr" => ModelFamily::KrokoAsr,
+            "nemotron_asr" => ModelFamily::NemotronAsr,
+            "nemotron_3_diar" => ModelFamily::Nemotron3Diar,
+            "nemotron_transcribe" => ModelFamily::NemotronTranscribe,
+            "nemotron-transcribe" => ModelFamily::NemotronTranscribe,
+            "parakeet_tdt" => ModelFamily::ParakeetTdt,
+            "vibevoice_asr" => ModelFamily::VibevoiceAsr,
+            "vibevoice_asr_streaming" => ModelFamily::VibevoiceAsrStreaming,
+            "firered_audio" => ModelFamily::FireredAudio,
+            "granite5asr" => ModelFamily::Granite5Asr,
+            "granite_speech5_asr" => ModelFamily::Granite5Asr,
+            "granite_speech" => ModelFamily::Granite5Asr,
+            "granite_speech5_ctc" => ModelFamily::Granite5Asr,
+            // Granite Speech 5.0 2B（granite_speech5 族；与上面 granite5asr 的
+            // turboctc 变体名互斥，均为精确匹配不冲突）。
+            "granite_speech5" | "granite-speech5" => ModelFamily::GraniteSpeech5,
+            "audio8_asr" => ModelFamily::Audio8Asr,
+            "arkasr" => ModelFamily::Audio8Asr,
+            "audio8_tts" => ModelFamily::Audio8Tts,
+            "vibeasr" => ModelFamily::Vibeasr,
+            "moonshine_asr" => ModelFamily::MoonshineAsr,
+            "niagara_asr" => ModelFamily::NiagaraAsr,
+            "canary_asr" => ModelFamily::CanaryAsr,
+            "cohere_asr" => ModelFamily::CohereAsr,
+            "moss_transcribe_diarize" => ModelFamily::MossTranscribeDiarize,
+            "confucius4_r2t2" => ModelFamily::Confucius4R2t2,
+            "edda_asr" => ModelFamily::EddaAsr,
+            "edda-asr" => ModelFamily::EddaAsr,
+            "audio_flamingo" => ModelFamily::AudioFlamingo,
+            "crisperwhisper" => ModelFamily::Crisperwhisper,
+            "gigaam_asr" => ModelFamily::GigaamAsr,
+            "index_echo" => ModelFamily::IndexEcho,
+            "lfm2_audio" => ModelFamily::Lfm2Audio,
+            "lfm3_audio" => ModelFamily::Lfm3Audio,
+            "lfm3-audio" => ModelFamily::Lfm3Audio,
+            "lfm_d1_omni" => ModelFamily::LfmD1Omni,
+            "lfm-d1-omni" => ModelFamily::LfmD1Omni,
+            "owsm" => ModelFamily::Owsm,
+            "owsm_ctc" => ModelFamily::OwsmCtc,
+            "samsone" => ModelFamily::Samsone,
+            "whistle_asr" => ModelFamily::WhistleAsr,
+            "whistle-asr" => ModelFamily::WhistleAsr,
+            "phonon2_asr" => ModelFamily::Phonon2Asr,
+            "phonon2-asr" => ModelFamily::Phonon2Asr,
+            "underdog_bark3" => ModelFamily::UnderdogBark3,
+            "underdog-bark3" => ModelFamily::UnderdogBark3,
+            "haas_asr" => ModelFamily::HaasAsr,
+            "haas-asr" => ModelFamily::HaasAsr,
+            "qwen3_tts" => ModelFamily::Qwen3Tts,
+            "confucius4_tts" => ModelFamily::Confucius4Tts,
+            "dots_tts" => ModelFamily::DotsTts,
+            "fish_audio" => ModelFamily::FishAudio,
+            "fish_drama3" => ModelFamily::FishDrama3,
+            "fish-drama3" => ModelFamily::FishDrama3,
+            "glm_tts" => ModelFamily::GlmTts,
+            "higgs_audio_tts" => ModelFamily::HiggsAudioTts,
+            "index_tts2" => ModelFamily::IndexTts2,
+            "irodori_tts" => ModelFamily::IrodoriTts,
+            "moss_tts_local" => ModelFamily::MossTtsLocal,
+            "moss_tts_nano" => ModelFamily::MossTtsNano,
+            "moss_tts_v15" => ModelFamily::MossTtsV15,
+            "moss_voicegen" => ModelFamily::MossVoicegen,
+            "neutts" => ModelFamily::Neutts,
+            "outetts" => ModelFamily::Outetts,
+            "pocket_tts" => ModelFamily::PocketTts,
+            "pocket_tts_small" => ModelFamily::PocketTtsSmall,
+            "pocket-tts-small" => ModelFamily::PocketTtsSmall,
+            "gradium_phonon" => ModelFamily::GradiumPhonon,
+            "gradium-phonon" => ModelFamily::GradiumPhonon,
+            "gradium" => ModelFamily::GradiumPhonon,
+            "vietneu_tts" => ModelFamily::VieneuV3Turbo,
+            "vieneu_v3_turbo" => ModelFamily::VieneuV3Turbo,
+            "fireredtts3" => ModelFamily::Fireredtts3,
+            "f5_tts" => ModelFamily::F5Tts,
+            "magpie_tts" => ModelFamily::MagpieTts,
+            "personaplex" => ModelFamily::Personaplex,
+            "soprano_tts" => ModelFamily::SopranoTts,
+            "echo_tts" => ModelFamily::EchoTts,
+            "voxcpm1" => ModelFamily::Voxcpm1,
+            "kokoro_tts" => ModelFamily::KokoroTts,
+            "zipvoice" => ModelFamily::Zipvoice,
+            "auk" => ModelFamily::Auk,
+            "piper_tts" => ModelFamily::PiperTts,
+            "kitten_tts" => ModelFamily::KittenTts,
+            "kitten_tts2" => ModelFamily::KittenTts2,
+            "kale_tts" | "kale-tts" => ModelFamily::KaleTts,
+            "voxmel_tts" | "voxmel-tts" | "voxmeltts" => ModelFamily::VoxmelTts,
+            "plapre" => ModelFamily::Plapre,
+            "plapre_3" | "plapre-3" => ModelFamily::Plapre,
+            "kugelaudio" => ModelFamily::Kugelaudio,
+            "maya1" => ModelFamily::Maya1,
+            "moss_ttsd" => ModelFamily::MossTtsd,
+            "ming3_tts" => ModelFamily::Ming3Tts,
+            "ming3-tts" => ModelFamily::Ming3Tts,
+            "ming3_audio" => ModelFamily::Ming3Audio,
+            "ming3-audio" => ModelFamily::Ming3Audio,
+            "xtts_v2" => ModelFamily::XttsV2,
+            "xtts-v2" => ModelFamily::XttsV2,
+            "xtts" => ModelFamily::XttsV2,
+            "zonos2" => ModelFamily::Zonos2,
+            "zonos-2" => ModelFamily::Zonos2,
+            "zonos3" => ModelFamily::Zonos3,
+            "zonos3_mini" => ModelFamily::Zonos3,
+            "zonos3-mini" => ModelFamily::Zonos3,
+            "zonos-3" => ModelFamily::Zonos3,
+            "m5_tts" | "m5-tts" | "m5tts" => ModelFamily::M5Tts,
+            "tiny_voca" | "tiny-voca" | "tinyvoca" => ModelFamily::TinyVoca,
+            "minimax_h3" => ModelFamily::MinimaxH3,
+            "sanotts" => ModelFamily::Sanotts,
+            "sopro_tts" => ModelFamily::SoproTts,
+            "sopro" => ModelFamily::SoproTts,
+            "sopro_v2" => ModelFamily::SoproTts,
+            "sopro_v2_turbo" => ModelFamily::SoproTts,
+            "mira_tts" => ModelFamily::MiraTts,
+            "miratts" => ModelFamily::MiraTts,
+            "mira" => ModelFamily::MiraTts,
+            "MiraTTS" => ModelFamily::MiraTts,
+            "cosyvoice3" => ModelFamily::Cosyvoice3,
+            "breeze_tts" => ModelFamily::BreezeTts,
+            "sortformer_diar" => ModelFamily::SortformerDiar,
+            "sortformer_diar_v2" => ModelFamily::SortformerDiarV2,
+            "seed_vc" => ModelFamily::SeedVc,
+            "rvc" => ModelFamily::Rvc,
+            "meanvc2" => ModelFamily::Meanvc2,
+            "tone_color_vc" => ModelFamily::ToneColorVc,
+            "chatterbox" => ModelFamily::Chatterbox,
+            "chatterbox_turbo" => ModelFamily::ChatterboxTurbo,
+            "vevo2" => ModelFamily::Vevo2,
+            "voxcpm2" => ModelFamily::Voxcpm2,
+            "ace_step" => ModelFamily::AceStep,
+            "htdemucs" => ModelFamily::Htdemucs,
+            "htdemucs_6stems" => ModelFamily::Htdemucs6Stems,
+            "htdemucs_6s" => ModelFamily::Htdemucs6Stems,
+            "mossformer2" => ModelFamily::Mossformer2,
+            "tf_gridnet" => ModelFamily::TfGridnet,
+            "tf-gridnet" => ModelFamily::TfGridnet,
+            "mel_band_roformer" => ModelFamily::MelBandRoformer,
+            "bs_roformer" => ModelFamily::BsRoformer,
+            "muscriptor" => ModelFamily::Muscriptor,
+            "omnivoice" => ModelFamily::Omnivoice,
+            "stable_audio" => ModelFamily::StableAudio,
+            "minimax_music3" => ModelFamily::MinimaxMusic3,
+            "supertonic" => ModelFamily::Supertonic,
+            "yue2" => ModelFamily::Yue2,
+            "mulacover" => ModelFamily::Mulacover,
+            "mula-cover" => ModelFamily::Mulacover,
+            "magenta_realtime_2" => ModelFamily::MagentaRealtime2,
+            "magenta-realtime-2" => ModelFamily::MagentaRealtime2,
+            "sheetsage2" => ModelFamily::Sheetsage2,
+            "rosvot" => ModelFamily::Rosvot,
+            "dettato" => ModelFamily::Dettato,
+            "voxtral_realtime" => ModelFamily::VoxtralRealtime,
+            "voxtral_tts" => ModelFamily::VoxtralTts,
+            "voxtral-tts" => ModelFamily::VoxtralTts,
+            "audiosr" => ModelFamily::Audiosr,
+            "apollo" => ModelFamily::Apollo,
+            "universr" => ModelFamily::Universr,
+            "builtin_audio_utils" => ModelFamily::BuiltinAudioUtils,
+            "voice_isolator" | "voice-isolator" | "voiceisolator" => ModelFamily::VoiceIsolator,
+            "controlfoley" => ModelFamily::ControlFoley,
+            "moss_soundeffect" => ModelFamily::MossSoundeffect,
+            "moss-soundeffect" => ModelFamily::MossSoundeffect,
+            "midashenglm_gen" => ModelFamily::MidashEnglmGen,
+            "liveavatar" => ModelFamily::Liveavatar,
+            "latentsync" => ModelFamily::Latentsync,
+            "latent-sync" => ModelFamily::Latentsync,
+            "soulx_flashhead" => ModelFamily::SoulxFlashhead,
+            "soulx-flashhead" => ModelFamily::SoulxFlashhead,
+            "soulx_singer" => ModelFamily::SoulxSinger,
+            "soulx-singer" => ModelFamily::SoulxSinger,
+            "soulxsinger" => ModelFamily::SoulxSinger,
+            "reuse" => ModelFamily::Reuse,
+            "realtime_reuse" => ModelFamily::RealtimeReuse,
+            "realtime-reuse" => ModelFamily::RealtimeReuse,
+            "sam_audio" => ModelFamily::SamAudio,
+            "sidon" => ModelFamily::Sidon,
+            "smart_turn" => ModelFamily::SmartTurn,
+            "micro_wake_word" => ModelFamily::MicroWakeWord,
+            "micro-wake-word" => ModelFamily::MicroWakeWord,
+            "sherpa_kws" => ModelFamily::SherpaKws,
+            "sherpa-kws" => ModelFamily::SherpaKws,
+            "open_wake_word" => ModelFamily::OpenWakeWord,
+            "open-wake-word" => ModelFamily::OpenWakeWord,
+            "ced" => ModelFamily::Ced,
+            "ast_audioset" => ModelFamily::AstAudioset,
+            "ast-audioset" => ModelFamily::AstAudioset,
+            "miocodec" => ModelFamily::Miocodec,
+            "miotts" => ModelFamily::Miotts,
+            "vibevoice" => ModelFamily::Vibevoice,
+            "dramabox" => ModelFamily::Dramabox,
+            "heartmula" => ModelFamily::Heartmula,
+            "inflect_v2" => ModelFamily::InflectV2,
+            "qwen3_forced_aligner" => ModelFamily::Qwen3ForcedAligner,
+            "mms_forced_aligner" => ModelFamily::MmsForcedAligner,
+            other => ModelFamily::Custom(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for ModelFamily {
+    fn from(s: String) -> Self {
+        ModelFamily::from(s.as_str())
+    }
+}
+
+impl AsRef<str> for ModelFamily {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for ModelFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 计算后端（映射 `audiocpp_model_create_task_session` 的 `backend` 参数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// CPU
+    Cpu,
+    /// CUDA
+    Cuda,
+    /// HIP / ROCm
+    Hip,
+    /// Vulkan
+    Vulkan,
+    /// Metal
+    Metal,
+    /// 自动选择最佳可用后端
+    Best,
+}
+
+impl Backend {
+    /// 转换为传给 C 边界的字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Cpu => "cpu",
+            Backend::Cuda => "cuda",
+            Backend::Hip => "hip",
+            Backend::Vulkan => "vulkan",
+            Backend::Metal => "metal",
+            Backend::Best => "best",
+        }
+    }
+}
+
+/// 计算设备（`audiocpp_registry_devices_json` 的一项）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Device {
+    /// 后端名，如 `"CPU"`。
+    pub backend: String,
+    /// 设备序号。
+    pub index: i32,
+    /// 设备名。
+    pub name: String,
+    /// 设备类型，如 `"CPU"`。
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+/// 模型族 loader 的声明信息（`audiocpp_registry_loaders_json` 的一项）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoaderInfo {
+    /// 模型族名。
+    pub family: String,
+    /// 能力集合。
+    pub capabilities: Capabilities,
+    /// 指令策略描述。
+    pub instructions_policy: String,
+    /// 可用的 API 端点。
+    pub api_endpoints: Vec<String>,
+}
+
+/// 能力集合（`audiocpp_model_capabilities_json` / loader 声明）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// 支持的任务及其模式。
+    pub supported_tasks: Vec<SupportedTask>,
+    /// 支持的语言。
+    pub languages: Vec<String>,
+    /// 是否支持说话人参考音频。
+    pub supports_speaker_reference: bool,
+    /// 是否支持风格条件。
+    pub supports_style_condition: bool,
+    /// 是否支持时间戳。
+    pub supports_timestamps: bool,
+}
+
+/// 一个受支持的任务及其可用模式。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupportedTask {
+    /// 任务名，如 `"vad"`。
+    pub task: String,
+    /// 可用模式，如 `["offline","streaming"]`。
+    pub modes: Vec<String>,
+}
+
+/// 已加载模型的元数据（`audiocpp_model_metadata_json`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelMetadata {
+    /// 模型族。
+    pub family: String,
+    /// 变体。
+    pub variant: String,
+    /// 描述。
+    pub description: String,
+    /// 候选配置。
+    pub config_candidates: Vec<String>,
+    /// 候选权重。
+    pub weight_candidates: Vec<String>,
+}
+
+/// 一段音频在采样轴上的时间范围。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TimeSpan {
+    /// 起始采样点（含）。
+    pub start_sample: i64,
+    /// 结束采样点（不含）。
+    pub end_sample: i64,
+}
+
+/// 语音活动片段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeechSegment {
+    /// 时间范围。
+    pub span: TimeSpan,
+    /// 置信度（0..1）。
+    pub confidence: f32,
+    /// 附带文本（如 ASR 片段）。
+    pub text: String,
+}
+
+/// 说话人分离中的一段发言（谁在什么时间说话）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerTurn {
+    /// 说话人 id，如 `"speaker_0"`。
+    pub speaker_id: String,
+    /// 发言时间范围。
+    pub span: TimeSpan,
+    /// 置信度（0..1）。
+    pub confidence: f32,
+    /// 该段文本（部分模型产出，如带转写的说话人分离）。
+    #[serde(default)]
+    pub text: String,
+}
+
+/// 词级时间戳（ASR 逐词对齐）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordTimestamp {
+    /// 时间范围（采样点）。
+    pub span: TimeSpan,
+    /// 词文本。
+    pub word: String,
+    /// 置信度（0..1）。
+    pub confidence: f32,
+}
+
+/// 模型产出的产物（embedding / 状态 / 对齐结果等）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceArtifact {
+    /// 产物种类（如 `speaker_embedding` / `transcript_alignment`）。
+    pub kind: String,
+    /// 产物 id。
+    pub id: String,
+    /// 二进制载荷的 base64 编码（无载荷时为空字符串）。
+    #[serde(default)]
+    pub payload_base64: String,
+    /// 附加元数据。
+    #[serde(default)]
+    pub meta: BTreeMap<String, String>,
+}
+
+/// CLI 选项信息（模型支持的请求 / 会话 / 加载选项）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CliOption {
+    /// 选项名。
+    pub name: String,
+    /// 值名称（帮助文本）。
+    pub value_name: String,
+    /// 描述。
+    pub description: String,
+    /// 是否必填。
+    pub required: bool,
+    /// 默认值（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    /// 最小值（可选，字符串形式）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_value: Option<String>,
+    /// 最大值（可选，字符串形式）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_value: Option<String>,
+}
+
+/// 模型预检时发现的配置 / 权重资产。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedAsset {
+    /// 资产 id。
+    pub id: String,
+    /// 资产路径。
+    pub path: String,
+}
+
+/// 模型的三类 CLI 选项（请求 / 会话 / 加载）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CliInterface {
+    /// 请求级选项（如 `audio_chunk_seconds`）。
+    #[serde(default)]
+    pub request_options: Vec<CliOption>,
+    /// 会话级选项。
+    #[serde(default)]
+    pub session_options: Vec<CliOption>,
+    /// 加载级选项（如 `weight_id`）。
+    #[serde(default)]
+    pub load_options: Vec<CliOption>,
+}
+
+/// 模型预检结果（`Registry::inspect`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelInspection {
+    /// 模型元数据。
+    pub metadata: ModelMetadata,
+    /// 能力集合。
+    pub capabilities: Capabilities,
+    /// CLI 选项（请求 / 会话 / 加载）。
+    pub cli: CliInterface,
+    /// 发现的配置文件。
+    #[serde(default)]
+    pub discovered_configs: Vec<NamedAsset>,
+    /// 发现的权重文件。
+    #[serde(default)]
+    pub discovered_weights: Vec<NamedAsset>,
+    /// 模型根目录。
+    #[serde(default)]
+    pub model_root: String,
+}
+
+/// 文本输出（如 ASR / TTS 的文本）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextOutput {
+    /// 文本内容。
+    pub text: String,
+    /// 语言。
+    pub language: String,
+}
+
+/// 音频输出的描述信息（采样率 / 声道 / 长度）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioBufferInfo {
+    /// 采样率。
+    pub sample_rate: i32,
+    /// 声道数。
+    pub channels: i32,
+    /// 采样数。
+    pub sample_count: usize,
+    /// 实际采样数据（f32，-1..1）。仅当生成音频需要回传时存在
+    /// （如 TTS 的 `audio_output`）；VAD / ASR 通常不携带。
+    #[serde(default)]
+    pub samples: Option<Vec<f32>>,
+}
+
+/// 带名字的音频输出（如 TTS 的多段输出）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedAudioOutput {
+    /// 输出 id。
+    pub id: String,
+    /// 音频描述。
+    pub audio: AudioBufferInfo,
+    /// 附加元数据。
+    pub meta: BTreeMap<String, String>,
+}
+
+/// 自定义结构化输出（上游 `TaskResult::custom_schema_output`）。
+///
+/// 目前有三类产出：Smart Turn（task `turn`）的 `"smart_turn.v1"`
+///（`data` 为 `{"complete": bool, "probability": number}`，`threshold`
+/// 请求选项判定，默认 0.5）；CED（task `cls`）的 `"ced.classification.v1"`；
+/// AST AudioSet（task `cls`）的 `"ast_audioset.classification.v1"`。
+/// 后两者的 `data` 为 `{"scores": [...]}`（527 个 AudioSet 类别得分）。
+/// `data` 为任意 JSON，用 `serde_json::Value` 承载。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomSchemaOutput {
+    /// 输出 schema 标识，如 `"smart_turn.v1"`。
+    pub schema: String,
+    /// 结构化数据载荷。
+    pub data: serde_json::Value,
+}
+
+/// 一次任务执行的完整结果（`audiocpp_session_run_offline` / `finish`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskResult {
+    /// 检测到的语音片段。
+    pub speech_segments: Vec<SpeechSegment>,
+    /// 说话人分离的发言分段（存在时）。
+    pub speaker_turns: Vec<SpeakerTurn>,
+    /// 文本输出（存在时）。
+    pub text_output: Option<TextOutput>,
+    /// 音频输出（存在时）。
+    pub audio_output: Option<AudioBufferInfo>,
+    /// 命名音频输出列表。
+    pub named_audio_outputs: Vec<NamedAudioOutput>,
+    /// 词级时间戳（存在时）。
+    ///
+    /// 是否输出按模型族而定，空数组只表示"本次无词戳"，先查选项再报缺口：
+    /// - Qwen3 ASR：默认**不**输出；需请求选项 `return_timestamps=true`（见
+    ///   [`crate::options::request::RETURN_TIMESTAMPS`]），且建会话时经会话选项
+    ///   配好对齐模型（见
+    ///   [`crate::options::session::QWEN3_ASR_FORCED_ALIGNER_MODEL_PATH`]），
+    ///   上游用对齐器内部回填。流式模式不支持词戳（直接抛错）。
+    /// - 强制对齐族（`qwen3_forced_aligner` / `mms_forced_aligner`，task
+    ///   `align`）直接输出；ASR 主文本 + 对齐回填是无词戳族的常规降级链。
+    #[serde(default)]
+    pub word_timestamps: Vec<WordTimestamp>,
+    /// 自定义结构化输出（存在时，如 Smart Turn 的 `smart_turn.v1` 轮次判定）。
+    #[serde(default)]
+    pub custom_schema_output: Option<CustomSchemaOutput>,
+    /// 单个产物输出（存在时，如 voice-clone 的 cached_voice_id）。
+    #[serde(default)]
+    pub artifact_output: Option<VoiceArtifact>,
+    /// 多个产物输出（存在时）。
+    #[serde(default)]
+    pub output_artifacts: Vec<VoiceArtifact>,
+}
+
+/// 流式会话产出的单个事件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamEvent {
+    /// 语音活动事件列表。
+    pub voice_activity: Vec<VoiceActivityEvent>,
+    /// 部分文本（流式 ASR 等）。
+    pub partial_text: Option<TextOutput>,
+    /// 可修正的整段转写假设（上游 `StreamEvent::partial_text_snapshot`）：
+    /// 客户端用它替换暂存显示；`partial_text` 仍是仅追加的已确认文本。
+    /// 仅部分模型按需输出（如 parakeet 系热词流式），缺省为 `None`。
+    #[serde(default)]
+    pub partial_text_snapshot: Option<TextOutput>,
+    /// 音频输出（存在时）。
+    pub audio_output: Option<AudioBufferInfo>,
+    /// 命名音频输出列表（如流式 TTS 的逐块 `chunk_N`）。
+    #[serde(default)]
+    pub named_audio_outputs: Vec<NamedAudioOutput>,
+    /// 说话人分段（流式说话人分离等，存在时）。
+    #[serde(default)]
+    pub speaker_turns: Vec<SpeakerTurn>,
+    /// 词级时间戳（仅产出词戳的族才有；Qwen3 ASR 流式不支持词戳，
+    /// 见 [`TaskResult::word_timestamps`]）。
+    #[serde(default)]
+    pub word_timestamps: Vec<WordTimestamp>,
+    /// 产物输出（流式产出 embedding / 状态等，存在时）。
+    #[serde(default)]
+    pub output_artifacts: Vec<VoiceArtifact>,
+    /// 是否为最终事件。
+    pub is_final: bool,
+}
+
+/// 语音活动事件（`speech_start` / `speech_end` / `speech_segment`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceActivityEvent {
+    /// 事件类型。
+    pub kind: String,
+    /// 触发位置（采样点）。
+    pub sample: i64,
+    /// 语音概率。
+    pub probability: f32,
+    /// 片段（`speech_segment` 事件携带）。
+    pub segment: Option<SpeechSegment>,
+}
+
+/// 流式策略描述（`audiocpp_session_streaming_policy_json`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamingPolicy {
+    /// 输入类型，如 `"audio_chunks"`。
+    pub input: String,
+    /// 输出类型，如 `"pull_events"` / `"final_result"`。
+    pub output: String,
+    /// 推荐的音频分块采样数。
+    pub preferred_audio_chunk_samples: usize,
+    /// 推荐的音频分块秒数。
+    pub preferred_audio_chunk_seconds: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    // 测试断言中的 unwrap/expect 是惯用法：失败即测试失败，展开错误链无意义。
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// 所有非 Custom 变体的 `as_str()` 必须能被 `From<&str>` 精确回收到
+    /// 原变体（而不是落入 `Custom`），且 `as_str` 与 `From` 两张 match
+    /// 表完全一致——防止新增模型族时漏改其一。
+    #[test]
+    fn model_family_roundtrip() {
+        let mut variants: Vec<ModelFamily> = Vec::new();
+        macro_rules! push {
+            ($($v:ident),* $(,)?) => {
+                $(variants.push(ModelFamily::$v);)*
+            };
+        }
+        push![
+            // VAD
+            SileroVad,
+            MarblenetVad,
+            Pulsevad,
+            FireredVad,
+            EarshotVad,
+            // ASR
+            Qwen3Asr,
+            CitrinetAsr,
+            SenseAsr,
+            FunAsrNano,
+            HiggsAudioStt,
+            HviskeAsr,
+            HviskeAsrV6,
+            KrokoAsr,
+            NemotronAsr,
+            Nemotron3Diar,
+            NemotronTranscribe,
+            ParakeetTdt,
+            VibevoiceAsr,
+            VibevoiceAsrStreaming,
+            FireredAudio,
+            Granite5Asr,
+            GraniteSpeech5,
+            Audio8Asr,
+            Audio8Tts,
+            Vibeasr,
+            MoonshineAsr,
+            NiagaraAsr,
+            CanaryAsr,
+            CohereAsr,
+            MossTranscribeDiarize,
+            Confucius4R2t2,
+            EddaAsr,
+            AudioFlamingo,
+            Crisperwhisper,
+            GigaamAsr,
+            IndexEcho,
+            Lfm2Audio,
+            Lfm3Audio,
+            LfmD1Omni,
+            Owsm,
+            OwsmCtc,
+            Samsone,
+            WhistleAsr,
+            Phonon2Asr,
+            UnderdogBark3,
+            HaasAsr,
+            // TTS
+            Qwen3Tts,
+            Confucius4Tts,
+            DotsTts,
+            FishAudio,
+            FishDrama3,
+            GlmTts,
+            HiggsAudioTts,
+            IndexTts2,
+            IrodoriTts,
+            MossTtsLocal,
+            MossTtsNano,
+            MossTtsV15,
+            MossVoicegen,
+            Neutts,
+            Outetts,
+            PocketTts,
+            PocketTtsSmall,
+            GradiumPhonon,
+            VieneuV3Turbo,
+            Fireredtts3,
+            F5Tts,
+            MagpieTts,
+            Personaplex,
+            SopranoTts,
+            EchoTts,
+            Voxcpm1,
+            KokoroTts,
+            Zipvoice,
+            Auk,
+            PiperTts,
+            KittenTts,
+            KittenTts2,
+            Plapre,
+            Kugelaudio,
+            Maya1,
+            MossTtsd,
+            Ming3Tts,
+            XttsV2,
+            Zonos2,
+            Zonos3,
+            M5Tts,
+            TinyVoca,
+            KaleTts,
+            VoxmelTts,
+            MinimaxH3,
+            Sanotts,
+            SoproTts,
+            MiraTts,
+            Cosyvoice3,
+            BreezeTts,
+            // 分离 / 转换 / 音乐
+            SortformerDiar,
+            SortformerDiarV2,
+            SeedVc,
+            Rvc,
+            Meanvc2,
+            ToneColorVc,
+            Chatterbox,
+            ChatterboxTurbo,
+            Vevo2,
+            Voxcpm2,
+            AceStep,
+            Htdemucs,
+            Htdemucs6Stems,
+            Mossformer2,
+            TfGridnet,
+            MelBandRoformer,
+            BsRoformer,
+            Muscriptor,
+            Omnivoice,
+            StableAudio,
+            MinimaxMusic3,
+            Supertonic,
+            Yue2,
+            Mulacover,
+            MagentaRealtime2,
+            Sheetsage2,
+            Rosvot,
+            Dettato,
+            VoxtralRealtime,
+            VoxtralTts,
+            Audiosr,
+            Apollo,
+            Universr,
+            BuiltinAudioUtils,
+            VoiceIsolator,
+            ControlFoley,
+            MossSoundeffect,
+            MidashEnglmGen,
+            Liveavatar,
+            Latentsync,
+            SoulxFlashhead,
+            SoulxSinger,
+            Reuse,
+            RealtimeReuse,
+            SamAudio,
+            Sidon,
+            SmartTurn,
+            // 唤醒词 / 音频分类
+            MicroWakeWord,
+            SherpaKws,
+            OpenWakeWord,
+            Ced,
+            AstAudioset,
+            // 其他
+            Miocodec,
+            Miotts,
+            Vibevoice,
+            Dramabox,
+            Heartmula,
+            InflectV2,
+            Qwen3ForcedAligner,
+            MmsForcedAligner,
+            Ming3Audio,
+        ];
+        assert!(
+            variants.len() >= 40,
+            "ModelFamily 应至少覆盖上游全部 40+ loader 族，当前 {}",
+            variants.len()
+        );
+        for v in variants {
+            let name = v.as_str();
+            assert_eq!(
+                ModelFamily::from(name),
+                v,
+                "as_str() 与 From<&str> 不一致：{}",
+                name
+            );
+            // Display / AsRef 应等价于 as_str。
+            assert_eq!(format!("{v}"), name);
+            assert_eq!(v.as_ref(), name);
+        }
+    }
+
+    #[test]
+    fn model_family_custom_fallback() {
+        // 未收录的名字落入 Custom 并原样保留。
+        let m = ModelFamily::from("brand_new_family");
+        match &m {
+            ModelFamily::Custom(s) => assert_eq!(s, "brand_new_family"),
+            other => panic!("未收录名字应落入 Custom，得到 {other:?}"),
+        }
+        assert_eq!(m.as_str(), "brand_new_family");
+        // Custom 值本身不再被 From 回收。
+        assert_eq!(
+            ModelFamily::from("brand_new_family"),
+            ModelFamily::Custom("brand_new_family".to_owned())
+        );
+        // From<String> 与 AsRef 一致。
+        assert_eq!(
+            ModelFamily::from("qwen3_asr".to_owned()),
+            ModelFamily::Qwen3Asr
+        );
+    }
+
+    #[test]
+    fn model_family_from_path() {
+        // 关键词命中（常见 GGUF 命名）
+        assert_eq!(
+            ModelFamily::from_path("models/qwen3-asr-0.6b-q8_0.gguf"),
+            Some(ModelFamily::Qwen3Asr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("sortformer-diar-4spk-v1-q8_0.gguf"),
+            Some(ModelFamily::SortformerDiar)
+        );
+        assert_eq!(
+            ModelFamily::from_path("citrinet-asr-q8_0.gguf"),
+            Some(ModelFamily::CitrinetAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("moss-tts-nano-q8_0.gguf"),
+            Some(ModelFamily::MossTtsNano)
+        );
+        // fish_drama3 与 fish_audio 互不误判（无子串重叠，回归锁定）。
+        assert_eq!(
+            ModelFamily::from_path("fish-drama3-q8_0.gguf"),
+            Some(ModelFamily::FishDrama3)
+        );
+        assert_eq!(
+            ModelFamily::from_path("fish_audio-f16.gguf"),
+            Some(ModelFamily::FishAudio)
+        );
+        // moss_tts_v15 不被裸 "moss" 关键词吞掉。
+        assert_eq!(
+            ModelFamily::from_path("moss-tts-v15-q8_0.gguf"),
+            Some(ModelFamily::MossTtsV15)
+        );
+        // nemotron_3_diar 不被裸 "nemotron" 关键词吞掉。
+        assert_eq!(
+            ModelFamily::from_path("nemotron-3-diarization-bf16.gguf"),
+            Some(ModelFamily::Nemotron3Diar)
+        );
+        // vieneu_v3_turbo / 旧名 vietneu 均命中同一族。
+        assert_eq!(
+            ModelFamily::from_path("vieneu-v3-turbo-q8_0.gguf"),
+            Some(ModelFamily::VieneuV3Turbo)
+        );
+        assert_eq!(ModelFamily::from("vietneu_tts"), ModelFamily::VieneuV3Turbo);
+        // 精确规则优先于裸关键词：qwen3-tts / qwen3-forced-aligner 不能判成 Qwen3Asr
+        assert_eq!(
+            ModelFamily::from_path("qwen3-tts-12hz-0.6b-base-q8_0.gguf"),
+            Some(ModelFamily::Qwen3Tts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("qwen3-forced-aligner-q8_0.gguf"),
+            Some(ModelFamily::Qwen3ForcedAligner)
+        );
+        assert_eq!(
+            ModelFamily::from_path("mira-tts-q8_0.gguf"),
+            Some(ModelFamily::MiraTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("htdemucs-6s-q8_0.gguf"),
+            Some(ModelFamily::Htdemucs6Stems)
+        );
+        // htdemucs_6stems 不被裸 "htdemucs" 关键词吞掉；裸名仍判回 Htdemucs。
+        assert_eq!(
+            ModelFamily::from_path("htdemucs-q8_0.gguf"),
+            Some(ModelFamily::Htdemucs)
+        );
+        // kitten_tts2 不被 kitten_tts / 裸 "kitten" 吞掉。
+        assert_eq!(
+            ModelFamily::from_path("kitten-tts2-q8_0.gguf"),
+            Some(ModelFamily::KittenTts2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("kitten-tts-q8_0.gguf"),
+            Some(ModelFamily::KittenTts)
+        );
+        // plapre_3 / plapre 均判回 Plapre。
+        assert_eq!(
+            ModelFamily::from_path("plapre-3-bf16.gguf"),
+            Some(ModelFamily::Plapre)
+        );
+        // open_wake_word 与 micro_wake_word 互不误判。
+        assert_eq!(
+            ModelFamily::from_path("open-wake-word-alexa-f32.gguf"),
+            Some(ModelFamily::OpenWakeWord)
+        );
+        assert_eq!(
+            ModelFamily::from_path("microwake-mixednet-q8_0.gguf"),
+            Some(ModelFamily::MicroWakeWord)
+        );
+        // index_echo 不被裸 "echo" 吞掉。
+        assert_eq!(
+            ModelFamily::from_path("index-echo-q8_0.gguf"),
+            Some(ModelFamily::IndexEcho)
+        );
+        assert_eq!(
+            ModelFamily::from_path("echo-tts-q8_0.gguf"),
+            Some(ModelFamily::EchoTts)
+        );
+        // owsm_ctc 不被裸 "owsm" 吞掉。
+        assert_eq!(
+            ModelFamily::from_path("owsm-ctc-q8_0.gguf"),
+            Some(ModelFamily::OwsmCtc)
+        );
+        assert_eq!(
+            ModelFamily::from_path("owsm-q8_0.gguf"),
+            Some(ModelFamily::Owsm)
+        );
+        // moss_ttsd 不被裸 "moss" 吞掉。
+        assert_eq!(
+            ModelFamily::from_path("moss-ttsd-q8_0.gguf"),
+            Some(ModelFamily::MossTtsd)
+        );
+        // 新族常规命中抽查。
+        assert_eq!(
+            ModelFamily::from_path("smart-turn-q8_0.gguf"),
+            Some(ModelFamily::SmartTurn)
+        );
+        // firered_vad 独立成族（非 firered_audio）。
+        assert_eq!(
+            ModelFamily::from_path("firered-vad-q8_0.gguf"),
+            Some(ModelFamily::FireredVad)
+        );
+        // hviske_asr_v6 不被裸 "hviske" 吞掉；裸名仍判回 HviskeAsr。
+        assert_eq!(
+            ModelFamily::from_path("hviske-asr-v6-q8_0.gguf"),
+            Some(ModelFamily::HviskeAsrV6)
+        );
+        assert_eq!(
+            ModelFamily::from_path("hviske-asr-q8_0.gguf"),
+            Some(ModelFamily::HviskeAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("whistle-asr-q8_0.gguf"),
+            Some(ModelFamily::WhistleAsr)
+        );
+        // mossformer2 不被裸 "moss" 吞掉。
+        assert_eq!(
+            ModelFamily::from_path("mossformer2-ss-16k-f32.gguf"),
+            Some(ModelFamily::Mossformer2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("tf-gridnet-q8_0.gguf"),
+            Some(ModelFamily::TfGridnet)
+        );
+        // 唤醒词族。
+        assert_eq!(
+            ModelFamily::from_path("micro-wake-word-hey-jarvis-q8_0.gguf"),
+            Some(ModelFamily::MicroWakeWord)
+        );
+        assert_eq!(
+            ModelFamily::from_path("sherpa-kws-keywords-q8_0.gguf"),
+            Some(ModelFamily::SherpaKws)
+        );
+        // ced 不吞掉对齐模型（for**ced**-aligner），且 audioset 后缀判给 CED。
+        assert_eq!(
+            ModelFamily::from_path("ced-base-16k-q8_0.gguf"),
+            Some(ModelFamily::Ced)
+        );
+        assert_eq!(
+            ModelFamily::from_path("qwen3-forced-aligner-q8_0.gguf"),
+            Some(ModelFamily::Qwen3ForcedAligner)
+        );
+        assert_eq!(
+            ModelFamily::from_path("ast-audioset-q8_0.gguf"),
+            Some(ModelFamily::AstAudioset)
+        );
+        assert_eq!(
+            ModelFamily::from_path("tone-color-vc-q8_0.gguf"),
+            Some(ModelFamily::ToneColorVc)
+        );
+        assert_eq!(
+            ModelFamily::from("htdemucs_6s"),
+            ModelFamily::Htdemucs6Stems
+        );
+        // 流式/新变体不被其前缀家族吞掉（子串匹配顺序）
+        assert_eq!(
+            ModelFamily::from_path("vibevoice-asr-streaming-7b-q8_0.gguf"),
+            Some(ModelFamily::VibevoiceAsrStreaming)
+        );
+        assert_eq!(
+            ModelFamily::from_path("sortformer-diar-v2-q8_0.gguf"),
+            Some(ModelFamily::SortformerDiarV2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("kokoro-tts-82m-q8_0.gguf"),
+            Some(ModelFamily::KokoroTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("moonshine-tiny-q8_0.gguf"),
+            Some(ModelFamily::MoonshineAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("niagara-asr-q8_0.gguf"),
+            Some(ModelFamily::NiagaraAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("yue2-music-q8_0.gguf"),
+            Some(ModelFamily::Yue2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("sheetsage2-q8_0.gguf"),
+            Some(ModelFamily::Sheetsage2)
+        );
+        // voxtral_tts 不被裸 "voxtral" 关键词吞掉（后者判回 realtime）。
+        assert_eq!(
+            ModelFamily::from_path("voxtral-tts-4b-q8_0.gguf"),
+            Some(ModelFamily::VoxtralTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("voxtral-realtime-q8_0.gguf"),
+            Some(ModelFamily::VoxtralRealtime)
+        );
+        assert_eq!(
+            ModelFamily::from_path("pulsevad-2.1k-f32.gguf"),
+            Some(ModelFamily::Pulsevad)
+        );
+        assert_eq!(
+            ModelFamily::from_path("canary-180m-flash-q8_0.gguf"),
+            Some(ModelFamily::CanaryAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("cohere-transcribe-03-2026-q8_0.gguf"),
+            Some(ModelFamily::CohereAsr)
+        );
+        // moss_transcribe_diarize 不能被裸 "moss" 吞掉
+        assert_eq!(
+            ModelFamily::from_path("moss-transcribe-diarize-q8_0.gguf"),
+            Some(ModelFamily::MossTranscribeDiarize)
+        );
+        assert_eq!(
+            ModelFamily::from_path("apollo-orig.gguf"),
+            Some(ModelFamily::Apollo)
+        );
+        assert_eq!(
+            ModelFamily::from_path("universr-audio-orig.gguf"),
+            Some(ModelFamily::Universr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("zipvoice-distill-q8_0.gguf"),
+            Some(ModelFamily::Zipvoice)
+        );
+        assert_eq!(
+            ModelFamily::from_path("auk-flash-q8_0.gguf"),
+            Some(ModelFamily::Auk)
+        );
+        assert_eq!(
+            ModelFamily::from_path("liveavatar-nvfp4.gguf"),
+            Some(ModelFamily::Liveavatar)
+        );
+        assert_eq!(
+            ModelFamily::from_path("piper-en-us-lessac-medium-orig.gguf"),
+            Some(ModelFamily::PiperTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("kitten-tts-mini-0.8-orig.gguf"),
+            Some(ModelFamily::KittenTts)
+        );
+        // confucius4_r2t2 不能被裸 "confucius" 吞掉（判成 Confucius4Tts）
+        assert_eq!(
+            ModelFamily::from_path("confucius4-r2t2-q8_0.gguf"),
+            Some(ModelFamily::Confucius4R2t2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("confucius4-tts-q8_0.gguf"),
+            Some(ModelFamily::Confucius4Tts)
+        );
+        // 内置音频工具：model_path 直接传工具 ID 也能映射到族。
+        assert_eq!(
+            ModelFamily::from_path("deepfilternet2"),
+            Some(ModelFamily::BuiltinAudioUtils)
+        );
+        // gradium_phonon 与 pocket_tts 互不误判（同 target、不同 loader 族）；
+        // phonon-2 自 d2da530b 起是正式族 Phonon2Asr（不再是 None）。
+        assert_eq!(
+            ModelFamily::from_path("phonon-2-mixed-q8.gguf"),
+            Some(ModelFamily::Phonon2Asr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("Phonon-2-GGUF/phonon-2-mixed-q8.gguf"),
+            Some(ModelFamily::Phonon2Asr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("phonon-31m-en-q8_0.gguf"),
+            Some(ModelFamily::GradiumPhonon)
+        );
+        assert_eq!(
+            ModelFamily::from_path("gradium-phonon-31m-en-q8_0.gguf"),
+            Some(ModelFamily::GradiumPhonon)
+        );
+        assert_eq!(
+            ModelFamily::from_path("pocket-tts-q8_0.gguf"),
+            Some(ModelFamily::PocketTts)
+        );
+        // cc21c9ea→d2da530b 新增 4 族：按上游真实权重文件名断言。
+        // pocket_tts_small 不被裸 "pocket_tts" 吞掉（含目录名的完整路径）。
+        assert_eq!(
+            ModelFamily::from_path(
+                "PocketTTS-Small-GGUF/english-18m-refl/english-18m-refl-f32.gguf"
+            ),
+            Some(ModelFamily::PocketTtsSmall)
+        );
+        // realtime_reuse 不被目录 RE-USE-GGUF 的 "re-use"/文件名的 "reuse"
+        // 抢先吞成 Reuse。
+        assert_eq!(
+            ModelFamily::from_path("RE-USE-GGUF/realtime-reuse-f32.gguf"),
+            Some(ModelFamily::RealtimeReuse)
+        );
+        assert_eq!(
+            ModelFamily::from_path("Haas-ja-v1.0-GGUF/haas-ja-v1.0-q8_0.gguf"),
+            Some(ModelFamily::HaasAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("Underdog-Bark-3.0-GGUF/underdog-bark-3.0-mixed-f16.gguf"),
+            Some(ModelFamily::UnderdogBark3)
+        );
+        assert_eq!(
+            ModelFamily::from_path("d1-Omni-2B-GGUF/d1-Omni-2B-Q8_0.gguf"),
+            Some(ModelFamily::LfmD1Omni)
+        );
+        assert_eq!(
+            ModelFamily::from_path("d1-Omni-2B-GGUF/mmproj-d1-Omni-2B-F16.gguf"),
+            Some(ModelFamily::LfmD1Omni)
+        );
+        // ming3_audio 不被裸 "ming3" 吞成 Ming3Tts；权重名两种写法均命中。
+        assert_eq!(
+            ModelFamily::from_path("ming-3.0-audio-tiny-bf16.gguf"),
+            Some(ModelFamily::Ming3Audio)
+        );
+        assert_eq!(
+            ModelFamily::from_path("ming-3.0-tts-0.5b-bf16.gguf"),
+            Some(ModelFamily::Ming3Tts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("xtts-v2-gpt-q8_0.gguf"),
+            Some(ModelFamily::XttsV2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("latentsync-1.6-q8_0-f16.gguf"),
+            Some(ModelFamily::Latentsync)
+        );
+        // 大小写不敏感
+        assert_eq!(
+            ModelFamily::from_path("Qwen3-ASR.Q8_0.GGUF"),
+            Some(ModelFamily::Qwen3Asr)
+        );
+        // #family= 显式覆盖优先于关键词（大小写不敏感）
+        assert_eq!(
+            ModelFamily::from_path("model.gguf#family=citrinet_asr"),
+            Some(ModelFamily::CitrinetAsr)
+        );
+        assert_eq!(
+            ModelFamily::from_path("model.gguf#family=MiraTTS"),
+            Some(ModelFamily::MiraTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("model.gguf#family=qwen3_tts"),
+            Some(ModelFamily::Qwen3Tts)
+        );
+        // ---- cc21c9ea 新增 5 族：按上游真实权重名/目录名校验 ----
+        assert_eq!(
+            ModelFamily::from_path("earshot_vad.safetensors"),
+            Some(ModelFamily::EarshotVad)
+        );
+        assert_eq!(
+            ModelFamily::from_path("nemotron-transcribe-30b-a4b-experts-iq4_nl.gguf"),
+            Some(ModelFamily::NemotronTranscribe)
+        );
+        // nemotron 的 encoder 侧 mmproj 与权重目录名都含 "nemotron-3"，
+        // 必须命中 Transcribe 而非被 nemotron_3_diar 的关键词吞掉。
+        assert_eq!(
+            ModelFamily::from_path(
+                "mmproj-NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf"
+            ),
+            Some(ModelFamily::NemotronTranscribe)
+        );
+        assert_eq!(
+            ModelFamily::from_path("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF"),
+            Some(ModelFamily::NemotronTranscribe)
+        );
+        // 反向回归：真正的 Nemotron 3 Diar 仍判成 diar。
+        assert_eq!(
+            ModelFamily::from_path("nemotron-3-diarization-bf16.gguf"),
+            Some(ModelFamily::Nemotron3Diar)
+        );
+        assert_eq!(
+            ModelFamily::from_path("LFM3-Audio-2B-Q8_0.gguf"),
+            Some(ModelFamily::Lfm3Audio)
+        );
+        assert_eq!(
+            ModelFamily::from_path("mmproj-LFM3-Audio-2B-F16.gguf"),
+            Some(ModelFamily::Lfm3Audio)
+        );
+        // 反向回归：lfm2 不被新增的 lfm3 关键词影响。
+        assert_eq!(
+            ModelFamily::from_path("lfm2.5-audio-1.5b-q8_0.gguf"),
+            Some(ModelFamily::Lfm2Audio)
+        );
+        assert_eq!(
+            ModelFamily::from_path("magenta-rt2-small-f16.gguf"),
+            Some(ModelFamily::MagentaRealtime2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("Magenta-RealTime-2-GGUF/magenta-rt2-base-q8_0.gguf"),
+            Some(ModelFamily::MagentaRealtime2)
+        );
+        assert_eq!(
+            ModelFamily::from_path("SoulX-FlashHead-Lite-Q8_0.gguf"),
+            Some(ModelFamily::SoulxFlashhead)
+        );
+        assert_eq!(
+            ModelFamily::from_path("SoulX-FlashHead-GGUF"),
+            Some(ModelFamily::SoulxFlashhead)
+        );
+        // ---- d2da530b→d38518a0 新增 5 族：按上游真实权重名/目录名校验 ----
+        // edda_asr（丹麦语 Whisper）无前缀冲突。
+        assert_eq!(
+            ModelFamily::from_path("edda-v0.2-large-q8_0.gguf"),
+            Some(ModelFamily::EddaAsr)
+        );
+        // moss_soundeffect 不被裸 "moss" 吞成 MossTtsNano。
+        assert_eq!(
+            ModelFamily::from_path("MOSS-SoundEffect-v2-GGUF/moss-soundeffect-v2-q8_0.gguf"),
+            Some(ModelFamily::MossSoundeffect)
+        );
+        // mulacover 只能命中完整族名，裸 "mula" 不收（heartmula 不受影响）。
+        assert_eq!(
+            ModelFamily::from_path("MuLaCover-GGUF/mulacover-q8_0.gguf"),
+            Some(ModelFamily::Mulacover)
+        );
+        assert_eq!(
+            ModelFamily::from_path("heartmula-q8_0.gguf"),
+            Some(ModelFamily::Heartmula)
+        );
+        assert_eq!(
+            ModelFamily::from_path("ZONOS2-GGUF/zonos2-q8_0.gguf"),
+            Some(ModelFamily::Zonos2)
+        );
+        // zonos3 主干文件名为 backbone-ptq.gguf，族名靠目录识别。
+        assert_eq!(
+            ModelFamily::from_path("ZONOS3-Mini-GGUF/backbone-ptq.gguf"),
+            Some(ModelFamily::Zonos3)
+        );
+        assert_eq!(
+            ModelFamily::from_path("M5-TTS-GGUF/m5-tts-50m-voiceclone-q8_0.gguf"),
+            Some(ModelFamily::M5Tts)
+        );
+        // ---- d38518a0→5ec688c6..4de392e0 新增 3 族：按上游真实权重名/目录名校验 ----
+        // tiny_voca：上游权重为 models/tiny-voca-GGUF/tiny-voca-orig.gguf。
+        assert_eq!(
+            ModelFamily::from_path("tiny-voca-GGUF/tiny-voca-orig.gguf"),
+            Some(ModelFamily::TinyVoca)
+        );
+        // rosvot：上游权重为 ROSVOT-GGUF/rosvot-f32.gguf，无前缀冲突。
+        assert_eq!(
+            ModelFamily::from_path("ROSVOT-GGUF/rosvot-f32.gguf"),
+            Some(ModelFamily::Rosvot)
+        );
+        // soulx_singer 不被裸 "soulx" 吞成 SoulxFlashhead。
+        assert_eq!(
+            ModelFamily::from_path("SoulX-Singer-GGUF/soulx-singer-q8_0.gguf"),
+            Some(ModelFamily::SoulxSinger)
+        );
+        assert_eq!(
+            ModelFamily::from_path("soulx-singer-f16.gguf"),
+            Some(ModelFamily::SoulxSinger)
+        );
+        // 反向断言：SoulX-FlashHead 仍判 SoulxFlashhead。
+        assert_eq!(
+            ModelFamily::from_path("SoulX-FlashHead-Lite-Q8_0.gguf"),
+            Some(ModelFamily::SoulxFlashhead)
+        );
+        // ---- 5e7273db 新增 granite_speech5：不被 granite5asr 的 "granite-speech"
+        // /"granite" 吞掉（新族权重带 "-5.0-2b"，turboctc 权重名则不含）。
+        assert_eq!(
+            ModelFamily::from_path("Granite-Speech-5.0-2B-GGUF/granite-speech-5.0-2b-q8_0.gguf"),
+            Some(ModelFamily::GraniteSpeech5)
+        );
+        assert_eq!(
+            ModelFamily::from_path("granite-speech-5.0-2b-orig.gguf"),
+            Some(ModelFamily::GraniteSpeech5)
+        );
+        // 反向断言：granite5asr 的 470m-turboctc 权重仍判 Granite5Asr。
+        assert_eq!(
+            ModelFamily::from_path(
+                "Granite-Speech-5.0-470M-TurboCTC-GGUF/granite-speech-5.0-470m-turboctc-q8_0.gguf"
+            ),
+            Some(ModelFamily::Granite5Asr)
+        );
+        // ---- d09b2d78 新增 4 族：按上游真实权重名/目录名校验 ----
+        assert_eq!(
+            ModelFamily::from_path("kale-tts-1-GGUF/kale-tts-1-nano-f32.gguf"),
+            Some(ModelFamily::KaleTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("VoxMel-TTS-GGUF/voxmel-tts-0.6b-q8_0.gguf"),
+            Some(ModelFamily::VoxmelTts)
+        );
+        assert_eq!(
+            ModelFamily::from_path("voice-isolator-GGUF/voice-isolator-realtime-f32.gguf"),
+            Some(ModelFamily::VoiceIsolator)
+        );
+        assert_eq!(
+            ModelFamily::from_path("Dettato-GGUF/dettato-f16.gguf"),
+            Some(ModelFamily::Dettato)
+        );
+        // 反向断言：新关键词未收裸 "voice"，既有 VibeVoice 文件名不受影响
+        // （既有关键词表把带连字符的 vibevoice-asr 判为 Vibevoice）。
+        assert_eq!(
+            ModelFamily::from_path("vibevoice-asr-q8_0.gguf"),
+            Some(ModelFamily::Vibevoice)
+        );
+        // 无法识别
+        assert_eq!(ModelFamily::from_path("my-weights.gguf"), None);
+        assert_eq!(ModelFamily::from_path(""), None);
+    }
+
+    #[test]
+    fn task_kind_as_str() {
+        let cases = [
+            (TaskKind::Vad, "vad"),
+            (TaskKind::Asr, "asr"),
+            (TaskKind::Diar, "diar"),
+            (TaskKind::SourceSeparation, "sep"),
+            (TaskKind::AudioGeneration, "gen"),
+            (TaskKind::Tts, "tts"),
+            (TaskKind::VoiceCloning, "clon"),
+            (TaskKind::VoiceConversion, "vc"),
+            (TaskKind::SpeechToSpeech, "s2s"),
+            (TaskKind::Alignment, "align"),
+            (TaskKind::VoiceDesign, "vdes"),
+            (TaskKind::SpeakerRecognition, "spk"),
+            (TaskKind::Svc, "svc"),
+            (TaskKind::Midi, "midi"),
+            (TaskKind::TurnDetection, "turn"),
+            (TaskKind::WakeWord, "wake"),
+            (TaskKind::AudioClassification, "cls"),
+        ];
+        for (k, want) in cases {
+            assert_eq!(k.as_str(), want);
+        }
+    }
+
+    #[test]
+    fn task_kind_aliases() {
+        // 上游别名与规范短名互通：`wake_word`→WakeWord，`classify`→AudioClassification。
+        assert_eq!(
+            serde_json::from_str::<TaskKind>("\"wake_word\"").unwrap(),
+            TaskKind::WakeWord
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskKind>("\"classify\"").unwrap(),
+            TaskKind::AudioClassification
+        );
+    }
+
+    #[test]
+    fn task_kind_serde_roundtrip() {
+        // serde 表示必须与 as_str（C 边界字符串）一致，而非变体名的
+        // 小写形式（如 "sep" 而非 "sourceseparation"）。
+        let all = [
+            TaskKind::Vad,
+            TaskKind::Asr,
+            TaskKind::Diar,
+            TaskKind::SourceSeparation,
+            TaskKind::AudioGeneration,
+            TaskKind::Tts,
+            TaskKind::VoiceCloning,
+            TaskKind::VoiceConversion,
+            TaskKind::SpeechToSpeech,
+            TaskKind::Alignment,
+            TaskKind::VoiceDesign,
+            TaskKind::SpeakerRecognition,
+            TaskKind::Svc,
+            TaskKind::Midi,
+            TaskKind::TurnDetection,
+            TaskKind::WakeWord,
+            TaskKind::AudioClassification,
+        ];
+        for k in all {
+            let s = serde_json::to_string(&k).unwrap();
+            assert_eq!(s, format!("\"{}\"", k.as_str()));
+            assert_eq!(serde_json::from_str::<TaskKind>(&s).unwrap(), k);
+        }
+        assert!(serde_json::from_str::<TaskKind>("\"sourceseparation\"").is_err());
+    }
+
+    #[test]
+    fn run_mode_as_str() {
+        assert_eq!(RunMode::Offline.as_str(), "offline");
+        assert_eq!(RunMode::Streaming.as_str(), "streaming");
+    }
+
+    #[test]
+    fn backend_as_str() {
+        let cases = [
+            (Backend::Cpu, "cpu"),
+            (Backend::Cuda, "cuda"),
+            (Backend::Hip, "hip"),
+            (Backend::Vulkan, "vulkan"),
+            (Backend::Metal, "metal"),
+            (Backend::Best, "best"),
+        ];
+        for (b, want) in cases {
+            assert_eq!(b.as_str(), want);
+        }
+    }
+
+    /// 结构化类型应能从 C 侧 `dump_*` 产出的 JSON 反序列化（serde 契约）。
+    #[test]
+    fn structured_types_deserialize() {
+        let result: TaskResult = serde_json::from_str(
+            r#"{
+                "speech_segments": [
+                    {"span": {"start_sample": 0, "end_sample": 1600}, "confidence": 0.95, "text": ""}
+                ],
+                "text_output": {"text": "hi", "language": "en"},
+                "audio_output": {"sample_rate": 24000, "channels": 1, "sample_count": 0, "samples": []},
+                "named_audio_outputs": [],
+                "speaker_turns": [
+                    {"speaker_id": "speaker_0", "span": {"start_sample": 0, "end_sample": 1600}, "confidence": 0.9, "text": "hello"}
+                ],
+                "word_timestamps": [
+                    {"span": {"start_sample": 0, "end_sample": 320}, "word": "hello", "confidence": 0.99}
+                ],
+                "artifact_output": {"kind": "speaker_embedding", "id": "spk1", "payload_base64": "", "meta": {}},
+                "output_artifacts": [
+                    {"kind": "custom", "id": "a", "payload_base64": "AQID", "meta": {"k": "v"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(result.speech_segments.len(), 1);
+        assert_eq!(result.speech_segments[0].span.start_sample, 0);
+        assert_eq!(result.speech_segments[0].confidence, 0.95);
+        assert_eq!(result.text_output.as_ref().unwrap().text, "hi");
+        assert_eq!(result.audio_output.unwrap().sample_rate, 24000);
+        assert_eq!(result.speaker_turns[0].text, "hello");
+        assert_eq!(result.word_timestamps[0].word, "hello");
+        assert_eq!(
+            result.artifact_output.as_ref().unwrap().kind,
+            "speaker_embedding"
+        );
+        assert_eq!(result.output_artifacts[0].payload_base64, "AQID");
+
+        let ev: StreamEvent = serde_json::from_str(
+            r#"{
+                "voice_activity": [
+                    {"kind": "speech_start", "sample": 100, "probability": 0.8, "segment": null}
+                ],
+                "partial_text": null,
+                "partial_text_snapshot": {"text": "hel", "language": "en"},
+                "audio_output": null,
+                "named_audio_outputs": [{"id": "chunk_0", "audio": {"sample_rate": 48000, "channels": 2, "sample_count": 320, "samples": []}, "meta": {}}],
+                "speaker_turns": [],
+                "word_timestamps": [],
+                "output_artifacts": [],
+                "is_final": true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ev.voice_activity[0].kind, "speech_start");
+        assert_eq!(ev.named_audio_outputs[0].id, "chunk_0");
+        assert_eq!(ev.partial_text_snapshot.as_ref().unwrap().text, "hel");
+        assert!(ev.is_final);
+    }
+
+    #[test]
+    fn model_inspection_deserialize() {
+        // 验证 inspect 返回的 ModelInspection 结构与上游 dump_inspection 对齐，
+        // 且缺失字段（无 meta / 无发现资产）能向后兼容。
+        let info: ModelInspection = serde_json::from_str(
+            r#"{
+                "metadata": {
+                    "family": "qwen3_asr",
+                    "variant": "q8_0",
+                    "description": "Qwen3 ASR",
+                    "config_candidates": ["config.json"],
+                    "weight_candidates": ["qwen3-asr-q8_0.gguf"]
+                },
+                "capabilities": {
+                    "supported_tasks": [{"task": "asr", "modes": ["offline", "streaming"]}],
+                    "languages": ["zh", "en"],
+                    "supports_speaker_reference": false,
+                    "supports_style_condition": false,
+                    "supports_timestamps": true
+                },
+                "discovered_weights": [
+                    {"id": "model", "path": "/models/qwen3-asr-q8_0.gguf"}
+                ],
+                "cli": {
+                    "request_options": [
+                        {"name": "language", "value_name": "CODE", "description": "语言", "required": false, "default_value": "auto"}
+                    ],
+                    "session_options": [],
+                    "load_options": []
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(info.metadata.family, "qwen3_asr");
+        assert!(
+            info.capabilities
+                .supported_tasks
+                .iter()
+                .any(|t| t.task == "asr" && t.modes.contains(&"streaming".to_string()))
+        );
+        assert_eq!(info.discovered_weights[0].id, "model");
+        assert_eq!(info.cli.request_options[0].name, "language");
+        assert_eq!(
+            info.cli.request_options[0].default_value.as_deref(),
+            Some("auto")
+        );
+    }
+}
