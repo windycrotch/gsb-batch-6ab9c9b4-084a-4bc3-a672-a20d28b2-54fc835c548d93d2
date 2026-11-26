@@ -139,7 +139,9 @@ func (p *Proxy) RegisterWrapSession(target string, headers map[string]string) (i
 func (p *Proxy) SetHeaders(h map[string]string) {
 	p.mu.Lock()
 	p.headers = clone(h)
-	p.invalidatePlaylistsLocked("u:|")
+	// Drop every /u playlist (both plain and sid-scoped keys); the injected
+	// headers changed, so a playlist rewritten against the old set is stale.
+	p.invalidatePlaylistsLocked("u:")
 	p.mu.Unlock()
 }
 
@@ -156,10 +158,17 @@ func (p *Proxy) Header(name string) string {
 }
 
 // Close stops the listener and releases upstream connections from this playback.
+// Every mounted session is unmounted first so its in-flight prefetch chunks and
+// upstream connections are cancelled instead of leaking.
 func (p *Proxy) Close() error {
 	p.mu.Lock()
+	sessions := p.sessions
+	p.sessions = map[string]*proxySession{}
 	p.playlists = nil
 	p.mu.Unlock()
+	for _, sess := range sessions {
+		sess.markRemoved()
+	}
 	if p.srv == nil {
 		return nil
 	}
@@ -190,8 +199,13 @@ func (p *Proxy) cachedPlaylist(key string) (string, bool) {
 	return entry.body, true
 }
 
-func (p *Proxy) storePlaylist(key, rewritten string, raw []byte) {
+func (p *Proxy) storePlaylist(key, rewritten string, raw []byte, sess *proxySession) {
 	if key == "" || !isCacheablePlaylist(raw) {
+		return
+	}
+	// Never cache for an unmounted session: RemoveSession invalidates existing
+	// entries, and this guards playlists finishing just after removal.
+	if sess != nil && sess.isRemoved() {
 		return
 	}
 	now := time.Now()
@@ -253,23 +267,42 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	reqCtx := r.Context()
 	sid := r.URL.Query().Get("sid")
+	var sess *proxySession
 	var sessHeaders map[string]string
+	var sessVersion int64
 	if sid != "" {
-		sess, found := p.session(sid)
-		if !found {
+		var found bool
+		sess, found = p.session(sid)
+		if !found || sess.isRemoved() {
 			http.NotFound(w, r)
 			return
 		}
-		_, sessHeaders = sess.snapshot()
+		_, sessHeaders, sessVersion = sess.snapshot()
+		reqCtx = p.sessionContext(sess, reqCtx)
 		reqCtx = context.WithValue(reqCtx, sessionHeadersKey{}, sessHeaders)
 	}
 	cacheKey := "u:" + sid + "|" + target
+	if sid != "" {
+		cacheKey = sessionCacheKey("u", sid, target, sessVersion)
+	}
 	if r.Method == http.MethodGet {
 		if cached, ok := p.cachedPlaylist(cacheKey); ok {
-			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, cached)
-			return
+			// For a wrap session, re-check that the session is still mounted
+			// and on the same version so a refresh cannot expose a playlist
+			// rewritten against the old address/headers.
+			if sid == "" {
+				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, cached)
+				return
+			}
+			_, _, curVersion := sess.snapshot()
+			if !sess.isRemoved() && curVersion == sessVersion {
+				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, cached)
+				return
+			}
 		}
 	}
 	reqLimit := time.Duration(0)
@@ -299,6 +332,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	// A wrap session whose auth expired: refresh once, coherently, and retry.
+	// The request URL is taken from the playlist the player already holds, so
+	// only headers change; the session's base address swap still invalidates
+	// the playlist caches so the next playlist fetch uses the new address.
+	if sid != "" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		res := sess.ensureRefresh()
+		if sess.isRemoved() {
+			httpx.DrainAndClose(resp.Body)
+			return
+		}
+		if res.outcome == refreshSucceeded {
+			httpx.DrainAndClose(resp.Body)
+			p.invalidateSessionPlaylists(sid)
+			retryReq := req.Clone(reqCtx)
+			applyMap(retryReq, res.headers)
+			resp, err = p.doWithTimeout(retryReq, reqLimit)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			sessHeaders = res.headers
+			sessVersion = res.version
+			cacheKey = sessionCacheKey("u", sid, target, res.version)
+		}
+	}
 	defer httpx.DrainAndClose(resp.Body)
 	base := u
 	if resp.Request != nil && resp.Request.URL != nil {
@@ -321,7 +382,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wrap = func(raw string) string { return p.wrapWithSID(sid, raw) }
 	}
 	if playlist(resp.Header.Get("Content-Type"), base.Path) {
-		p.writePlaylistWith(w, resp, base.String(), cacheKey, reqCtx, sessHeaders, sid != "", wrap, reqLimit)
+		p.writePlaylistWith(w, resp, base.String(), cacheKey, reqCtx, sessHeaders, sid != "", wrap, reqLimit, sess)
 		return
 	}
 	// Sniff a short prefix so a playlist without a useful content type
@@ -334,7 +395,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if n > 0 && bytes.HasPrefix(bytes.TrimSpace(buf[:n]), []byte("#EXTM3U")) {
 		if resp.StatusCode == http.StatusPartialContent {
-			p.writePlaylistWith(w, resp, base.String(), cacheKey, reqCtx, sessHeaders, sid != "", wrap, reqLimit)
+			p.writePlaylistWith(w, resp, base.String(), cacheKey, reqCtx, sessHeaders, sid != "", wrap, reqLimit, sess)
 			return
 		}
 		rest, _, err := httpx.ReadLimit(resp.Body, resp.ContentLength, playlistLimit)
@@ -343,7 +404,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body := append(append([]byte{}, buf[:n]...), rest...)
-		p.writeRewrittenWith(w, base.String(), cacheKey, body, wrap)
+		p.writeRewrittenWith(w, base.String(), cacheKey, body, wrap, sess)
 		return
 	}
 	copyMediaHeaders(w.Header(), resp.Header)
@@ -381,7 +442,7 @@ func copyFlushing(dst io.Writer, src io.Reader, rc *http.ResponseController) {
 	}
 }
 
-func (p *Proxy) writePlaylistWith(w http.ResponseWriter, resp *http.Response, playlistURL, cacheKey string, ctx context.Context, sessHeaders map[string]string, hasSession bool, wrap func(string) string, timeoutLimit time.Duration) {
+func (p *Proxy) writePlaylistWith(w http.ResponseWriter, resp *http.Response, playlistURL, cacheKey string, ctx context.Context, sessHeaders map[string]string, hasSession bool, wrap func(string) string, timeoutLimit time.Duration, sess *proxySession) {
 	if resp.StatusCode == http.StatusPartialContent {
 		// Extensionless playlist endpoints can only be identified after the
 		// response. Retry without the player's range before rewriting.
@@ -409,7 +470,7 @@ func (p *Proxy) writePlaylistWith(w http.ResponseWriter, resp *http.Response, pl
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	p.writeRewrittenWith(w, playlistURL, cacheKey, body, wrap)
+	p.writeRewrittenWith(w, playlistURL, cacheKey, body, wrap, sess)
 }
 
 func (p *Proxy) apply(req *http.Request) {

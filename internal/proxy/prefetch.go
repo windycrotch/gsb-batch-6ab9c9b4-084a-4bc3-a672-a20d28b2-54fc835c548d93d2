@@ -21,7 +21,13 @@ const (
 // servePrefetch accelerates large non-HLS range streams (such as cloud-drive 4K MP4/MKV
 // files throttled per connection) using bounded concurrent range reads.
 // Returns true if the response was completely handled; false falls back to direct proxy.
-func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *proxySession, target string, headers map[string]string) bool {
+//
+// All chunks share the session's single address/header snapshot: when an
+// upstream 401/403 triggers a refresh, the refresh is single-flight and every
+// subsequent chunk uses the new URL and headers together. The stream context
+// is cancelled when the player disconnects, the session is removed or any
+// chunk fails, so remaining chunks stop and upstream connections are released.
+func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *proxySession, id, target string, headers map[string]string) bool {
 	reqStart, reqEnd, hasRange, ok := parseSingleByteRange(r.Header.Get("Range"))
 	if !ok {
 		return false
@@ -34,26 +40,39 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		return false
 	}
 
+	// Bind the whole prefetch to the session lifecycle: removing the session
+	// cancels every in-flight chunk, and a player disconnect cancels it too.
+	streamCtx, cancel := context.WithCancel(p.sessionContext(sess, r.Context()))
+	defer cancel()
+
 	firstEnd := reqStart + prefetchChunkSize - 1
 	if reqEnd >= 0 && reqEnd < firstEnd {
 		firstEnd = reqEnd
 	}
 	firstRange := fmt.Sprintf("bytes=%d-%d", reqStart, firstEnd)
-	resp, err := p.doSessionRequest(r.Context(), http.MethodGet, target, headers, firstRange, false)
+	resp, err := p.doSessionRequest(streamCtx, http.MethodGet, target, headers, firstRange, false)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || errors.Is(context.Cause(streamCtx), errSessionRemoved) {
 			return true
 		}
 		return false
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		if newURL, newHdr, refreshed := sess.tryRefresh(r.Context()); refreshed {
-			httpx.DrainAndClose(resp.Body)
-			target, headers = newURL, newHdr
-			resp, err = p.doSessionRequest(r.Context(), http.MethodGet, target, headers, firstRange, false)
-			if err != nil {
-				return errors.Is(err, context.Canceled)
-			}
+		httpx.DrainAndClose(resp.Body)
+		res := sess.ensureRefresh()
+		if sess.isRemoved() || streamCtx.Err() != nil {
+			return true
+		}
+		if res.outcome != refreshSucceeded {
+			// No new snapshot: fall through to direct proxy so the upstream
+			// 401/403 reaches the player instead of a fabricated response.
+			return false
+		}
+		p.invalidateSessionPlaylists(id)
+		target, headers = res.url, res.headers
+		resp, err = p.doSessionRequest(streamCtx, http.MethodGet, target, headers, firstRange, false)
+		if err != nil {
+			return errors.Is(err, context.Canceled) || errors.Is(context.Cause(streamCtx), errSessionRemoved)
 		}
 	}
 	if resp.StatusCode != http.StatusPartialContent {
@@ -71,7 +90,7 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 	ct := resp.Header.Get("Content-Type")
 	httpx.DrainAndClose(resp.Body)
 	if err != nil {
-		return errors.Is(err, context.Canceled)
+		return errors.Is(err, context.Canceled) || errors.Is(context.Cause(streamCtx), errSessionRemoved)
 	}
 
 	finalEnd := total - 1
@@ -102,10 +121,6 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		return true
 	}
 
-	// Stream remaining chunks with a bounded sliding window of concurrent workers.
-	streamCtx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
 	type chunkRange struct {
 		start int64
 		end   int64
@@ -127,8 +142,11 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				curTarget, curHeaders := sess.snapshot()
-				data, fetchErr := p.fetchChunk(streamCtx, sess, curTarget, curHeaders, job.r.start, job.r.end)
+				// Every chunk reads the session's current snapshot. A refresh
+				// swaps URL and headers atomically, so chunks can never mix an
+				// old address with new headers (or vice versa).
+				curTarget, curHeaders, _ := sess.snapshot()
+				data, fetchErr := p.fetchChunk(streamCtx, sess, id, curTarget, curHeaders, job.r.start, job.r.end)
 				job.slot.data, job.slot.err = data, fetchErr
 				close(job.slot.done)
 				if fetchErr != nil {
@@ -172,6 +190,9 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		case <-slot.done:
 		}
 		if slot.err != nil || streamCtx.Err() != nil {
+			// Player disconnect, removed session, upstream error or failed
+			// refresh: stop the remaining chunks and never deliver partial data
+			// as a complete response.
 			cancel()
 			wg.Wait()
 			return true
@@ -188,7 +209,7 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 	return true
 }
 
-func (p *Proxy) fetchChunk(ctx context.Context, sess *proxySession, target string, headers map[string]string, start, end int64) ([]byte, error) {
+func (p *Proxy) fetchChunk(ctx context.Context, sess *proxySession, id, target string, headers map[string]string, start, end int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -198,12 +219,20 @@ func (p *Proxy) fetchChunk(ctx context.Context, sess *proxySession, target strin
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		if newURL, newHdr, refreshed := sess.tryRefresh(ctx); refreshed {
-			httpx.DrainAndClose(resp.Body)
-			resp, err = p.doSessionRequest(ctx, http.MethodGet, newURL, newHdr, rng, false)
-			if err != nil {
-				return nil, err
-			}
+		httpx.DrainAndClose(resp.Body)
+		// Single-flight: concurrent chunks blocked on the same 401/403 share
+		// one refresh and all continue with the same fresh snapshot.
+		res := sess.ensureRefresh()
+		if ctx.Err() != nil || sess.isRemoved() {
+			return nil, context.Canceled
+		}
+		if res.outcome != refreshSucceeded {
+			return nil, fmt.Errorf("upstream chunk auth expired and refresh did not succeed")
+		}
+		p.invalidateSessionPlaylists(id)
+		resp, err = p.doSessionRequest(ctx, http.MethodGet, res.url, res.headers, rng, false)
+		if err != nil {
+			return nil, err
 		}
 	}
 	defer httpx.DrainAndClose(resp.Body)
@@ -214,6 +243,11 @@ func (p *Proxy) fetchChunk(ctx context.Context, sess *proxySession, target strin
 	data, _, err := httpx.ReadLimit(resp.Body, expected, expected)
 	if err != nil {
 		return nil, err
+	}
+	// A short chunk means an upstream error or truncation: fail the whole
+	// prefetch instead of splicing incomplete bytes into the player's stream.
+	if int64(len(data)) != expected {
+		return nil, fmt.Errorf("upstream chunk %d-%d returned %d bytes, want %d", start, end, len(data), expected)
 	}
 	return data, nil
 }
