@@ -5,38 +5,20 @@ import (
 	"time"
 )
 
+// LockAndNotify is a mutex paired with a coalescing wake-up signal.
+//
+// A notification raised while nobody is waiting is retained (at most one), so a
+// waiter which registers slightly late still wakes up immediately. This matters
+// because otherwise work queued just before the loop goes to sleep would sit
+// idle until the loop's periodic timeout, making state changes very laggy.
 type LockAndNotify struct {
 	mutex sync.Mutex
-
-	waker   chan struct{}
-	waiting chan bool
-	waiter  chan struct{}
+	wake  chan struct{}
 }
 
 func NewLockAndNotify() *LockAndNotify {
-	waker := make(chan struct{}, 16)
-	waiting := make(chan bool, 1)
-	waiter := make(chan struct{}, 1)
-
-	go func() {
-		iswaiting := false
-		for {
-			select {
-			case is := <-waiting:
-				iswaiting = is
-			case <-waker:
-				if iswaiting {
-					iswaiting = false
-					waiter <- struct{}{}
-				}
-			}
-		}
-	}()
-
 	return &LockAndNotify{
-		waker:   waker,
-		waiting: waiting,
-		waiter:  waiter,
+		wake: make(chan struct{}, 1),
 	}
 }
 
@@ -48,18 +30,23 @@ func (l *LockAndNotify) Leave() {
 	l.mutex.Unlock()
 }
 
-// This is really dangerous if we've aborted!
+// Notify wakes a waiter, or leaves a pending wake-up for the next waiter.
+// It never blocks.
 func (l *LockAndNotify) Notify() {
-	l.waker <- struct{}{}
+	select {
+	case l.wake <- struct{}{}:
+	default:
+		// A wake-up is already pending, which is sufficient.
+	}
 }
 
+// Wait blocks until Notify is called or the delay elapses.
 func (l *LockAndNotify) Wait(delay time.Duration) {
-	l.waiting <- true
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 
 	select {
-	case <-time.After(delay):
-	case <-l.waiter:
+	case <-l.wake:
+	case <-timer.C:
 	}
-
-	l.waiting <- false
 }

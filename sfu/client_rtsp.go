@@ -38,6 +38,7 @@ type RtspClient struct {
 }
 
 func (r *RtspClient) stop() {
+	r.stopped.Store(true)
 	r.handler.Send(rtspClientStop, nil)
 }
 
@@ -54,6 +55,10 @@ func (r *RtspClient) run(s *Sfu) {
 			return true
 		case rtspClientDial:
 			if r.rtsplibClient != nil {
+				return true
+			}
+
+			if r.stopped.Load() {
 				return true
 			}
 
@@ -76,17 +81,26 @@ func (r *RtspClient) run(s *Sfu) {
 			u, err := base.ParseURL(r.url)
 			if err != nil {
 				log.Println("Invalid url", err)
+				// Unparseable address can never succeed, so report the failure
+				// and let the SFU drop it (a new submission may still retry).
+				r.notifyFailed()
+				r.stop()
 				return true
 			}
 
 			r.rtsplibClient = &gortsplib.Client{}
 			err = r.rtsplibClient.Start(u.Scheme, u.Host)
-			if failedCheck(err) {
+			if r.logger.NilErrCheck(r.label, "Failed to start rtsp client", err) {
+				r.rtsplibClient = nil
+				r.handler.Timeout(rtspClientDial, nil, 5000*time.Millisecond)
 				return true
 			}
 
 			r.rtspDescription, _, err = r.rtsplibClient.Describe(u)
-			if failedCheck(err) {
+			if r.logger.NilErrCheck(r.label, "Failed to describe rtsp stream", err) {
+				r.rtsplibClient.Close()
+				r.rtsplibClient = nil
+				r.handler.Timeout(rtspClientDial, nil, 5000*time.Millisecond)
 				return true
 			}
 
@@ -98,6 +112,7 @@ func (r *RtspClient) run(s *Sfu) {
 					UmbrellaId: "UMB_ID" + uuid.NewString(),
 					Kind:       TrackKind_Video,
 				},
+				owner: r,
 			}
 
 			videorelay, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
@@ -188,6 +203,7 @@ func (r *RtspClient) run(s *Sfu) {
 	r.handler.Send(rtspClientDial, nil)
 
 	r.handler.Loop(func() {
+		r.notifyTerminated()
 	})
 }
 

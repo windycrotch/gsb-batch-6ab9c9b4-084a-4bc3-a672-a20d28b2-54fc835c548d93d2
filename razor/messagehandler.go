@@ -2,6 +2,7 @@ package razor
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,7 +16,7 @@ type MessageHandler[MessageQueueWhat comparable, PayloadType any] struct {
 	callback MessageHandlerCallback[MessageQueueWhat, PayloadType]
 	lock     *LockAndNotify
 
-	aborted bool
+	aborted atomic.Bool
 
 	logger *Logger
 }
@@ -26,7 +27,6 @@ func NewMessageHandler[MessageQueueWhat comparable, PayloadType any](logger *Log
 		queue:    NewMessageQueue[MessageQueueWhat, PayloadType](queueLength),
 		callback: callback,
 		lock:     NewLockAndNotify(),
-		aborted:  false,
 		logger:   logger,
 	}
 }
@@ -43,7 +43,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Send(what MessageQueueW
 	mh.logger.Trace(mh.label, fmt.Sprintf("Send: %v", what))
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "Send called on aborted messagehandler")
 		mh.lock.Leave()
 
@@ -65,7 +65,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Timeout(what MessageQue
 	mh.logger.Trace(mh.label, fmt.Sprintf("Timeout: %v %s", what, delay))
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "Timeout called on aborted messagehandler")
 		mh.lock.Leave()
 		return false
@@ -85,7 +85,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Cancel(what MessageQueu
 	mh.logger.Trace(mh.label, fmt.Sprintf("Cancel: %v", what))
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "Cancel called on aborted messagehandler")
 		mh.lock.Leave()
 	} else {
@@ -100,15 +100,19 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) CancelAll() {
 	mh.logger.Trace(mh.label, "CancelAll")
 	mh.lock.Enter()
 
-	if mh.aborted {
+	if mh.aborted.Load() {
 		mh.logger.Info(mh.label, "CancelAll called on aborted messagehandler (will happen once every time)")
 		mh.lock.Leave()
 	} else {
 		mh.queue.Clear()
 
 		mh.lock.Leave()
-		mh.lock.Notify()
 	}
+
+	// Always notify, including when aborted: the worker loop must wake up to
+	// observe the abort flag and run its cleanup rather than sitting until its
+	// periodic timeout.
+	mh.lock.Notify()
 }
 
 func (mh *MessageHandler[MessageQueueWhat, PayloadType]) DoWork(now time.Time) {
@@ -167,7 +171,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Loop(oncleanup func()) 
 	go func() {
 		work := func() {
 			for {
-				if mh.aborted {
+				if mh.aborted.Load() {
 					return
 				}
 
@@ -203,7 +207,7 @@ func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Loop(oncleanup func()) 
 func (mh *MessageHandler[MessageQueueWhat, PayloadType]) Abort() {
 	mh.logger.Trace(mh.label, "Abort")
 	mh.lock.Enter()
-	mh.aborted = true
+	mh.aborted.Store(true)
 	mh.lock.Leave()
 
 	mh.CancelAll()

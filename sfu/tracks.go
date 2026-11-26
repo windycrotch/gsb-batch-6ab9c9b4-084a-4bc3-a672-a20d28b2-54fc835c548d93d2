@@ -11,6 +11,11 @@ type incomingTrack struct {
 	remote     *webrtc.TrackRemote
 	relay      *webrtc.TrackLocalStaticRTP
 	receiver   *webrtc.RTPReceiver
+
+	// The client which introduced this track. Used to reference count tracks so
+	// that a track shared by multiple relays is only stopped once the last
+	// owner disappears, and so that tracks of a removed relay never linger.
+	owner RemoteClient
 }
 
 func (it *incomingTrack) String() string {

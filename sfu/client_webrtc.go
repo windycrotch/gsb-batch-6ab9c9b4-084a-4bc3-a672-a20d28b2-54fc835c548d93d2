@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"atomirex.com/umbrella/razor"
@@ -17,6 +18,10 @@ import (
 	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/proto"
 )
+
+// errRelayStopped is returned by the dial hook when the relay is removed while
+// a connection attempt is still in flight.
+var errRelayStopped = fmt.Errorf("relay stopped while establishing")
 
 type clientCommand int
 
@@ -74,6 +79,56 @@ type client struct {
 
 	// Incoming tracks that have yet to be attached to MIDs
 	stagedIncomingTracks []*rawIncomingTrack
+
+	dialMu     sync.Mutex
+	dialCancel context.CancelFunc
+	dialConn   net.Conn
+
+	// wsMu guards the websocket pointer only (never a network operation), so
+	// stop() can always take it and close the connection, which in turn
+	// unblocks any writer waiting in writeMu.
+	wsMu    sync.Mutex
+	writeMu sync.Mutex
+}
+
+func (c *client) currentWebsocket() *websocket.Conn {
+	c.wsMu.Lock()
+	defer c.wsMu.Unlock()
+	return c.websocket
+}
+
+// trackDialConn records the raw connection used for an in-flight dial so that
+// stop() can abort a handshake which is still waiting for a response.
+func (c *client) trackDialConn(conn net.Conn) bool {
+	c.dialMu.Lock()
+	defer c.dialMu.Unlock()
+
+	if c.stopped.Load() {
+		return false
+	}
+
+	c.dialConn = conn
+	return true
+}
+
+func (c *client) forgetDialConn(conn net.Conn) {
+	c.dialMu.Lock()
+	if c.dialConn == conn {
+		c.dialConn = nil
+	}
+	c.dialMu.Unlock()
+}
+
+// closeWebsocket closes the websocket once, unblocking any pending reader.
+func (c *client) closeWebsocket() {
+	c.wsMu.Lock()
+	ws := c.websocket
+	c.websocket = nil
+	c.wsMu.Unlock()
+
+	if ws != nil {
+		ws.Close()
+	}
 }
 
 func (c *client) getStatus() *SFUStatusClient {
@@ -81,9 +136,19 @@ func (c *client) getStatus() *SFUStatusClient {
 		status: make(chan *SFUStatusClient, 1),
 	}}
 
-	c.handler.Send(clientGetStatus, &msg)
+	// If the client handler has already been aborted it will never reply, so
+	// never block the caller (the SFU command loop) indefinitely.
+	if !c.handler.Send(clientGetStatus, &msg) {
+		return nil
+	}
 
-	return <-msg.result.status
+	select {
+	case status := <-msg.result.status:
+		return status
+	case <-time.After(statusQueryTimeout):
+		c.logger.Error(c.label, "Timed out waiting for client status")
+		return nil
+	}
 }
 
 func (c *client) run(ws *websocket.Conn, s *Sfu) {
@@ -143,7 +208,9 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 		case clientKeyframeGateUnlock:
 			sendKeyFrameGate = false
 		case clientSendProto:
-			if c.websocket == nil {
+			ws := c.currentWebsocket()
+
+			if ws == nil {
 				c.logger.Error(c.label, "Attempting send when not connected to websocket")
 				return true
 			}
@@ -158,7 +225,12 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 
 			c.logger.Verbose(c.label, "ws proto sending "+payload.message.String())
 
-			err = c.websocket.WriteMessage(websocket.BinaryMessage, data)
+			// Serialize writes to the websocket only. The pointer lock is never
+			// held across a network operation so stop() can close the
+			// connection and unblock this write.
+			c.writeMu.Lock()
+			err = ws.WriteMessage(websocket.BinaryMessage, data)
+			c.writeMu.Unlock()
 
 			if c.logger.NilErrCheck(c.label, "Failed to write proto to ws", err) {
 				stop()
@@ -242,40 +314,79 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 
 			payload.result.status <- status
 		case clientDialWs:
-			if c.websocket != nil {
+			if c.currentWebsocket() != nil {
 				return true
 			}
+
+			if c.stopped.Load() {
+				return true
+			}
+
+			c.dialMu.Lock()
+			dialCtx, cancel := context.WithCancel(context.Background())
+			c.dialCancel = cancel
+			c.dialMu.Unlock()
 
 			dialer := websocket.Dialer{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // TODO remove this bad ignoring of certs, but useful for local testing
-
-				NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					host, port, err := net.SplitHostPort(addr)
-					if err != nil {
-						port = "443" // Default wss port
-					} else {
-						// Use our own mdns to discover it, if possible
-						// This is to enable an OpenWrt AP to discover Apple servers on the same subnet
-						if strings.HasSuffix(host, ".local") {
-							found, err := s.mdnsLookup(host)
-							if err == nil {
-								host = found
-							}
-						}
-					}
-
-					dialer := &net.Dialer{}
-					return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
-				},
 			}
 
-			conn, _, err := dialer.Dial(c.trunkurl, nil)
-			if c.logger.NilErrCheck(c.label, "Error dialling ws "+c.trunkurl, err) {
-				c.handler.Timeout(clientDialWs, nil, time.Second*10)
+			dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					port = "443" // Default wss port
+				} else if strings.HasSuffix(host, ".local") {
+					// Use our own mdns to discover it, if possible
+					// This is to enable an OpenWrt AP to discover Apple servers on the same subnet
+					found, err := s.mdnsLookup(host)
+					if err == nil {
+						host = found
+					}
+				}
+
+				netDialer := &net.Dialer{}
+				conn, err := netDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+				if err != nil {
+					return nil, err
+				}
+
+				if !c.trackDialConn(conn) {
+					conn.Close()
+					return nil, errRelayStopped
+				}
+
+				return conn, nil
+			}
+
+			conn, _, err := dialer.DialContext(dialCtx, c.trunkurl, nil)
+			cancel()
+
+			if conn != nil {
+				c.forgetDialConn(conn.UnderlyingConn())
+			}
+
+			if c.stopped.Load() {
+				// We were removed while dialling: do not leave a half connected
+				// instance behind, and do not report a failure for a relay which
+				// was intentionally stopped.
+				if conn != nil {
+					conn.Close()
+				}
 				return true
 			}
 
+			if c.logger.NilErrCheck(c.label, "Error dialling ws "+c.trunkurl, err) {
+				// Establishment failed: tell the SFU so it drops this relay and
+				// allows a later submission of the same address to retry.
+				c.notifyFailed()
+				stop()
+				return true
+			}
+
+			c.wsMu.Lock()
 			c.websocket = conn
+			c.wsMu.Unlock()
+
 			go func() {
 				c.continueWebsocket(s)
 			}()
@@ -331,26 +442,51 @@ func (c *client) run(ws *websocket.Conn, s *Sfu) {
 			s.removeOutgoingTracksForIncomingTrack(it.track)
 		}
 
-		if ws != nil {
-			ws.Close()
-			ws = nil
-		}
+		c.closeWebsocket()
 
+		// Use an immediate close rather than a graceful one: this peer is being
+		// torn down, and a graceful close can take seconds, which would delay a
+		// replacement relay for the same address and make the server list lag
+		// behind the submitted intent.
 		if outgoing != nil {
-			outgoing.wrapped.GracefulClose()
+			outgoing.Close()
 		}
 		outgoing = nil
 
 		if incoming != nil {
-			incoming.wrapped.GracefulClose()
+			incoming.Close()
 		}
 		incoming = nil
 
 		c.logger.Info(c.label, "Post clean up finished")
+
+		// Tell the SFU this relay instance is fully torn down. This is the point
+		// at which a replacement instance for the same address may be created.
+		c.notifyTerminated()
 	})
 }
 
 func (c *client) stop() {
+	c.stopped.Store(true)
+
+	// Unblock an in-flight dial so a relay removed mid-establishment cannot
+	// linger as a half connected instance. Cancelling the context aborts a
+	// connection attempt, and closing the tracked connection aborts a
+	// handshake which is still waiting for bytes from the peer.
+	c.dialMu.Lock()
+	if c.dialCancel != nil {
+		c.dialCancel()
+		c.dialCancel = nil
+	}
+	if c.dialConn != nil {
+		c.dialConn.Close()
+		c.dialConn = nil
+	}
+	c.dialMu.Unlock()
+
+	// Unblock the websocket reader so a stopped relay tears down promptly.
+	c.closeWebsocket()
+
 	c.handler.CancelAll()
 	c.handler.Send(clientStop, nil)
 }
@@ -464,7 +600,7 @@ func (c *client) handleWsMessage(message *RemoteNodeMessage, s *Sfu) {
 						c.logger.Error(c.label, "Failed to add transceiver "+err.Error())
 					} else {
 						intrack := &incomingTrackWithClientState{
-							track: &incomingTrack{descriptor: td},
+							track: &incomingTrack{descriptor: td, owner: c},
 						}
 
 						c.incomingTracks[intrack.UmbrellaID()] = intrack
@@ -521,6 +657,7 @@ func (c *client) evalIncomingState(s *Sfu) {
 					intrack.track.descriptor.Id = sit.track.ID()
 					intrack.track.descriptor.StreamId = sit.track.StreamID()
 					intrack.track.receiver = sit.receiver
+					intrack.track.owner = c
 					intrack.transceiverMid = mid
 
 					// Remove from staged
@@ -709,7 +846,13 @@ func (c *client) continueWebsocket(s *Sfu) {
 		c.stop()
 	}()
 
-	ws := c.websocket
+	ws := c.currentWebsocket()
+
+	if ws == nil {
+		c.notifyTerminated()
+		return
+	}
+
 	incoming := c.incoming
 	outgoing := c.outgoing
 
@@ -738,15 +881,15 @@ func (c *client) continueWebsocket(s *Sfu) {
 		})
 	}
 
-	incoming.OnICECandidate = func(i *webrtc.ICECandidate) {
+	incoming.SetOnICECandidate(func(i *webrtc.ICECandidate) {
 		icecandidate(i, true)
-	}
+	})
 
-	outgoing.OnICECandidate = func(i *webrtc.ICECandidate) {
+	outgoing.SetOnICECandidate(func(i *webrtc.ICECandidate) {
 		icecandidate(i, false)
-	}
+	})
 
-	incoming.OnConnectionStateChange = func(p webrtc.PeerConnectionState) {
+	incoming.SetOnConnectionStateChange(func(p webrtc.PeerConnectionState) {
 		switch p {
 		case webrtc.PeerConnectionStateFailed:
 		case webrtc.PeerConnectionStateDisconnected:
@@ -756,9 +899,9 @@ func (c *client) continueWebsocket(s *Sfu) {
 		}
 
 		s.handler.Send(sfuSignalClients, nil)
-	}
+	})
 
-	outgoing.OnConnectionStateChange = func(p webrtc.PeerConnectionState) {
+	outgoing.SetOnConnectionStateChange(func(p webrtc.PeerConnectionState) {
 		switch p {
 		case webrtc.PeerConnectionStateFailed:
 		case webrtc.PeerConnectionStateDisconnected:
@@ -768,9 +911,9 @@ func (c *client) continueWebsocket(s *Sfu) {
 		}
 
 		s.handler.Send(sfuSignalClients, nil)
-	}
+	})
 
-	outgoing.OnSignalingStateChange = func(ss webrtc.SignalingState) {
+	outgoing.SetOnSignalingStateChange(func(ss webrtc.SignalingState) {
 		if ss == webrtc.SignalingStateStable {
 			mappings := make([]*MidToUmbrellaIDMapping, 0)
 
@@ -790,20 +933,20 @@ func (c *client) continueWebsocket(s *Sfu) {
 
 			c.writeProto(&RemoteNodeMessage{MidMappings: &MidToUmbrellaIDMappings{Mapping: mappings}})
 		}
-	}
+	})
 
-	incoming.OnTrack = func(t *webrtc.TrackRemote, r *webrtc.RTPReceiver) {
+	incoming.SetOnTrack(func(t *webrtc.TrackRemote, r *webrtc.RTPReceiver) {
 		c.logger.Info(c.label, "OnTrack "+t.ID()+" "+r.RTPTransceiver().Mid())
 		c.handler.Send(clientIncomingTrackAdded, &clientCommandMessage{newincomingTrack: &rawIncomingTrack{track: t, receiver: r}})
-	}
+	})
 
-	incoming.OnNegotiationNeeded = func() {
+	incoming.SetOnNegotiationNeeded(func() {
 		c.handler.Send(clientEvalState, nil)
-	}
+	})
 
-	outgoing.OnNegotiationNeeded = func() {
+	outgoing.SetOnNegotiationNeeded(func() {
 		c.handler.Send(clientEvalState, nil)
-	}
+	})
 
 	// Signal for the new PeerConnection
 	s.handler.Send(sfuSignalClients, nil)
