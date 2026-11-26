@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/jpeg"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Glimesh/waveguide/config"
@@ -33,6 +34,12 @@ type Control struct {
 	orchestrator       orchestrator.Orchestrator
 	streams            map[types.ChannelID]*Stream
 	metadataCollectors map[types.ChannelID]chan bool
+
+	// stateMutex guards streams and metadataCollectors. All stream lifecycle
+	// transitions (StartStream / StopStream / newStream / removeStream) take
+	// this lock so that two requests for the same channel can never interleave
+	// and leave two registered streams.
+	stateMutex sync.RWMutex
 
 	log     logrus.FieldLogger
 	httpMux *http.ServeMux
@@ -92,6 +99,38 @@ func New(
 	}, nil
 }
 
+// NewWithDependencies builds a Control with explicit service and orchestrator
+// implementations. It is intended for tests (and embedded deployments) that
+// want to exercise the full stream lifecycle without loading a config file or
+// talking to external services.
+func NewWithDependencies(
+	ctx context.Context,
+	svc service.Service,
+	or orchestrator.Orchestrator,
+	hostname string,
+	logger *logrus.Logger,
+) *Control {
+	if svc != nil {
+		svc.SetLogger(logger.WithFields(logrus.Fields{"service": svc.Name()}))
+	}
+	if or != nil {
+		or.SetLogger(logger.WithFields(logrus.Fields{"orchestrator": or.Name()}))
+	}
+
+	return &Control{
+		ctx:                ctx,
+		service:            svc,
+		orchestrator:       or,
+		streams:            make(map[types.ChannelID]*Stream),
+		metadataCollectors: make(map[types.ChannelID]chan bool),
+		httpMux:            http.NewServeMux(),
+		log: logger.WithFields(logrus.Fields{
+			"control": "waveguide",
+		}),
+		Hostname: hostname,
+	}
+}
+
 func (ctrl *Control) Context() context.Context {
 	return ctrl.ctx
 }
@@ -101,7 +140,14 @@ func (ctrl *Control) ContextErr() error {
 }
 
 func (ctrl *Control) Shutdown() {
+	ctrl.stateMutex.RLock()
+	channelIDs := make([]types.ChannelID, 0, len(ctrl.streams))
 	for c := range ctrl.streams {
+		channelIDs = append(channelIDs, c)
+	}
+	ctrl.stateMutex.RUnlock()
+
+	for _, c := range channelIDs {
 		ctrl.StopStream(c)
 	}
 }
@@ -112,7 +158,11 @@ func (ctrl *Control) GetTracks(channelID types.ChannelID) ([]StreamTrack, error)
 		return nil, err
 	}
 
-	return stream.tracks, nil
+	ctrl.stateMutex.RLock()
+	tracks := append([]StreamTrack(nil), stream.tracks...)
+	ctrl.stateMutex.RUnlock()
+
+	return tracks, nil
 }
 
 func (ctrl *Control) GetHmacKey(channelID types.ChannelID) (string, error) {
@@ -139,8 +189,11 @@ func (ctrl *Control) Authenticate(channelID types.ChannelID, streamKey types.Str
 func (ctrl *Control) StartStream(channelID types.ChannelID) (*Stream, error) {
 	ctx, cancel := context.WithCancel(ctrl.Context())
 
+	// newStream atomically rejects a second concurrent stream for the same
+	// channel, so at most one stream can ever be registered per channel.
 	stream, err := ctrl.newStream(channelID, cancel)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
@@ -149,6 +202,7 @@ func (ctrl *Control) StartStream(channelID types.ChannelID) (*Stream, error) {
 	streamID, err := ctrl.service.StartStream(channelID)
 	if err != nil {
 		ctrl.removeStream(channelID)
+		cancel()
 		return nil, err
 	}
 	stream.StreamID = streamID
@@ -171,27 +225,43 @@ func (ctrl *Control) StartStream(channelID types.ChannelID) (*Stream, error) {
 	return stream, err
 }
 
+// StopStream ends the stream for a channel and notifies the external service
+// and orchestrator exactly once. It is safe to call concurrently and multiple
+// times (DELETE, connection-state callbacks and timeout goroutines all funnel
+// through here): only the first call performs the external stop requests and
+// removes the internal registration; subsequent calls are no-ops.
 func (ctrl *Control) StopStream(channelID types.ChannelID) error {
-	// StopStream is called
-	ctrl.log.Debug("Stop Stream")
-	stream, err := ctrl.getStream(channelID)
-	if err != nil {
-		if errors.Is(err, errStreamRemoved) {
-			return nil
-		}
-		return err
+	// Serialize lifecycle transitions so two concurrent stops cannot both
+	// observe a live stream and both send external stop requests.
+	ctrl.stateMutex.Lock()
+	stream, exists := ctrl.streams[channelID]
+	if !exists {
+		// Already removed (or never existed): nothing to do, nothing to report.
+		ctrl.stateMutex.Unlock()
+		return nil
 	}
 
-	if !stream.Stopped() {
-		stream.Stop()
+	// Detach the stream from the registry up front. Any concurrent or later
+	// StopStream call will now observe no stream and return immediately,
+	// guaranteeing the external stop requests below run at most once.
+	collector, hasCollector := ctrl.metadataCollectors[channelID]
+	ctrl.removeStreamLocked(channelID)
+	ctrl.stateMutex.Unlock()
+
+	if hasCollector {
+		// Stop the metadata/heartbeat collector; buffered channel never blocks.
+		select {
+		case collector <- true:
+		default:
+		}
+		ctrl.log.Debug("sent metadata collector signal")
 	}
-	ctrl.metadataCollectors[channelID] <- true
-	ctrl.log.Debug("sent metadata collector signal")
+
+	stream.Stop()
 
 	// Make sure we send stop commands to everyone, and don't return until they've all been sent
 	serviceErr := ctrl.service.EndStream(stream.StreamID)
 	orchestratorErr := ctrl.orchestrator.StopStream(stream.ChannelID, stream.StreamID)
-	controlErr := ctrl.removeStream(channelID)
 
 	if serviceErr != nil {
 		stream.log.Error(serviceErr)
@@ -200,10 +270,6 @@ func (ctrl *Control) StopStream(channelID types.ChannelID) error {
 	if orchestratorErr != nil {
 		stream.log.Error(orchestratorErr)
 		return orchestratorErr
-	}
-	if controlErr != nil {
-		stream.log.Error(controlErr)
-		return controlErr
 	}
 
 	return nil
@@ -223,6 +289,13 @@ func (ctrl *Control) setupHeartbeat(channelID types.ChannelID) {
 	if err != nil {
 		return
 	}
+
+	// Capture the collector channel up front: the map entry is deleted when the
+	// stream stops, and reading a nil channel would block this goroutine on the
+	// stop signal forever.
+	ctrl.stateMutex.RLock()
+	stopSignal := ctrl.metadataCollectors[channelID]
+	ctrl.stateMutex.RUnlock()
 
 	for {
 		select {
@@ -263,7 +336,7 @@ func (ctrl *Control) setupHeartbeat(channelID types.ChannelID) {
 				return
 			}
 
-		case <-ctrl.metadataCollectors[channelID]:
+		case <-stopSignal:
 			ticker.Stop()
 			return
 		}
@@ -358,6 +431,13 @@ func (ctrl *Control) sendThumbnail(channelID types.ChannelID) (err error) {
 }
 
 func (ctrl *Control) newStream(channelID types.ChannelID, cancelFunc context.CancelFunc) (*Stream, error) {
+	ctrl.stateMutex.Lock()
+	defer ctrl.stateMutex.Unlock()
+
+	if _, exists := ctrl.streams[channelID]; exists {
+		return nil, errors.New("stream already exists in stream manager state")
+	}
+
 	stream := &Stream{ //nolint exhaustive struct
 		ChannelID: channelID,
 
@@ -368,8 +448,6 @@ func (ctrl *Control) newStream(channelID types.ChannelID, cancelFunc context.Can
 		cancelFunc:        cancelFunc,
 		kf:                keyframer.New(),
 		rtpIngest:         make(chan *rtp.Packet),
-		stopHeartbeat:     make(chan struct{}, 1),
-		stopThumbnailer:   make(chan struct{}, 1),
 		thumbnailReceiver: make(chan *rtp.Packet, 50),
 		requestThumbnail:  make(chan struct{}, 1),
 
@@ -385,9 +463,6 @@ func (ctrl *Control) newStream(channelID types.ChannelID, cancelFunc context.Can
 		stream.videoWriterChan = make(chan *rtp.Packet, 100) // not sure what the buffer size here should be
 	}
 
-	if _, exists := ctrl.streams[channelID]; exists {
-		return stream, errors.New("stream already exists in stream manager state")
-	}
 	ctrl.streams[channelID] = stream
 	ctrl.metadataCollectors[channelID] = make(chan bool, 1)
 
@@ -395,6 +470,14 @@ func (ctrl *Control) newStream(channelID types.ChannelID, cancelFunc context.Can
 }
 
 func (ctrl *Control) removeStream(id types.ChannelID) error {
+	ctrl.stateMutex.Lock()
+	defer ctrl.stateMutex.Unlock()
+
+	return ctrl.removeStreamLocked(id)
+}
+
+// removeStreamLocked removes a stream while the caller holds stateMutex.
+func (ctrl *Control) removeStreamLocked(id types.ChannelID) error {
 	if _, exists := ctrl.streams[id]; !exists {
 		return errors.New("RemoveStream stream does not exist in state")
 	}
@@ -408,8 +491,27 @@ func (ctrl *Control) removeStream(id types.ChannelID) error {
 var errStreamRemoved = errors.New("stream does not exist in state")
 
 func (ctrl *Control) getStream(id types.ChannelID) (*Stream, error) {
+	ctrl.stateMutex.RLock()
+	defer ctrl.stateMutex.RUnlock()
+
 	if _, exists := ctrl.streams[id]; !exists {
 		return nil, errStreamRemoved
 	}
 	return ctrl.streams[id], nil
+}
+
+// HasStream reports whether a stream is currently registered for the channel.
+// It is primarily intended for tests asserting on live state.
+func (ctrl *Control) HasStream(channelID types.ChannelID) bool {
+	ctrl.stateMutex.RLock()
+	defer ctrl.stateMutex.RUnlock()
+
+	_, exists := ctrl.streams[channelID]
+	return exists
+}
+
+// HTTPHandler exposes the mux that inputs and outputs register their handlers
+// on, so tests can drive the full HTTP stack in-process.
+func (ctrl *Control) HTTPHandler() http.Handler {
+	return ctrl.httpMux
 }

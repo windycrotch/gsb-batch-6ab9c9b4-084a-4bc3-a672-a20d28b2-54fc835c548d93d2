@@ -3,6 +3,8 @@ package control
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Glimesh/waveguide/pkg/keyframer"
 	"github.com/Glimesh/waveguide/pkg/types"
@@ -22,7 +24,13 @@ type Stream struct {
 	log logrus.FieldLogger
 
 	cancelFunc context.CancelFunc
-	stopped    bool
+
+	// stopOnce makes Stop idempotent and reentrant: DELETE, connection-state
+	// callbacks and timeout goroutines can all race to stop the same stream
+	// without performing the teardown twice.
+	stopOnce sync.Once
+	// stopped is read concurrently through Stopped(); guard it atomically.
+	stopped int32
 
 	// authenticated is set after the stream has successfully authed with a remote service
 	authenticated bool
@@ -41,8 +49,6 @@ type Stream struct {
 	rtpIngest     chan *rtp.Packet
 	lastThumbnail chan []byte
 	// channel used to signal thumbnailer to stop
-	stopThumbnailer   chan struct{}
-	stopHeartbeat     chan struct{}
 	requestThumbnail  chan struct{}
 	thumbnailReceiver chan *rtp.Packet
 
@@ -101,17 +107,14 @@ func (s *Stream) ReportMetadata(metadatas ...Metadata) error {
 }
 
 func (s *Stream) Stop() {
-	s.log.Infof("stopping stream")
-
-	s.stopHeartbeat <- struct{}{} // not being used anywhere, is it really needed?
-
-	s.cancelFunc()
-	s.stopped = true
-	s.log.Debug("sent stop thumbnailer signal")
-
-	s.log.Debug("canceled stream ctx")
+	s.stopOnce.Do(func() {
+		s.log.Infof("stopping stream")
+		s.cancelFunc()
+		atomic.StoreInt32(&s.stopped, 1)
+		s.log.Debug("canceled stream ctx")
+	})
 }
 
 func (s *Stream) Stopped() bool {
-	return s.stopped
+	return atomic.LoadInt32(&s.stopped) == 1
 }
