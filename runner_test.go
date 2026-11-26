@@ -2,6 +2,7 @@ package spireav_test
 
 import (
 	"context"
+	"os/exec"
 	"testing"
 
 	"github.com/spiretechnology/spireav"
@@ -16,8 +17,18 @@ func overrideFfmpegPath(path string) func() {
 	}
 }
 
+// requireFfmpeg skips tests that need a real FFmpeg binary when none is installed, so
+// that the suite can run locally without it.
+func requireFfmpeg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath(spireav.FfmpegPath); err != nil {
+		t.Skipf("skipping: ffmpeg binary not available: %v", err)
+	}
+}
+
 func TestRunnerErrors(t *testing.T) {
 	t.Run("invalid args", func(t *testing.T) {
+		requireFfmpeg(t)
 		runner := spireav.NewRunner(spireav.RunnableArgs{"several", "bad", "args"})
 		err := runner.Run(context.Background())
 		require.Error(t, err, "expected error when running process with invalid args")
