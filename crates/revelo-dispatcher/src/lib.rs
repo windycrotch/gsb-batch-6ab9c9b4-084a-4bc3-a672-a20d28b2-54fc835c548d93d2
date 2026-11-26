@@ -12,6 +12,9 @@
 //!   rayon when the `parallel` feature is enabled. Large buffers use a
 //!   sequential, raw-read-capped probe so speculative parser candidates cannot
 //!   fault or copy the whole file before the real parser is selected.
+//! - [`probe`] — runs an explicit candidate list with fully isolated trial
+//!   contexts, then re-runs the winner from a clean state and returns its
+//!   complete result (fields, truncation flag, access stats).
 //!
 //! # Example
 //!
@@ -35,6 +38,9 @@
 //! their category to minimise false positives.
 
 #![deny(unsafe_code)]
+
+pub mod probe;
+pub use probe::{probe, ParserFn, ProbeMatch, ProbeOutcome};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
