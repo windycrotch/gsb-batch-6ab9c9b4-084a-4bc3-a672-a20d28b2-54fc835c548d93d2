@@ -39,6 +39,9 @@ type bufferTask struct {
 	target string
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// cancelled 标记此任务已被撤回,由 dcQueue 在锁内设置
+	cancelled bool
 }
 
 // VStatus for status info
@@ -137,9 +140,13 @@ func getInfo(id string) (*youtubevideoparser.VideoInfo, error) {
 }
 
 // Response create send task that send data to dc
-func (m *MediaHub) Response(d *webrtc.DataChannel, id string, index []uint64) error {
+// 同一通道上相同 (id,index) 的重复请求只会保留一份,重复项会被忽略。
+func (m *MediaHub) Response(d DataChannel, id string, index []uint64) error {
 	vinfo, item := m.getVideoInfo(id)
 	if !itemValid(item) {
+		return nil
+	}
+	if d == nil || d.ReadyState() != webrtc.DataChannelStateOpen {
 		return nil
 	}
 	for _, i := range index {
@@ -149,25 +156,24 @@ func (m *MediaHub) Response(d *webrtc.DataChannel, id string, index []uint64) er
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
 		queueManager.send(d, &bufferTask{
-			id,
-			i,
-			target,
-			ctx,
-			cancel,
+			id:     id,
+			index:  i,
+			target: target,
+			ctx:    ctx,
+			cancel: cancel,
 		})
 	}
 	return nil
 }
 
 // QuitResponse cancel that send task
-func (m *MediaHub) QuitResponse(d *webrtc.DataChannel, id string, index []uint64) {
+func (m *MediaHub) QuitResponse(d DataChannel, id string, index []uint64) {
 	queueManager.quit(d, id, index)
 	m.clean()
 }
 
 // Stats output status
 func (m *MediaHub) Stats() *VStatus {
-	var res = map[string]*youtubevideoparser.VideoInfo{}
 	m.videos.Range(func(key, value any) bool {
 		v := value.(*videoItem)
 		res[key.(string)] = v.vinfo
