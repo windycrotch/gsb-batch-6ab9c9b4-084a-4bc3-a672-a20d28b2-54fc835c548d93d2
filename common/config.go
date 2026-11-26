@@ -309,6 +309,8 @@ type HTTPForwarderTargetConfig struct {
 type LiveStreamVideoForwarderConfig struct {
 	// MaxInFlight max number of segments to forward in parallel
 	MaxInFlight int `mapstructure:"maxInFlightSegments" json:"maxInFlightSegments" validate:"required,gte=1"`
+	// Retry per-segment forwarding retry behavior
+	Retry ForwarderRetryConfig `mapstructure:"retry" json:"retry" validate:"required,dive"`
 	// Remote HTTP forwarder target config
 	Remote HTTPForwarderTargetConfig `mapstructure:"remote" json:"remote" validate:"required,dive"`
 }
@@ -317,8 +319,30 @@ type LiveStreamVideoForwarderConfig struct {
 type RecordingVideoForwarderConfig struct {
 	// MaxInFlight max number of segments to forward in parallel
 	MaxInFlight int `mapstructure:"maxInFlightSegments" json:"maxInFlightSegments" validate:"required,gte=1"`
+	// Retry per-segment upload / broadcast retry behavior
+	Retry ForwarderRetryConfig `mapstructure:"retry" json:"retry" validate:"required,dive"`
 	// RecordingStorage video recording storage config
 	RecordingStorage RecordingStorageConfig `mapstructure:"storage" json:"storage" validate:"required,dive"`
+}
+
+// ForwarderRetryConfig retry behavior for a segment forwarder
+type ForwarderRetryConfig struct {
+	// MaxAttempts total attempts made per segment (1 disables retries)
+	MaxAttempts int `mapstructure:"maxAttempts" json:"maxAttempts" validate:"required,gte=1"`
+	// InitialBackoffInMSec wait before the first retry in milliseconds
+	InitialBackoffInMSec uint32 `mapstructure:"initialBackoffInMSec" json:"initialBackoffInMSec" validate:"required,gte=1"`
+	// MaxBackoffInMSec upper bound on the wait between retries in milliseconds
+	MaxBackoffInMSec uint32 `mapstructure:"maxBackoffInMSec" json:"maxBackoffInMSec" validate:"required,gte=1"`
+}
+
+// InitialBackoff convert InitialBackoffInMSec to time.Duration
+func (c ForwarderRetryConfig) InitialBackoff() time.Duration {
+	return time.Millisecond * time.Duration(c.InitialBackoffInMSec)
+}
+
+// MaxBackoff convert MaxBackoffInMSec to time.Duration
+func (c ForwarderRetryConfig) MaxBackoff() time.Duration {
+	return time.Millisecond * time.Duration(c.MaxBackoffInMSec)
 }
 
 // VideoForwarderConfig video segment forwarding config
@@ -621,8 +645,14 @@ func InstallDefaultEdgeNodeConfigValues() {
 	// Default forwarder config
 	// Default live video segment forwarder config
 	viper.SetDefault("forwarder.live.maxInFlightSegments", 4)
+	viper.SetDefault("forwarder.live.retry.maxAttempts", 3)
+	viper.SetDefault("forwarder.live.retry.initialBackoffInMSec", 100)
+	viper.SetDefault("forwarder.live.retry.maxBackoffInMSec", 1000)
 	// Default recording video segment forwarder config
 	viper.SetDefault("forwarder.recording.maxInFlightSegments", 4)
+	viper.SetDefault("forwarder.recording.retry.maxAttempts", 3)
+	viper.SetDefault("forwarder.recording.retry.initialBackoffInMSec", 100)
+	viper.SetDefault("forwarder.recording.retry.maxBackoffInMSec", 1000)
 	// Default live segment forwarder HTTP config
 	viper.SetDefault("forwarder.live.remote.requestIDHeader", "X-Request-ID")
 	viper.SetDefault("forwarder.live.remote.client.retry.maxAttempts", 5)

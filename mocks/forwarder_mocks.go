@@ -8,6 +8,7 @@ import (
 	"context"
 
 	"github.com/alwitt/livemix/common"
+	"github.com/alwitt/livemix/forwarder"
 	mock "github.com/stretchr/testify/mock"
 )
 
@@ -375,4 +376,41 @@ func (_c *SegmentSender_ForwardSegment_Call) Return(err error) *SegmentSender_Fo
 func (_c *SegmentSender_ForwardSegment_Call) RunAndReturn(run func(ctxt context.Context, segment common.VideoSegmentWithData) error) *SegmentSender_ForwardSegment_Call {
 	_c.Call.Return(run)
 	return _c
+}
+
+// ForwardSegmentAndWait provides a mock function for the type LiveStreamSegmentForwarder
+func (_mock *LiveStreamSegmentForwarder) ForwardSegmentAndWait(
+	ctxt context.Context, segment common.VideoSegmentWithData,
+) (forwarder.SegmentForwardResult, error) {
+	ret := _mock.Called(ctxt, segment)
+
+	var r0 forwarder.SegmentForwardResult
+	if rf, ok := ret.Get(0).(func(context.Context, common.VideoSegmentWithData) forwarder.SegmentForwardResult); ok {
+		r0 = rf(ctxt, segment)
+	} else {
+		r0 = ret.Get(0).(forwarder.SegmentForwardResult)
+	}
+
+	var r1 error
+	if rf, ok := ret.Get(1).(func(context.Context, common.VideoSegmentWithData) error); ok {
+		r1 = rf(ctxt, segment)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// FailedSegments provides a mock function for the type RecordingSegmentForwarder
+func (_mock *RecordingSegmentForwarder) FailedSegments() []forwarder.FailedSegmentRecord {
+	ret := _mock.Called()
+
+	var r0 []forwarder.FailedSegmentRecord
+	if rf, ok := ret.Get(0).(func() []forwarder.FailedSegmentRecord); ok {
+		r0 = rf()
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).([]forwarder.FailedSegmentRecord)
+		}
+	}
+	return r0
 }

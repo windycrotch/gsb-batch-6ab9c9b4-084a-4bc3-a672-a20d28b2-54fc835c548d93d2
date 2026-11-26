@@ -123,6 +123,15 @@ forwarder:
     # Max number of segments to forward in parallel
     maxInFlightSegments: 4
 
+    # Per-segment upload / broadcast retry behavior
+    retry:
+      # Total attempts made per segment (1 disables retries)
+      maxAttempts: 3
+      # Wait before the first retry in milliseconds
+      initialBackoffInMSec: 100
+      # Upper bound on the wait between retries in milliseconds
+      maxBackoffInMSec: 1000
+
     # Recording storage config
     storage:
       # Storage bucket to place all the recording video segments in
@@ -140,6 +149,15 @@ forwarder:
   live:
     # Max number of segments to forward in parallel
     maxInFlightSegments: 4
+
+    # Per-segment live forwarding retry behavior
+    retry:
+      # Total attempts made per segment (1 disables retries)
+      maxAttempts: 3
+      # Wait before the first retry in milliseconds
+      initialBackoffInMSec: 100
+      # Upper bound on the wait between retries in milliseconds
+      maxBackoffInMSec: 1000
 
     # HTTP forwarder target config
     remote:

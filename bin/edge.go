@@ -446,6 +446,11 @@ func DefineEdgeNode(
 		dbConns,
 		httpSegmentSender,
 		config.Forwarder.Live.MaxInFlight,
+		forwarder.RetryConfig{
+			MaxAttempts:    config.Forwarder.Live.Retry.MaxAttempts,
+			InitialBackoff: config.Forwarder.Live.Retry.InitialBackoff(),
+			MaxBackoff:     config.Forwarder.Live.Retry.MaxBackoff(),
+		},
 		taskProcessorMetricsAgent,
 	)
 	if err != nil {
@@ -502,9 +507,15 @@ func DefineEdgeNode(
 	recordingForwarder, err := forwarder.NewS3RecordingSegmentForwarder(
 		parentCtxt,
 		config.Forwarder.Recording.RecordingStorage,
+		dbConns,
 		s3SegmentSender,
 		psBroadcast,
 		config.Forwarder.Recording.MaxInFlight,
+		forwarder.RetryConfig{
+			MaxAttempts:    config.Forwarder.Recording.Retry.MaxAttempts,
+			InitialBackoff: config.Forwarder.Recording.Retry.InitialBackoff(),
+			MaxBackoff:     config.Forwarder.Recording.Retry.MaxBackoff(),
+		},
 		taskProcessorMetricsAgent,
 	)
 	if err != nil {
