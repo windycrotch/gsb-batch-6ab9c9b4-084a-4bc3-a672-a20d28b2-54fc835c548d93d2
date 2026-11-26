@@ -1,0 +1,17 @@
+#ifndef __TEXT_H__
+#define __TEXT_H__
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "parameters.h"
+
+typedef void text_t;
+
+const char *text_get_error();
+bool text_create(const parameters_t *params, int stride, text_t **text);
+void text_reload_params(text_t *text, const parameters_t *params);
+void text_destroy(text_t *text);
+void text_draw(text_t *text, uint8_t *buf, uint64_t ntp);
+
+#endif
