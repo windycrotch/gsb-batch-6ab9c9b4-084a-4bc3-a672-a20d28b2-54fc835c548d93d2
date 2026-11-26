@@ -18,11 +18,11 @@ namespace mixr {
     }
 
     size_t Impl::CreateBuffer(uint8_t* data, size_t dataLength) {
-        //std::cout << "Create buffer" << std::endl;
         std::lock_guard guard(_mutex);
         Buffer buffer {
            /* .Data = */ std::vector<uint8_t>(data, data + dataLength),
-           /* DataLength= */ dataLength
+           /* DataLength= */ dataLength,
+           /* .Alive = */ true
         };
 
         size_t index;
@@ -40,39 +40,63 @@ namespace mixr {
     }
 
     void Impl::DestroyBuffer(size_t bufferId) {
-        //std::cout << "Destroy buffer" << std::endl;
-        std::lock_guard guard(_mutex);
-        Buffer* buffer = &_buffers[bufferId];
+        {
+            std::lock_guard guard(_mutex);
 
-        // Search to see if the buffer is contained in the source.
-        // If it is, remove it. If the source is currently playing the buffer, then stop the source.
-        // This is susceptible to race conditions and you are not meant to call this while a source that contains it is
-        // playing, but it offers a bit of protection.
-        for (size_t i = 0; i < _sources.size(); i++) {
-            Source* source = &_sources[i];
-            auto queuedBuffers = &source->QueuedBuffers;
+            // Defensive: an id that was never handed out, or one whose slot has
+            // already been destroyed, is a no-op rather than an out-of-bounds read.
+            if (bufferId >= _buffers.size() || !_buffers[bufferId].Alive)
+                return;
 
-            auto loc = std::find(queuedBuffers->begin(), queuedBuffers->end(), bufferId);
-            if (loc != queuedBuffers->end()) {
+            Buffer* buffer = &_buffers[bufferId];
+
+            // The buffer may be queued on any number of sources.
+            // - If it sits at the front of a source's queue that source is playing
+            //   from it, so the source must be stopped.
+            // - The buffer is removed from every queue that references it.
+            // All of this happens under _mutex, so the mixer thread cannot be
+            // mid-read of the buffer while it is being torn down.
+            for (size_t i = 0; i < _sources.size(); i++) {
+                Source* source = &_sources[i];
+
+                if (!source->Alive)
+                    continue;
+
+                auto* queuedBuffers = &source->QueuedBuffers;
+
+                auto loc = std::find(queuedBuffers->begin(), queuedBuffers->end(), bufferId);
+                if (loc == queuedBuffers->end())
+                    continue;
+
                 if (bufferId == queuedBuffers->front()) {
-                    SourceStop(i, false);
+                    // StopSourceLocked resets position, clears the queue and (if the
+                    // state actually changed) enqueues a de-duplicated Stopped event.
+                    StopSourceLocked(i);
+                } else {
+                    // Not at the front: just drop every reference to this buffer.
+                    queuedBuffers->erase(std::remove(queuedBuffers->begin(), queuedBuffers->end(), bufferId),
+                                         queuedBuffers->end());
                 }
-
-                queuedBuffers->erase(std::remove(queuedBuffers->begin(), queuedBuffers->end(), bufferId), queuedBuffers->end());
             }
+
+            // Drop the payload before parking the slot. Any stale id handed to
+            // UpdateBuffer afterwards is rejected by the Alive check there.
+            buffer->Data = {};
+            buffer->DataLength = 0;
+            buffer->Alive = false;
+
+            _availableBuffers.push_back(bufferId);
         }
 
-        buffer->Data = {};
-
-        _availableBuffers.push_back(bufferId);
+        // Sources stopped above have now fully settled; deliver their events.
+        FlushPendingCallbacks();
     }
 
     size_t Impl::CreateSource(const SourceDescription& description) {
-        //std::cout << "Create source" << std::endl;
         std::lock_guard guard(_mutex);
         AudioFormat format = description.Format;
 
-        uint8_t byteAlign;
+        uint8_t byteAlign = 0;
         switch (format.DataType) {
             case DataType::I8:
             case DataType::U8:
@@ -135,8 +159,8 @@ namespace mixr {
            /* .BufferFinishedCallback = */ nullptr,
            /* .BufferFinishedUserData = */ nullptr,
 
-           /* .SourceFinishedCallback = */ nullptr,
-           /* .SourceFinishedUserData = */ nullptr,
+           /* .StateChangedCallback = */ nullptr,
+           /* .StateChangedUserData = */ nullptr,
 
            /* .LastPosition = */ 0,
            /* .LastSampleL = */ 0.0f,
@@ -144,17 +168,26 @@ namespace mixr {
            /* .LastChunk = */ (size_t) -1,
 
            /* .ChunkSize = */ chunkSize,
+           /* .NumChunks = */ 0,
 
+           /* .Generation = */ 0,
+           /* .Alive = */ true,
+           /* .LastNotifiedState = */ SourceState::Stopped
         };
 
         size_t index;
 
         if (_availableSources.empty()) {
             index = _sources.size();
+            source.Generation = 1;
             _sources.push_back(source);
         } else {
             index = _availableSources.front();
             _availableSources.pop_front();
+            // A recycled slot must not inherit anything from its previous life:
+            // bump the generation so any in-flight events for the old source are
+            // rejected, and start from a fully initialised object.
+            source.Generation = _sources[index].Generation + 1;
             _sources[index] = source;
         }
 
@@ -162,25 +195,39 @@ namespace mixr {
     }
 
     void Impl::DestroySource(size_t sourceId) {
-        //std::cout << "Destroy source" << std::endl;
         std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         Source* source = &_sources[sourceId];
 
-        // Simple hack, unregister the state changed callback to prevent SourceStop from calling it.
+        // Detach the callbacks first: a destroy must not notify state changes or
+        // buffer completion to the owner that is releasing the source.
         source->StateChangedCallback = nullptr;
         source->BufferFinishedCallback = nullptr;
 
-        SourceStop(sourceId, false);
+        StopSourceLocked(sourceId);
+
+        // Any events queued before the callbacks were detached belong to the
+        // dying generation; drop them rather than letting them reach a recycled
+        // slot.
+        RemovePendingEventsLocked(sourceId);
 
         source->QueuedBuffers = {};
         delete source->MixBuffer;
+        source->MixBuffer = nullptr;
+        source->Alive = false;
 
         _availableSources.push_back(sourceId);
     }
 
     void Impl::UpdateBuffer(size_t bufferId, uint8_t* data, size_t dataLength) {
-        //std::cout << "Update buffer" << std::endl;
         std::lock_guard guard(_mutex);
+
+        if (bufferId >= _buffers.size() || !_buffers[bufferId].Alive)
+            return;
+
         Buffer* buffer = &_buffers[bufferId];
 
         // Resize the buffer if it is not big enough, but otherwise, don't.
@@ -194,8 +241,14 @@ namespace mixr {
     }
 
     void Impl::SourceSubmitBuffer(size_t sourceId, size_t bufferId) {
-        //std::cout << "Submit buffer" << std::endl;
         std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
+        if (bufferId >= _buffers.size() || !_buffers[bufferId].Alive)
+            return;
+
         Source* source = &_sources[sourceId];
         source->QueuedBuffers.push_back(bufferId);
 
@@ -205,75 +258,115 @@ namespace mixr {
     }
 
     void Impl::SourceClearBuffers(size_t sourceId) {
-        //std::cout << "Clear buffers" << std::endl;
-        std::lock_guard guard(_mutex);
-        SourceStop(sourceId, false);
-        _sources[sourceId].QueuedBuffers = {};
+        {
+            std::lock_guard guard(_mutex);
+
+            if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+                return;
+
+            // Spec: after clearing, the source is stopped and its queue is empty.
+            // StopSourceLocked performs the full reset and de-duplicated notification.
+            StopSourceLocked(sourceId);
+            _sources[sourceId].QueuedBuffers = {};
+        }
+
+        FlushPendingCallbacks();
     }
 
     void Impl::SourcePlay(size_t sourceId) {
-        //std::cout << "Play" << std::endl;
-        Source* source = &_sources[sourceId];
-        SourceState state = SourceGetState(sourceId);
+        {
+            std::lock_guard guard(_mutex);
 
-        if (source->QueuedBuffers.empty())
-            return;
+            if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+                return;
 
-        source->Playing = true;
+            Source* source = &_sources[sourceId];
 
-        if (state != SourceState::Playing && source->StateChangedCallback) {
-            source->StateChangedCallback(SourceState::Playing, source->StateChangedUserData);
+            if (source->QueuedBuffers.empty())
+                return;
+
+            source->Playing = true;
+
+            // The state has settled (queue non-empty, Playing set); request the
+            // notification, which is de-duplicated against the last one sent.
+            RequestStateLocked(source, sourceId, SourceState::Playing);
         }
+
+        FlushPendingCallbacks();
     }
 
     void Impl::SourcePause(size_t sourceId) {
-        //std::cout << "Pause" << std::endl;
-        Source* source = &_sources[sourceId];
-        SourceState state = SourceGetState(sourceId);
+        {
+            std::lock_guard guard(_mutex);
 
-        source->Playing = false;
+            if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+                return;
 
-        if (state != SourceState::Paused && source->StateChangedCallback) {
-            source->StateChangedCallback(SourceState::Paused, source->StateChangedUserData);
+            Source* source = &_sources[sourceId];
+
+            source->Playing = false;
+
+            // A source with no queued buffers and no position is Stopped, not Paused;
+            // only announce Paused when the settled state really is Paused.
+            SourceState state = SourceGetStateLocked(source);
+            if (state == SourceState::Paused) {
+                RequestStateLocked(source, sourceId, SourceState::Paused);
+            }
         }
+
+        FlushPendingCallbacks();
     }
 
     void Impl::SourceStop(size_t sourceId, bool useMutex) {
-        //std::cout << "Stop" << std::endl;
-        if (useMutex)
-            std::lock_guard guard(_mutex);
+        if (useMutex) {
+            {
+                std::lock_guard guard(_mutex);
 
-        Source* source = &_sources[sourceId];
-        SourceState state = SourceGetState(sourceId);
+                if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+                    return;
 
-        source->Playing = false;
-        source->QueuedBuffers.clear();
-        source->Position = 0;
-        source->LastPosition = 0;
-        source->LastSampleL = 0.0f;
-        source->LastSampleR = 0.0f;
-        source->FinePosition = 0.0;
-        source->LastChunk = -1;
+                StopSourceLocked(sourceId);
+            }
 
-        // Only invoke the callback AFTER everything is set for extra safety.
-        if (state != SourceState::Stopped && source->StateChangedCallback) {
-            source->StateChangedCallback(SourceState::Stopped, source->StateChangedUserData);
+            FlushPendingCallbacks();
+        } else {
+            StopSourceLocked(sourceId);
         }
     }
 
     void Impl::SourceSetSpeed(size_t sourceId, double speed) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         _sources[sourceId].Speed = speed;
     }
 
     void Impl::SourceSetVolume(size_t sourceId, float volume) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         _sources[sourceId].MainVolume = volume;
     }
 
     void Impl::SourceSetLooping(size_t sourceId, bool looping) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         _sources[sourceId].Looping = looping;
     }
 
     void Impl::SourceSetPanning(size_t sourceId, float panning) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         Source* source = &_sources[sourceId];
 
         source->VolumeL = Clamp(1 - panning, 0.0f, 1.0f);
@@ -281,6 +374,11 @@ namespace mixr {
     }
 
     void Impl::SourceSetChannelVolumes(size_t sourceId, float volumeL, float volumeR) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         Source* source = &_sources[sourceId];
 
         source->VolumeL = volumeL;
@@ -288,6 +386,11 @@ namespace mixr {
     }
 
     void Impl::SourceSetBufferFinishedCallback(size_t sourceId, void (*callback)(void*), void* userData) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         Source* source = &_sources[sourceId];
 
         source->BufferFinishedCallback = callback;
@@ -295,6 +398,11 @@ namespace mixr {
     }
 
     void Impl::SourceSetStateChangedCallback(size_t sourceId, void (*callback)(SourceState, void*), void* userData) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return;
+
         Source* source = &_sources[sourceId];
 
         source->StateChangedCallback = callback;
@@ -302,30 +410,47 @@ namespace mixr {
     }
 
     SourceState Impl::SourceGetState(size_t sourceId) {
-        Source* source = &_sources[sourceId];
+        std::lock_guard guard(_mutex);
 
-        if (source->Playing) {
-            return SourceState::Playing;
-        } else if (source->Position == 0 && source->QueuedBuffers.empty()) {
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
             return SourceState::Stopped;
-        } else {
-            return SourceState::Paused;
-        }
+
+        return SourceGetStateLocked(&_sources[sourceId]);
     }
 
     double Impl::SourceGetSpeed(size_t sourceId) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return 1.0;
+
         return _sources[sourceId].Speed;
     }
 
     float Impl::SourceGetVolume(size_t sourceId) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return 0.0f;
+
         return _sources[sourceId].MainVolume;
     }
 
     bool Impl::SourceGetLooping(size_t sourceId) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return false;
+
         return _sources[sourceId].Looping;
     }
 
     float Impl::SourceGetPanning(size_t sourceId) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return 0.0f;
+
         Source* source = &_sources[sourceId];
 
         // -L + R
@@ -338,6 +463,14 @@ namespace mixr {
     }
 
     void Impl::SourceGetChannelVolumes(size_t sourceId, float* volumeL, float* volumeR) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive) {
+            if (volumeL) *volumeL = 0.0f;
+            if (volumeR) *volumeR = 0.0f;
+            return;
+        }
+
         Source* source = &_sources[sourceId];
 
         *volumeL = source->VolumeL;
@@ -345,21 +478,141 @@ namespace mixr {
     }
 
     size_t Impl::SourceGetPositionSamples(size_t sourceId) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return 0;
+
         return _sources[sourceId].Position;
     }
 
     double Impl::SourceGetPositionSeconds(size_t sourceId) {
+        std::lock_guard guard(_mutex);
+
+        if (sourceId >= _sources.size() || !_sources[sourceId].Alive)
+            return 0.0;
+
         Source* source = &_sources[sourceId];
 
         return (double) source->Position / (double) source->Format.SampleRate;
     }
 
     float Impl::GetMasterVolume() {
+        std::lock_guard guard(_mutex);
         return _masterVolume;
     }
 
     void Impl::SetMasterVolume(float volume) {
+        std::lock_guard guard(_mutex);
         _masterVolume = volume;
+    }
+
+    SourceState Impl::SourceGetStateLocked(const Source* source) const {
+        if (source->Playing) {
+            return SourceState::Playing;
+        } else if (source->Position == 0 && source->QueuedBuffers.empty()) {
+            return SourceState::Stopped;
+        } else {
+            return SourceState::Paused;
+        }
+    }
+
+    void Impl::RequestStateLocked(Source* source, size_t sourceId, SourceState state) {
+        // De-duplicate: the same state transition is never announced twice in a
+        // row. The actual callback runs later, without the lock, after the state
+        // has settled.
+        if (source->LastNotifiedState == state)
+            return;
+
+        source->LastNotifiedState = state;
+
+        if (!source->StateChangedCallback)
+            return;
+
+        _pendingStateEvents.push_back(PendingStateEvent {
+            /* .SourceId = */ sourceId,
+            /* .Generation = */ source->Generation,
+            /* .State = */ state,
+            /* .Callback = */ source->StateChangedCallback,
+            /* .UserData = */ source->StateChangedUserData
+        });
+    }
+
+    void Impl::StopSourceLocked(size_t sourceId) {
+        Source* source = &_sources[sourceId];
+
+        SourceState state = SourceGetStateLocked(source);
+
+        source->Playing = false;
+        source->QueuedBuffers.clear();
+        source->Position = 0;
+        source->LastPosition = 0;
+        source->LastSampleL = 0.0f;
+        source->LastSampleR = 0.0f;
+        source->FinePosition = 0.0;
+        source->LastChunk = (size_t) -1;
+
+        // Enqueue the notification only if the settled state actually differs
+        // from the last one delivered; this makes repeated/concurrent stops
+        // produce at most one Stopped notification.
+        if (state != SourceState::Stopped) {
+            RequestStateLocked(source, sourceId, SourceState::Stopped);
+        }
+    }
+
+    void Impl::RemovePendingEventsLocked(size_t sourceId) {
+        _pendingStateEvents.erase(
+            std::remove_if(_pendingStateEvents.begin(), _pendingStateEvents.end(),
+                           [sourceId](const PendingStateEvent& event) {
+                               return event.SourceId == sourceId;
+                           }),
+            _pendingStateEvents.end());
+
+        _pendingBufferFinishedEvents.erase(
+            std::remove_if(_pendingBufferFinishedEvents.begin(), _pendingBufferFinishedEvents.end(),
+                           [sourceId](const PendingBufferFinishedEvent& event) {
+                               return event.SourceId == sourceId;
+                           }),
+            _pendingBufferFinishedEvents.end());
+    }
+
+    void Impl::FlushPendingCallbacks() {
+        // Swap the queues out under the lock, then invoke with no lock held.
+        // This keeps the mixer state consistent when a callback re-enters the
+        // context and prevents a slow callback from blocking the mixing thread.
+        std::vector<PendingStateEvent> stateEvents;
+        std::vector<PendingBufferFinishedEvent> finishedEvents;
+
+        {
+            std::lock_guard guard(_mutex);
+            stateEvents.swap(_pendingStateEvents);
+            finishedEvents.swap(_pendingBufferFinishedEvents);
+        }
+
+        for (const auto& event : stateEvents) {
+            // Generation guard: the slot may have been destroyed and recycled
+            // between enqueue and delivery. Only deliver if it is still the same
+            // incarnation and is still alive.
+            if (event.SourceId >= _sources.size())
+                continue;
+
+            const Source& source = _sources[event.SourceId];
+            if (!source.Alive || source.Generation != event.Generation)
+                continue;
+
+            event.Callback(event.State, event.UserData);
+        }
+
+        for (const auto& event : finishedEvents) {
+            if (event.SourceId >= _sources.size())
+                continue;
+
+            const Source& source = _sources[event.SourceId];
+            if (!source.Alive || source.Generation != event.Generation)
+                continue;
+
+            event.Callback(event.UserData);
+        }
     }
 
     inline float GetSample(const uint8_t* data, size_t index, DataType dataType) {
@@ -382,64 +635,61 @@ namespace mixr {
     }
 
     void Impl::MixToStereoF32Buffer(float* buffer, size_t bufferLength) {
-        //std::cout << "Begin Mixing" << std::endl;
-        std::vector<Source*> finishedSources;
-        std::vector<size_t> stoppedSources;
+        // All inspection and mutation of sources/buffers happens under the lock.
+        // A concurrent stop, clear, buffer-destroy or source-destroy therefore
+        // either completes entirely before this mix pass or waits until it is
+        // done; the mixer can never observe a half-cleared queue or a freed
+        // buffer payload. Callbacks produced here are deferred until below.
         {
             std::lock_guard guard(_mutex);
-            for (int i = 0; i < bufferLength; i += 2) {
+            for (int i = 0; i < (int) bufferLength; i += 2) {
                 buffer[i + 0] = 0;
                 buffer[i + 1] = 0;
 
-                // TODO: Optimize this by placing all playing sources into a vector which gets enumerated over.
-                for (int s = 0; s < _sources.size(); s++) {
-                    //std::cout << "Processing Source " << s << std::endl;
+                for (int s = 0; s < (int) _sources.size(); s++) {
                     Source* source = &_sources[s];
 
-                    //std::cout << "  Source: " << source << ", Playing: " << source->Playing << ", MainVolume: " << source->MainVolume << std::endl;
-
-                    if (!source->Playing || source->MainVolume <= 0.01f)
+                    if (!source->Alive || !source->Playing || source->MainVolume <= 0.01f)
                         continue;
 
-                    //std::cout << "  Reached point 1" << std::endl;
+                    // Defensive: a playing source must always have a front buffer.
+                    // If invariant damage left the queue empty, stop cleanly
+                    // instead of dereferencing an empty deque.
+                    if (source->QueuedBuffers.empty()) {
+                        StopSourceLocked(s);
+                        continue;
+                    }
 
                     // If the source speed (the speed that the mixer actually plays at) is above 1, then aliasing is
                     // introduced. So, when the source speed is above 1, we instead sample at a multiple of the mixer
                     // sample rate. So if the source speed was 1.1, and the mixer was sampling at 48khz, then it would sample
                     // at 96khz instead.
                     // Then, at the end, we simply remove the samples that aren't needed. Doing it in this way removes aliasing.
-                    // TODO: SampleRate * 3 sounds good? Instead of 2 -> 4, does 2 -> 3 -> 4 work?
                     double sourceSpeed = source->SpeedCorrection * source->Speed;
                     int sampleRateMultiplier = std::max((int) sourceSpeed, 1) << 1;
                     sourceSpeed /= sampleRateMultiplier;
 
-                    // TODO: This works but could be optimized more.
                     for (int c = 0; c < sampleRateMultiplier; c++) {
-                        Buffer* buf = &_buffers[source->QueuedBuffers.front()];
-                        //std::cout << "  Buffer: " << buf << ", DataLength: " << buf->DataLength << std::endl;
+                        // Re-resolve every iteration: advancing to the next
+                        // queued buffer changes the front.
+                        size_t frontBufferId = source->QueuedBuffers.front();
+                        Buffer* buf = &_buffers[frontBufferId];
 
                         uint8_t* bufferData = buf->Data.data();
                         AudioFormat* format = &source->Format;
 
-                        //std::cout << "  BufferData: " << bufferData << ", format: " << format << std::endl;
-
                         size_t bytePosition = source->Position * (source->ByteAlign + source->StereoAlign);
 
-                        float sampleL, sampleR;
+                        float sampleL = 0.0f, sampleR = 0.0f;
 
                         switch (source->Type) {
                             case SourceType::PCM: {
-                                //std::cout << "  Get samples" << std::endl;
                                 sampleL = GetSample(bufferData, bytePosition, format->DataType);
                                 sampleR = GetSample(bufferData, bytePosition + source->StereoAlign, format->DataType);
-                                //std::cout << "  Got samples!" << std::endl;
 
                                 break;
                             }
 
-                                // This makes me uncomfortable..
-                                // The fact that it works and *fast* annoys me because now I don't want to change it even though
-                                // it could really do with some threading and being less awful.
                             case SourceType::ADPCM: {
                                 auto stereo = source->Format.Channels == 2;
                                 size_t chunkSize = source->ChunkSize;
@@ -487,25 +737,30 @@ namespace mixr {
                         }
 
                         if (source->Position >= source->LengthInSamples) {
-                            //std::cout << "  Reached point 2" << std::endl;
-                            // Hmm. This doesn't seem ideal.
-                            // Right now the library relies on the queue having elements, since it gets the buffer by checking
-                            // the front of the queue. Perhaps the "current buffer" should be stored in an index instead.
                             if (source->QueuedBuffers.size() > 1) {
-                                //std::cout << "  Reached point 3" << std::endl;
-                                finishedSources.push_back(source);
+                                // The current buffer finished and another is queued.
+                                // Record the buffer-finished event (delivered out
+                                // of the lock) and advance the queue.
+                                if (source->BufferFinishedCallback) {
+                                    _pendingBufferFinishedEvents.push_back(PendingBufferFinishedEvent {
+                                        /* .SourceId = */ (size_t) s,
+                                        /* .Generation = */ source->Generation,
+                                        /* .Callback = */ source->BufferFinishedCallback,
+                                        /* .UserData = */ source->BufferFinishedUserData
+                                    });
+                                }
 
-                                //std::cout << "  Pop queue" << std::endl;
                                 source->QueuedBuffers.pop_front();
                                 source->Position = 0;
-                                //std::cout << "  Updating source" << std::endl;
+                                source->LastPosition = 0;
+                                source->FinePosition = 0.0;
                                 UpdateSource(source);
                             } else if (source->Looping) {
                                 source->Position -= source->LengthInSamples;
                             } else {
-                                //std::cout << "  Stopping source" << std::endl;
-                                source->Playing = false;
-                                stoppedSources.push_back(s);
+                                // Last buffer finished: settle into Stopped now,
+                                // under the lock, with a de-duplicated event.
+                                StopSourceLocked((size_t) s);
 
                                 break;
                             }
@@ -516,24 +771,14 @@ namespace mixr {
                 buffer[i + 0] = Clamp(buffer[i + 0] * _masterVolume, -1.0f, 1.0f);
                 buffer[i + 1] = Clamp(buffer[i + 1] * _masterVolume, -1.0f, 1.0f);
             }
-            //std::cout << "Finish Mixing" << std::endl;
         }
 
-        for (const auto source : finishedSources)
-        {
-            if (source->BufferFinishedCallback) {
-                source->BufferFinishedCallback(source->BufferFinishedUserData);
-            }
-        }
-
-        for (const auto source : stoppedSources)
-        {
-            SourceStop(source, true);
-        }
+        // Deliver any notifications now that every state transition has settled
+        // and the lock is released.
+        FlushPendingCallbacks();
     }
 
     void Impl::UpdateSource(Source* source) {
-        //std::cout << "Update source" << std::endl;
         auto dataLength = _buffers[source->QueuedBuffers.front()].DataLength;
         auto byteAlign = source->ByteAlign;
         auto channels = source->Format.Channels;

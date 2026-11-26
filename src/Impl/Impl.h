@@ -15,6 +15,10 @@ namespace mixr {
     struct Buffer {
         std::vector<uint8_t> Data;
         size_t DataLength;
+
+        // False while the slot is parked in _availableBuffers. Guards against
+        // double-destroy and use of a recycled id.
+        bool Alive;
     };
 
     struct Source {
@@ -58,6 +62,36 @@ namespace mixr {
         size_t LastChunk;
         size_t ChunkSize;
         size_t NumChunks;
+
+        // ----- Lifetime / bookkeeping -----
+        // Bumped every time the slot is (re)created. Pending events stamped with
+        // an older generation are discarded when they are flushed, so an event
+        // can never reach a source that reused the slot.
+        uint64_t Generation;
+        // False while the slot is parked in _availableSources.
+        bool Alive;
+        // Last state for which a StateChanged event was enqueued. Provides
+        // per-source de-duplication of state notifications.
+        SourceState LastNotifiedState;
+    };
+
+    // A state-changed notification captured under the lock and delivered once
+    // the lock has been released and the state has settled.
+    struct PendingStateEvent {
+        size_t SourceId;
+        uint64_t Generation;
+        SourceState State;
+        void (*Callback)(SourceState, void*);
+        void* UserData;
+    };
+
+    // A buffer-finished notification captured under the lock and delivered once
+    // the lock has been released.
+    struct PendingBufferFinishedEvent {
+        size_t SourceId;
+        uint64_t Generation;
+        void (*Callback)(void*);
+        void* UserData;
     };
 
     class Impl {
@@ -73,7 +107,18 @@ namespace mixr {
 
         std::mutex _mutex;
 
+        // Notifications produced while _mutex is held. They are drained and
+        // invoked without the lock so callbacks may safely re-enter the context.
+        std::vector<PendingStateEvent> _pendingStateEvents;
+        std::vector<PendingBufferFinishedEvent> _pendingBufferFinishedEvents;
+
+        // ----- Locked helpers (caller must hold _mutex) -----
         void UpdateSource(Source* source);
+        [[nodiscard]] SourceState SourceGetStateLocked(const Source* source) const;
+        void RequestStateLocked(Source* source, size_t sourceId, SourceState state);
+        void StopSourceLocked(size_t sourceId);
+        void RemovePendingEventsLocked(size_t sourceId);
+        void FlushPendingCallbacks();
 
     public:
         explicit Impl(uint32_t sampleRate);
