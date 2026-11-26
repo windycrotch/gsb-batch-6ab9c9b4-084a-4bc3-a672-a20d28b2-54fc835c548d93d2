@@ -49,6 +49,10 @@ public class DefaultSocketIoHandler extends IoHandlerAdapter {
     @Override
     public void sessionClosed(IoSession session) throws Exception {
         IdSession userSession = (IdSession) session.getAttribute(USER_SESSION);
+        if (userSession != null) {
+            // Network-initiated close: stop accepting late requests before running cleanup.
+            userSession.markClosing();
+        }
         messageDispatcher.onSessionClosed(userSession);
     }
 

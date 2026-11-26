@@ -46,7 +46,7 @@ public class MessageIoDispatcher extends ChainedMessageDispatcher {
     }
 
     @Override
-    public void onSessionClosed(IdSession session) {
+    protected void doSessionClosed(IdSession session) {
         long playerId = SessionManager.INSTANCE.getPlayerIdBy(session);
         if (playerId > 0) {
             logger.info("角色[{}]close session", playerId);

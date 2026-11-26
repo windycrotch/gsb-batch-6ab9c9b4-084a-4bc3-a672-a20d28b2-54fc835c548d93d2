@@ -58,5 +58,30 @@
             <artifactId>jforgame-socket-core</artifactId>
             <version>${project.parent.version}</version>
         </dependency>
+        <!-- Integration tests drive the real Netty codec + dispatch entry with a business thread model -->
+        <dependency>
+            <groupId>io.github.jforgame</groupId>
+            <artifactId>jforgame-socket-threadmodel</artifactId>
+            <version>${project.parent.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.github.jforgame</groupId>
+            <artifactId>jforgame-threadmodel</artifactId>
+            <version>${project.parent.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.github.jforgame</groupId>
+            <artifactId>jforgame-codec-json</artifactId>
+            <version>${project.parent.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

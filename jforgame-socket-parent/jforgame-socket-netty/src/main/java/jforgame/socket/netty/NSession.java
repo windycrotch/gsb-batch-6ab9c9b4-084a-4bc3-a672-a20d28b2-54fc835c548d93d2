@@ -4,6 +4,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import jforgame.socket.core.protocol.message.SocketDataFrame;
+import jforgame.socket.core.session.AbstractIdSession;
 import jforgame.socket.core.session.IdSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,7 +23,7 @@ import java.util.UUID;
  * or the server actively closes the session.
  * Sessions can also contain some extended attributes for storing session-related information.
  */
-public class NSession implements IdSession {
+public class NSession extends AbstractIdSession {
 
     private static Logger logger = LoggerFactory.getLogger(IdSession.class);
 
@@ -146,6 +147,9 @@ public class NSession implements IdSession {
 
     @Override
     public void close() throws IOException {
+        // Flip the accepting flag first so concurrent/late requests are rejected immediately;
+        // the actual channel close is safe to invoke repeatedly.
+        markClosing();
         this.channel.close();
     }
 

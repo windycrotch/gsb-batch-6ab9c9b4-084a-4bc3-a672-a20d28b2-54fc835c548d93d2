@@ -2,6 +2,7 @@ package jforgame.socket.threadmodel;
 
 import jforgame.socket.core.dispatch.RequestContext;
 import jforgame.socket.core.execution.RequestExecutionInterceptor;
+import jforgame.socket.core.execution.RequestFailureHandler;
 import jforgame.socket.core.execution.RequestResponseSender;
 import jforgame.socket.core.dispatch.RequestScheduler;
 import jforgame.socket.threadmodel.actor.SessionBindingActorSelector;
@@ -52,6 +53,20 @@ public final class RequestSchedulers {
                                                         RequestResponseSender responseSender,
                                                         RequestExecutionInterceptor... interceptors) {
         RequestProcessor processor = new RequestProcessor(responseSender, interceptors);
+        return new DispatchThreadRequestScheduler(threadModel, dispatchKeyResolver, processor);
+    }
+
+    /**
+     * Creates a shard-dispatch scheduler with an explicit failure handler for business exceptions.
+     *
+     * @param failureHandler receives unhandled business exceptions and is responsible for the failure receipt
+     */
+    public static RequestScheduler newDispatchScheduler(DispatchThreadModel threadModel,
+                                                        RequestDispatchKeyResolver dispatchKeyResolver,
+                                                        RequestResponseSender responseSender,
+                                                        RequestFailureHandler failureHandler,
+                                                        RequestExecutionInterceptor... interceptors) {
+        RequestProcessor processor = new RequestProcessor(responseSender, failureHandler, interceptors);
         return new DispatchThreadRequestScheduler(threadModel, dispatchKeyResolver, processor);
     }
 

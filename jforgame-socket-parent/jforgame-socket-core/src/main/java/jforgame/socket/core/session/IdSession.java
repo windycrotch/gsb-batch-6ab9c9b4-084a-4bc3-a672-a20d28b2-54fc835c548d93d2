@@ -117,4 +117,52 @@ public interface IdSession extends Closeable {
      */
     Object getRawSession();
 
+    /**
+     * Whether this session has started closing or is already closed.
+     * <p>
+     * Returns {@code true} as soon as {@link #close()} has been invoked once (even while the
+     * underlying channel is still flushing), or the network connection has been torn down.
+     * Late requests observed in this state must be rejected by the dispatcher.
+     * </p>
+     *
+     * @return {@code true} if the session is closing/closed and must no longer accept requests
+     */
+    default boolean isClosed() {
+        return false;
+    }
+
+    /**
+     * Atomically mark the session as closing.
+     * <p>
+     * Only the first invocation returns {@code true}; every later invocation returns {@code false},
+     * which is the building block of idempotent session shutdown. It does not itself release the
+     * underlying connection; callers pair it with {@link #close()}.
+     * </p>
+     *
+     * @return {@code true} if this invocation won the race and performed the first mark;
+     *         {@code false} if the session was already marked closing
+     */
+    default boolean markClosing() {
+        return true;
+    }
+
+    /**
+     * Whether the one-time session cleanup callback has already been executed.
+     *
+     * @return {@code true} after the cleanup callback has run once
+     */
+    default boolean isCleanupDone() {
+        return false;
+    }
+
+    /**
+     * Atomically mark that the one-time session cleanup callback has run.
+     *
+     * @return {@code true} if this invocation performed the first mark and cleanup may proceed;
+     *         {@code false} if cleanup had already been marked by another thread
+     */
+    default boolean markCleanupDone() {
+        return true;
+    }
+
 }

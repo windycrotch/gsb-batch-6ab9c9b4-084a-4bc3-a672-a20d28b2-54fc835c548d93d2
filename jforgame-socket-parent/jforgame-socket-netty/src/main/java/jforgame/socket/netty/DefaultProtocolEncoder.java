@@ -10,8 +10,6 @@ import jforgame.socket.core.monitoring.MessageTrafficObserver;
 import jforgame.socket.core.protocol.message.MessageFactory;
 import jforgame.socket.core.protocol.message.SocketDataFrame;
 import jforgame.socket.core.protocol.message.DefaultMessageHeader;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Protocol stack encoder.
@@ -26,8 +24,6 @@ import org.slf4j.LoggerFactory;
  */
 @ChannelHandler.Sharable
 public class DefaultProtocolEncoder extends MessageToByteEncoder<Object> {
-
-    private static final Logger logger = LoggerFactory.getLogger("socketserver");
 
     private final MessageFactory messageFactory;
 
@@ -49,23 +45,22 @@ public class DefaultProtocolEncoder extends MessageToByteEncoder<Object> {
         // msgLength = 12+len(body) | body
         // msgLength | index | cmd  | body
         int cmd = messageFactory.getMessageId(dataFrame.getMessage().getClass());
-        try {
-            byte[] body = messageCodec.encode(dataFrame.getMessage());
-            // Write header
-            // message content length
-            int msgLength = body.length + DefaultMessageHeader.SIZE;
-            out.writeInt(msgLength);
-            out.writeInt(dataFrame.getIndex());
-            // Write cmd type
-            out.writeInt(cmd);
+        // Let encoding errors propagate to the pipeline exceptionCaught handler.
+        // Swallowing here would leave an empty/partial frame on the wire and permanently
+        // desynchronize the client's length-prefixed stream.
+        byte[] body = messageCodec.encode(dataFrame.getMessage());
+        // Write header
+        // message content length
+        int msgLength = body.length + DefaultMessageHeader.SIZE;
+        out.writeInt(msgLength);
+        out.writeInt(dataFrame.getIndex());
+        // Write cmd type
+        out.writeInt(cmd);
 
-            // Write body
-            out.writeBytes(body);
+        // Write body
+        out.writeBytes(body);
 
-            trafficObserver.onOutbound(cmd, msgLength);
-        } catch (Exception e) {
-            logger.error("wrote message {} failed", cmd, e);
-        }
+        trafficObserver.onOutbound(cmd, msgLength);
     }
 
 }

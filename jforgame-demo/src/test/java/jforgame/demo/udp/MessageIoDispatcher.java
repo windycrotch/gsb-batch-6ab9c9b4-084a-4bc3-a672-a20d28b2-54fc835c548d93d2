@@ -48,7 +48,7 @@ public class MessageIoDispatcher extends ChainedMessageDispatcher {
     }
 
     @Override
-    public void onSessionClosed(IdSession session) {
+    protected void doSessionClosed(IdSession session) {
     }
 
 }

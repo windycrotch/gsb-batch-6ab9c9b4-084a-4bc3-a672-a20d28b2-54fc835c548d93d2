@@ -63,6 +63,10 @@ public class ChannelIoHandler extends ChannelInboundHandlerAdapter {
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         Channel channel = ctx.channel();
         IdSession userSession = ChannelUtils.getSessionBy(channel);
+        if (userSession != null) {
+            // Network-initiated close: stop accepting late requests before running cleanup.
+            userSession.markClosing();
+        }
         messageDispatcher.onSessionClosed(userSession);
     }
 

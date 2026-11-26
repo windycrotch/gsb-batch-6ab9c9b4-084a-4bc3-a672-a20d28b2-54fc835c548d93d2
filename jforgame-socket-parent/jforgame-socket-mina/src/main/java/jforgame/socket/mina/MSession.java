@@ -1,6 +1,7 @@
 package jforgame.socket.mina;
 
 import jforgame.socket.core.protocol.message.SocketDataFrame;
+import jforgame.socket.core.session.AbstractIdSession;
 import jforgame.socket.core.session.IdSession;
 import org.apache.mina.core.future.IoFuture;
 import org.apache.mina.core.future.IoFutureListener;
@@ -20,7 +21,7 @@ import java.util.UUID;
  * The session lifecycle starts when client connects to server and ends when client disconnects or server proactively closes the session.
  * Sessions can also contain some extended attributes for storing session-related information.
  */
-public class MSession implements IdSession {
+public class MSession extends AbstractIdSession {
     private static Logger logger = LoggerFactory.getLogger(IdSession.class);
 
 
@@ -154,6 +155,8 @@ public class MSession implements IdSession {
 
     @Override
     public void close() throws IOException {
+        // Flip the accepting flag first so concurrent/late requests are rejected immediately.
+        markClosing();
         this.session.close(true);
     }
 
