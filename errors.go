@@ -1,0 +1,20 @@
+package adler
+
+import "errors"
+
+var (
+	ErrKeyNotFound         = errors.New("key does not exist")
+	ErrCoreClosed          = errors.New("core is closed")
+	ErrNilSession          = errors.New("nil session")
+	ErrAlreadyRegistered   = errors.New("session is already registered")
+	ErrWriteClosed         = errors.New("write session is closed")
+	ErrBufferFull          = errors.New("buffer is full")
+	ErrSessionClosed       = errors.New("session is closed")
+	ErrTypeAssertionFailed = errors.New("type assertion failed")
+	ErrRoomClosed          = errors.New("room is closed")
+	ErrCoreExit            = errors.New("cannot exit from core")
+	ErrRoomNotFound        = errors.New("room not found")
+	ErrRoomNotEmpty        = errors.New("room is not empty")
+	ErrProtobufValue       = errors.New("protobuf serializer: value must implement proto.message")
+	ErrProtobufTarget      = errors.New("protobuf serializer: target must implement proto.message")
+)
