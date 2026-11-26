@@ -229,7 +229,11 @@ func lexAttrs(l *lexer) stateFn {
 		case r == '.':
 			return lexAttrValue(l)
 		case r == '@':
-			return lexAttrValue(l)
+			// Byte range values such as 4587770@14872 appear directly
+			// after the tag colon with no "=". The leading digits were
+			// consumed as an attribute name; lex the whole value
+			// (including the offset) as one raw string.
+			return lexRawString(l)
 		case r == ':':
 			return lexAttrValue(l)
 		case r == '"':
@@ -294,7 +298,6 @@ Loop:
 	}
 	return lexAttrs(l)
 }
-
 
 func lexQString(l *lexer) stateFn {
 	for {

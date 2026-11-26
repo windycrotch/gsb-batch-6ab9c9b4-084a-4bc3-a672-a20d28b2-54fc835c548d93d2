@@ -75,7 +75,8 @@ func TestMarshalBadSegments(t *testing.T) {
 	}{
 		{"empty", Segment{}},
 		{"no duration", Segment{URI: "video.ts"}},
-		{"impossible range", Segment{URI: "bbb.ts", Duration: 6 * time.Second, Range: ByteRange{999, 10}}},
+		{"zero length range", Segment{URI: "bbb.ts", Duration: 6 * time.Second, Range: ByteRange{0, 10}}},
+		{"negative length range", Segment{URI: "bbb.ts", Duration: 6 * time.Second, Range: ByteRange{-5, 10}}},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

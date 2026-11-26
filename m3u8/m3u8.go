@@ -90,7 +90,14 @@ type Key struct {
 func (k Key) String() string {
 	var attrs []string
 	attrs = append(attrs, fmt.Sprintf("METHOD=%s", k.Method))
-	attrs = append(attrs, fmt.Sprintf("URI=%q", k.URI))
+	// METHOD=NONE signals that subsequent segments are not encrypted;
+	// it must not carry a URI or IV.
+	if k.Method == EncryptMethodNone {
+		return tagKey + ":" + strings.Join(attrs, ",")
+	}
+	if k.URI != "" {
+		attrs = append(attrs, fmt.Sprintf("URI=%q", k.URI))
+	}
 	attrs = append(attrs, fmt.Sprintf("IV=0x%s", hex.EncodeToString(k.IV[:])))
 	if k.Format != "" {
 		attrs = append(attrs, fmt.Sprintf("KEYFORMAT=%q", k.Format))

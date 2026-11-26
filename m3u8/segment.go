@@ -25,92 +25,106 @@ const (
 	tagDateRange       = "#EXT-X-DATERANGE"
 )
 
-// parseSegment returns the next segment from items and the leading
-// item which indicated the start of a segment.
+// parseSegment parses the tags belonging to a single media segment.
+// The leading item is the first tag already read by the caller
+// (one of the segment-level tags) and items is the shared lexer
+// channel. Parsing stops at the segment's URL, leaving any later
+// items for the caller.
 func parseSegment(items chan item, leading item) (*Segment, error) {
-	// we've already read one item, so send everything through again
-	// starting with the leading item to maintain the lexer's original order.
-	segItems := make(chan item)
-	go func() {
-		segItems <- leading
-		for it := range items {
-			if it.typ == itemURL {
-				segItems <- it
-				close(segItems)
-				return
-			}
-			segItems <- it
-		}
-	}()
-
 	var seg Segment
-	for it := range segItems {
+	// handle processes a single lexer item. The leading item from the
+	// caller is handled before reading the shared channel, so the
+	// original lexer order is preserved without re-emitting items.
+	handle := func(it item) (done bool, err error) {
 		switch it.typ {
-		case itemNewline:
-			continue
 		case itemError:
-			return nil, errors.New(it.val)
+			return true, errors.New(it.val)
+		case itemNewline:
+			return false, nil
 		case itemURL:
 			seg.URI = it.val
-			return &seg, nil
+			if seg.Duration == 0 {
+				return true, fmt.Errorf("segment %q: missing %s duration tag", seg.URI, tagSegmentDuration)
+			}
+			return true, nil
 		}
 
 		switch it.val {
 		case tagSegmentDuration:
-			it = <-segItems
+			it = <-items
 			if it.typ != itemAttrName && it.typ != itemNumber {
-				return nil, fmt.Errorf("parse segment duration: unexpected %s: want attribute name or number", it)
+				return true, fmt.Errorf("parse segment duration: unexpected %s: want attribute name or number", it)
 			}
 			dur, err := parseSegmentDuration(it.val)
 			if err != nil {
-				return nil, fmt.Errorf("parse segment duration: %w", err)
+				return true, fmt.Errorf("parse segment duration: %w", err)
 			}
 			seg.Duration = dur
 
 			// check for the optional segment title
-			it = <-segItems
+			it = <-items
 			if it.typ == itemNewline {
-				continue
+				return false, nil
 			} else if it.typ != itemComma {
-				return nil, fmt.Errorf("expected comma after segment duration, got %s", it)
+				return true, fmt.Errorf("expected comma after segment duration, got %s", it)
 			}
-			it = <-segItems
+			it = <-items
 			seg.Title = it.val
 
-
 		case tagByteRange:
-			it = <-segItems
+			it = <-items
 			r, err := parseByteRange(it.val)
 			if err != nil {
-				return nil, fmt.Errorf("parse byte range: %w", err)
+				return true, fmt.Errorf("parse byte range: %w", err)
 			}
 			seg.Range = r
 		case tagDiscontinuity:
+			// A discontinuity only marks the segment immediately
+			// following the tag; it is never carried forward.
 			seg.Discontinuity = true
 		case tagKey:
-			key, err := parseKey(segItems)
+			key, err := parseKey(items)
 			if err != nil {
-				return nil, fmt.Errorf("parse key: %w", err)
+				return true, fmt.Errorf("parse key: %w", err)
 			}
 			seg.Key = &key
 		case tagMap:
-			m, err := parseMap(segItems)
+			m, err := parseMap(items)
 			if err != nil {
-				return nil, fmt.Errorf("parse map: %w", err)
+				return true, fmt.Errorf("parse map: %w", err)
 			}
 			seg.Map = &m
 		case tagDateTime:
-			it = <-segItems
+			it = <-items
 			t, err := time.Parse(rfc3339Milli, it.val)
 			if err != nil {
-				return nil, fmt.Errorf("bad date time tag: %w", err)
+				return true, fmt.Errorf("bad date time tag: %w", err)
 			}
 			seg.DateTime = t
 		default:
-			return nil, fmt.Errorf("parsing %s unsupported", it)
+			return true, fmt.Errorf("parsing %s unsupported", it)
+		}
+		return false, nil
+	}
+
+	if done, err := handle(leading); err != nil {
+		return nil, err
+	} else if done {
+		return &seg, nil
+	}
+	for it := range items {
+		done, err := handle(it)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return &seg, nil
 		}
 	}
-	return nil, fmt.Errorf("no url")
+	// The channel closed before we found a segment URI: the input
+	// ends with an unclosed tag. This must be reported, not treated
+	// as a complete segment.
+	return nil, fmt.Errorf("segment %q: missing URI", seg.URI)
 }
 
 func parseSegmentDuration(s string) (time.Duration, error) {
@@ -154,11 +168,15 @@ func parseSegmentDuration(s string) (time.Duration, error) {
 
 func parseKey(items chan item) (Key, error) {
 	var key Key
+	methodSet := false
 	for it := range items {
 		switch it.typ {
 		case itemError:
 			return key, errors.New(it.val)
 		case itemNewline:
+			if !methodSet {
+				return key, fmt.Errorf("key tag missing required METHOD attribute")
+			}
 			return key, nil
 		case itemComma:
 			continue
@@ -179,6 +197,7 @@ func parseKey(items chan item) (Key, error) {
 			if key.Method == encryptMethodInvalid {
 				return key, fmt.Errorf("bad encrypt method %q", v.val)
 			}
+			methodSet = true
 		case "URI":
 			v = <-items
 			key.URI = strings.Trim(v.val, `"`)
@@ -189,7 +208,7 @@ func parseKey(items chan item) (Key, error) {
 				return key, fmt.Errorf("parse initialisation vector: %w", err)
 			}
 			if len(b) != len(key.IV) {
-				return key, fmt.Errorf("bad initialisation length %d, want %d", len(b), len(key.IV))
+				return key, fmt.Errorf("bad initialisation vector length %d, want %d bytes", len(b), len(key.IV))
 			}
 			copy(key.IV[:], b)
 		case "KEYFORMAT":
@@ -197,7 +216,7 @@ func parseKey(items chan item) (Key, error) {
 			key.Format = strings.Trim(v.val, `"`)
 		case "KEYFORMATVERSIONS":
 			v = <-items
-			ss := strings.Split(v.val, "/")
+			ss := strings.Split(strings.Trim(v.val, `"`), "/")
 			key.FormatVersions = make([]uint32, len(ss))
 			for i := range ss {
 				n, err := strconv.Atoi(ss[i])
@@ -210,7 +229,7 @@ func parseKey(items chan item) (Key, error) {
 			return key, fmt.Errorf("unexpected attribute %q", it.val)
 		}
 	}
-	return key, fmt.Errorf("unexpected end of tag")
+	return key, fmt.Errorf("unexpected end of key tag")
 }
 
 func parseMap(items chan item) (Map, error) {
@@ -221,6 +240,8 @@ func parseMap(items chan item) (Map, error) {
 			return mmap, errors.New(it.val)
 		case itemNewline:
 			return mmap, nil
+		case itemComma:
+			continue
 		}
 		if it.typ != itemAttrName {
 			return Map{}, fmt.Errorf("unexpected %s %q", it.typ, it.val)
@@ -236,7 +257,7 @@ func parseMap(items chan item) (Map, error) {
 		case "URI":
 			mmap.URI = strings.Trim(it.val, `"`)
 		case "BYTERANGE":
-			r, err := parseByteRange(it.val)
+			r, err := parseByteRange(strings.Trim(it.val, `"`))
 			if err != nil {
 				return Map{}, fmt.Errorf("parse byte range: %w", err)
 			}
@@ -245,12 +266,81 @@ func parseMap(items chan item) (Map, error) {
 			return Map{}, fmt.Errorf("unexpected attribute %q", it.val)
 		}
 	}
-	return Map{}, fmt.Errorf("unexpected end of tag")
+	return Map{}, fmt.Errorf("unexpected end of map tag")
 }
 
+// resolveInheritance applies the HLS inheritance rules of RFC 8216
+// sections 4.3.2.3 (EXT-X-KEY) and 4.3.2.5 (EXT-X-MAP) to every
+// segment.
+//
+// A segment that does not declare its own key or map inherits a copy
+// of the most recent value. A key with METHOD=NONE explicitly clears
+// encryption for itself and every following segment until a new key
+// appears. Each segment receives its own copy so later playlists
+// decoded concurrently cannot share or mutate each other's state.
+func resolveInheritance(segments []Segment) {
+	var currentKey *Key
+	var currentMap *Map
+	for i := range segments {
+		seg := &segments[i]
+		switch {
+		case seg.Key != nil:
+			// An explicit key always replaces the current one.
+			// METHOD=NONE is carried as an explicit value so the
+			// segment can state that it is no longer encrypted.
+			k := *seg.Key
+			currentKey = &k
+		case currentKey != nil:
+			k := *currentKey
+			seg.Key = &k
+		}
+		switch {
+		case seg.Map != nil:
+			m := *seg.Map
+			currentMap = &m
+		case currentMap != nil:
+			m := *currentMap
+			seg.Map = &m
+		}
+	}
+}
+
+// keyEqual reports whether two keys describe the same effective key.
+func keyEqual(a, b *Key) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Method != b.Method || a.URI != b.URI || a.Format != b.Format || a.IV != b.IV {
+		return false
+	}
+	if len(a.FormatVersions) != len(b.FormatVersions) {
+		return false
+	}
+	for i := range a.FormatVersions {
+		if a.FormatVersions[i] != b.FormatVersions[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mapEqual reports whether two maps describe the same EXT-X-MAP value.
+func mapEqual(a, b *Map) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.URI == b.URI && a.ByteRange == b.ByteRange
+}
+
+// writeSegments writes each segment. EXT-X-KEY and EXT-X-MAP tags are
+// only emitted where the effective value actually changes relative to
+// the previous segment; repeated declarations are merged. A
+// discontinuity tag is only written for the single segment it marks.
 func writeSegments(w io.Writer, segments []Segment) (n int, err error) {
+	var prevKey *Key
+	var prevMap *Map
 	for i, seg := range segments {
-		b, err := seg.MarshalText()
+		b, err := marshalSegmentText(&seg, prevKey, prevMap)
 		if err != nil {
 			return n, fmt.Errorf("segment %d: %w", i, err)
 		}
@@ -259,10 +349,70 @@ func writeSegments(w io.Writer, segments []Segment) (n int, err error) {
 		if err != nil {
 			return n, err
 		}
+		if seg.Key != nil {
+			prevKey = seg.Key
+		}
+		if seg.Map != nil {
+			prevMap = seg.Map
+		}
 	}
 	return n, nil
 }
 
+// marshalSegmentText renders one segment. Inherited key and map tags
+// are only written when their effective value differs from the
+// previous segment's value (tracked through prevKey and prevMap).
+// This keeps an inherited key or map from being written for every
+// segment.
+func marshalSegmentText(seg *Segment, prevKey *Key, prevMap *Map) ([]byte, error) {
+	if seg.URI == "" {
+		return nil, fmt.Errorf("empty URI")
+	}
+	if seg.Duration == 0 {
+		return nil, fmt.Errorf("zero duration")
+	}
+	var tags []string
+	if seg.Discontinuity {
+		tags = append(tags, tagDiscontinuity)
+	}
+	if seg.DateRange != nil {
+		buf := &bytes.Buffer{}
+		if err := writeDateRange(buf, seg.DateRange); err != nil {
+			return nil, fmt.Errorf("write date range: %w", err)
+		}
+		tags = append(tags, buf.String())
+	}
+	if seg.Range != [2]int{0, 0} {
+		if seg.Range[0] <= 0 {
+			return nil, fmt.Errorf("invalid byte range: length must be larger than zero, got %d", seg.Range[0])
+		}
+		tags = append(tags, fmt.Sprintf("%s:%s", tagByteRange, seg.Range))
+	}
+	// Only write the key tag when the effective key changed. A nil
+	// effective key means no encryption has been signalled yet.
+	if seg.Key != nil && !keyEqual(seg.Key, prevKey) {
+		tags = append(tags, seg.Key.String())
+	}
+	if seg.Map != nil && !mapEqual(seg.Map, prevMap) {
+		tags = append(tags, seg.Map.String())
+	}
+	if !seg.DateTime.IsZero() {
+		tags = append(tags, fmt.Sprintf("%s:%s", tagDateTime, seg.DateTime.Format(rfc3339Milli)))
+	}
+	us := seg.Duration / time.Microsecond
+	// we do .03f for the same precision as test-streams.mux.dev.
+	durTag := fmt.Sprintf("%s:%.03f", tagSegmentDuration, float32(us)/1e6)
+	if seg.Title != "" {
+		durTag += "," + seg.Title
+	}
+	tags = append(tags, durTag)
+	tags = append(tags, seg.URI)
+	return []byte(strings.Join(tags, "\n")), nil
+}
+
+// MarshalText renders a segment to the HLS text format. Key and map
+// tags are always written when set; callers writing a full playlist
+// should use [Encode] which merges repeated declarations.
 func (seg *Segment) MarshalText() ([]byte, error) {
 	if seg.URI == "" {
 		return nil, fmt.Errorf("empty URI")
@@ -282,8 +432,8 @@ func (seg *Segment) MarshalText() ([]byte, error) {
 		tags = append(tags, buf.String())
 	}
 	if seg.Range != [2]int{0, 0} {
-		if seg.Range[0] >= seg.Range[1] {
-			return nil, fmt.Errorf("impossible range: offset (%d) must be smaller than next %d", seg.Range[0], seg.Range[1])
+		if seg.Range[0] <= 0 {
+			return nil, fmt.Errorf("invalid byte range: length must be larger than zero, got %d", seg.Range[0])
 		}
 		tags = append(tags, fmt.Sprintf("%s:%s", tagByteRange, seg.Range))
 	}
@@ -300,7 +450,7 @@ func (seg *Segment) MarshalText() ([]byte, error) {
 	// we do .03f for the same precision as test-streams.mux.dev.
 	durTag := fmt.Sprintf("%s:%.03f", tagSegmentDuration, float32(us)/1e6)
 	if seg.Title != "" {
-		durTag += ","+seg.Title
+		durTag += "," + seg.Title
 	}
 	tags = append(tags, durTag)
 	tags = append(tags, seg.URI)

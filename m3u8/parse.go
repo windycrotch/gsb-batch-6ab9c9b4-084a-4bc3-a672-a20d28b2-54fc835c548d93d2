@@ -14,6 +14,7 @@ const (
 	tagHead                = tagStart + "M3U"
 	tagVersion             = "#EXT-X-VERSION"
 	tagVariant             = "#EXT-X-STREAM-INF"
+	tagIFrameStreamInf     = "#EXT-X-I-FRAME-STREAM-INF"
 	tagRendition           = "#EXT-X-MEDIA"
 	tagPlaylistType        = "#EXT-X-PLAYLIST-TYPE"        // RFC 8216, 4.4.3.5
 	tagTargetDuration      = "#EXT-X-TARGETDURATION"       // RFC 8216, 4.4.3.1
@@ -39,12 +40,12 @@ func Decode(rd io.Reader) (*Playlist, error) {
 	for it := range lex.items {
 		switch it.typ {
 		case itemError:
-			return p, errors.New(it.val)
+			return nil, errors.New(it.val)
 		case itemNewline:
 			continue
 		default:
 			if it.typ != itemTag {
-				return p, fmt.Errorf("unexpected %s %q, expected tag", it.typ, it.val)
+				return nil, fmt.Errorf("unexpected %s %q, expected tag", it.typ, it.val)
 			}
 		}
 
@@ -52,31 +53,37 @@ func Decode(rd io.Reader) (*Playlist, error) {
 		case tagVersion:
 			it = <-lex.items
 			if p.Version != 0 {
-				return p, fmt.Errorf("parse %s: playlist version already specified", it)
+				return nil, fmt.Errorf("parse %s: playlist version already specified", it)
 			}
 			p.Version, err = strconv.Atoi(it.val)
 			if err != nil {
-				return p, fmt.Errorf("parse playlist version: %w", err)
+				return nil, fmt.Errorf("parse playlist version: %w", err)
 			}
 		case tagIndependentSegments:
 			p.IndependentSegments = true
 		case tagVariant:
 			variant, err := parseVariant(lex.items)
 			if err != nil {
-				return p, fmt.Errorf("parse variant: %w", err)
+				return nil, fmt.Errorf("parse variant: %w", err)
 			}
 			p.Variants = append(p.Variants, *variant)
+		case tagIFrameStreamInf:
+			// I-frame variants carry their URI as an attribute on the
+			// same line and are not yet modelled; skip the full tag.
+			if err := drainTag(lex.items); err != nil {
+				return nil, err
+			}
 		case tagRendition:
 			rend, err := parseRendition(lex.items)
 			if err != nil {
-				return p, fmt.Errorf("parse rendition: %w", err)
+				return nil, fmt.Errorf("parse rendition: %w", err)
 			}
 			p.Media = append(p.Media, *rend)
 		case tagPlaylistType:
 			it = <-lex.items
 			typ, err := parsePlaylistType(it)
 			if err != nil {
-				return p, fmt.Errorf("parse playlist type: %w", err)
+				return nil, fmt.Errorf("parse playlist type: %w", err)
 			}
 			p.Type = typ
 
@@ -84,14 +91,17 @@ func Decode(rd io.Reader) (*Playlist, error) {
 			it = <-lex.items
 			dur, err := parseTargetDuration(it)
 			if err != nil {
-				return p, fmt.Errorf("parse target duration: %w", err)
+				return nil, fmt.Errorf("parse target duration: %w", err)
 			}
 			p.TargetDuration = dur
 
-		case tagSegmentDuration, tagByteRange, tagKey:
+		// Segment-level tags. Anything that may start a segment is
+		// routed to parseSegment so that EXT-X-KEY, EXT-X-MAP and
+		// EXT-X-DISCONTINUITY are associated with the right segment.
+		case tagSegmentDuration, tagByteRange, tagKey, tagMap, tagDiscontinuity, tagDateTime:
 			segment, err := parseSegment(lex.items, it)
 			if err != nil {
-				return p, fmt.Errorf("parse segment: %w", err)
+				return nil, fmt.Errorf("parse segment: %w", err)
 			}
 			p.Segments = append(p.Segments, *segment)
 
@@ -101,19 +111,39 @@ func Decode(rd io.Reader) (*Playlist, error) {
 			it = <-lex.items
 			seq, err := strconv.Atoi(it.val)
 			if err != nil {
-				return p, fmt.Errorf("parse media sequence: %w", err)
+				return nil, fmt.Errorf("parse media sequence: %w", err)
 			}
 			p.Sequence = seq
 		default:
 			if lex.debug {
 				fmt.Fprintln(os.Stderr, "unknown tag", it)
 			}
-			// throw away whatever is next; we don't support it but also don't want to
-			// return errors while this package is in development.
-			<-lex.items
+			// Discard the rest of the unsupported tag's line so the
+			// parser stays aligned with the following tags.
+			if err := drainTag(lex.items); err != nil {
+				return nil, err
+			}
 		}
 	}
+	// Apply HLS inheritance so every segment knows its effective key
+	// and init section, even when the tags were written only once.
+	resolveInheritance(p.Segments)
 	return p, nil
+}
+
+// drainTag reads and discards items until the newline terminating the
+// current tag line. It is used for tags the package does not model.
+// A lexer error is returned instead of being silently swallowed.
+func drainTag(items chan item) error {
+	for it := range items {
+		if it.typ == itemNewline {
+			return nil
+		}
+		if it.typ == itemError {
+			return errors.New(it.val)
+		}
+	}
+	return nil
 }
 
 func parseVariant(items chan item) (*Variant, error) {
@@ -142,6 +172,9 @@ func parseVariant(items chan item) (*Variant, error) {
 		case "PROGRAM-ID", "NAME":
 			// parsing PROGRAM-ID attribute unsupported; removed in HLS version 6
 			// NAME is non-standard, should be set in Rendition.
+			// Still consume the value so the parser stays aligned on
+			// the next attribute.
+			<-items
 		case "BANDWIDTH", "AVERAGE-BANDWIDTH":
 			it = <-items
 			if it.typ != itemNumber {
@@ -392,15 +425,27 @@ func parseTargetDuration(it item) (time.Duration, error) {
 func parseByteRange(s string) (ByteRange, error) {
 	offset, until, found := strings.Cut(s, "@")
 	if !found {
+		if offset == "" {
+			return ByteRange{}, fmt.Errorf("byte range missing length")
+		}
 		n, err := strconv.Atoi(offset)
 		if err != nil {
 			return ByteRange{}, err
 		}
+		if n <= 0 {
+			return ByteRange{}, fmt.Errorf("byte range length must be larger than zero, got %d", n)
+		}
 		return ByteRange{n, 0}, nil
+	}
+	if offset == "" {
+		return ByteRange{}, fmt.Errorf("byte range missing length")
 	}
 	n, err := strconv.Atoi(offset)
 	if err != nil {
 		return ByteRange{}, err
+	}
+	if n <= 0 {
+		return ByteRange{}, fmt.Errorf("byte range length must be larger than zero, got %d", n)
 	}
 	nn, err := strconv.Atoi(until)
 	if err != nil {
