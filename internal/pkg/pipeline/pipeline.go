@@ -34,6 +34,24 @@ func NewDefaultPipeline(dbFile string) (*Pipeline, error) {
 	}, nil
 }
 
+// NewReadOnlyPipeline creates a new pipeline that only reads from the given database file.
+// The database is opened in read-only mode so processing a file with this pipeline
+// never writes anything to it.
+func NewReadOnlyPipeline(dbFile string) (*Pipeline, error) {
+	db, err := db.NewBoltDBReadOnly(dbFile)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error connection to database at: %s", dbFile)
+	}
+	s := dsp.NewSpectrogrammer(model.DownsampleRatio, model.MaxFreq, model.SampleSize, true)
+	fpr := fingerprint.NewDefaultFingerprinter()
+
+	return &Pipeline{
+		s:   s,
+		DB:  db,
+		fpr: fpr,
+	}, nil
+}
+
 // NewPipeline creates a new pipeline
 func NewPipeline(s *dsp.Spectrogrammer, db db.Database, fpr fingerprint.Fingerprinter) *Pipeline {
 	return &Pipeline{
@@ -98,7 +116,7 @@ func (p *Pipeline) Process(path string) (*Result, error) {
 	var id uint32
 	songFpr := p.fpr.Fingerprint(id, partial.cMap)
 
-	log.Infof("sucessfully loaded %s into the database", path)
+	log.Infof("successfully processed %s (nothing stored in the database)", path)
 	return &Result{
 		Path:         path,
 		CMap:         partial.cMap,
