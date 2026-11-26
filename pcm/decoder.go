@@ -23,6 +23,11 @@ import (
 // can be passed directly. Do not wrap a source in a bufio.Reader when seeking is
 // needed: bufio.Reader does not implement io.Seeker, so SeekToSample would return
 // flac.ErrSeekUnsupported.
+//
+// None of Read, WriteTo, SeekToSample or Reset may be called concurrently with
+// another method on the same Decoder. In a sync.Pool deployment, lease one Decoder
+// to one goroutine at a time. Different Decoder values have independent stream
+// state and may decode, fail, recover and Reset in parallel.
 type Decoder struct {
 	br       *bitio.Reader
 	rs       io.ReadSeeker // non-nil when the source is seekable
@@ -127,8 +132,9 @@ func NewDecoder(r io.Reader, opts ...DecoderOption) (*Decoder, error) {
 //
 // On success the decoder behaves exactly as a fresh NewDecoder(r, opts...) would. If
 // Reset returns an error the decoder must not be used except through another Reset,
-// which fully recovers it; a nil r is rejected before any state changes, so the
-// previous stream stays intact.
+// which fully recovers it. A nil r is rejected before rebinding: when a stream is
+// already live its state stays intact, while an uninitialized zero value retains the
+// rejection as a sticky error so Read cannot reach a nil reader.
 //
 // Options apply to this call only: a decoder built with SkipMD5Verification and later
 // Reset without it verifies again, so pass the option on every Reset that should keep
@@ -172,7 +178,15 @@ func (d *Decoder) applyOptions(op string, opts []DecoderOption) error {
 // stream visible and the decoder stays recoverable by a later init.
 func (d *Decoder) init(op string, r io.Reader) error {
 	if r == nil {
-		return fmt.Errorf("go-flac/pcm: %s: nil reader", op)
+		err := fmt.Errorf("go-flac/pcm: %s: nil reader", op)
+		// A nil Reset is normally rejected before touching a live stream, preserving
+		// its position. A zero-value Decoder has no stream geometry or bit reader to
+		// preserve, so retain the latest rejection and prevent Read reaching a nil
+		// reader. A successful stream always has non-zero bytesPS.
+		if d.br == nil && d.bytesPS == 0 {
+			d.err = err
+		}
+		return err
 	}
 	rs, seekable := r.(io.ReadSeeker)
 	var base int64
@@ -337,6 +351,11 @@ const maxProbeWindow = 1 << 24 // 16 MiB
 // through a frame. It wraps io.ErrUnexpectedEOF as decodeNextFrame does for the
 // same cut, and is a package value so a failed seek allocates no error.
 var errSeekFrameCut = fmt.Errorf("%w: %w", flac.ErrTruncatedStream, io.ErrUnexpectedEOF)
+
+// errDecoderUninitialized is the defensive verdict for Read/WriteTo on a zero-value
+// Decoder that has never had a successful Reset. Reset is the supported entry point,
+// but returning an error is safer than dereferencing the nil bit reader.
+var errDecoderUninitialized = errors.New("go-flac/pcm: decoder has no stream; call NewDecoder or Reset")
 
 // SeekToSample positions the decoder so the next Read/WriteTo yields audio starting at
 // sampleIndex. It requires the source to be an io.Seeker. It returns the sample index
@@ -624,6 +643,13 @@ func (d *Decoder) decodeNextFrame() error {
 	if d.done {
 		return io.EOF
 	}
+	if d.br == nil {
+		// This is reachable only through direct use of a zero-value Decoder before a
+		// successful Reset. Failed seeks set d.err before dropping br, and successful
+		// end-seeks set done above.
+		d.err = errDecoderUninitialized
+		return d.err
+	}
 	err := frame.Decode(d.br, d.info, &d.frame)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -705,13 +731,15 @@ func (d *Decoder) finish() error {
 
 // Read fills p with interleaved little-endian PCM at OutputBitDepth.
 func (d *Decoder) Read(p []byte) (int, error) {
+	// A poisoned decoder reports its sticky error even for a zero-length request.
+	// The argument check below only avoids work for a healthy decoder.
+	if d.err != nil {
+		return 0, d.err
+	}
 	if len(p) == 0 {
 		// Per io.Reader, a zero-length read returns immediately; do not decode
 		// a frame just to copy nothing.
 		return 0, nil
-	}
-	if d.err != nil {
-		return 0, d.err
 	}
 	for len(d.pending) == 0 {
 		if err := d.decodeNextFrame(); err != nil {
